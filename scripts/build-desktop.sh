@@ -11,7 +11,7 @@ export CARGO_INCREMENTAL=0
 export MACOSX_DEPLOYMENT_TARGET=14.0
 export PATH="$toolchain_bin:$HOME/.cargo/bin:$PATH"
 cd "$project_dir"
-/opt/homebrew/bin/node --test ui/sunburst.test.mjs
+/opt/homebrew/bin/node --test ui/*.test.mjs
 "$toolchain_bin/cargo" test --workspace --locked --offline
 "$toolchain_bin/cargo" build -p macscan-desktop --release --locked --offline
 cd crates/desktop

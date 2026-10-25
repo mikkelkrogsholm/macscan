@@ -111,6 +111,16 @@ impl Db {
         Self::with_limit("512MiB")
     }
     fn with_limit(memory: &str) -> io::Result<Self> {
+        Self::open(memory, None, None)
+    }
+    pub fn spooling(path: &str, temporary: &str, limit: u64) -> io::Result<Self> {
+        let db = Self::open("512MiB", Some(path), Some(temporary))?;
+        db.exec(&format!("SET max_temp_directory_size={}", literal(&format!("{limit}B"))))?;
+        db.exec("SET preserve_insertion_order=false")?;
+        Ok(db)
+    }
+    fn open(memory: &str, path: Option<&str>, temporary: Option<&str>) -> io::Result<Self> {
+        let path = path.map(cstring).transpose()?;
         unsafe {
             let mut config = std::ptr::null_mut();
             if duckdb_create_config(&mut config) != 0 {
@@ -121,7 +131,7 @@ impl Db {
                 ("memory_limit", memory),
                 ("autoinstall_known_extensions", "false"),
                 ("autoload_known_extensions", "false"),
-                ("temp_directory", ""),
+                ("temp_directory", temporary.unwrap_or("")),
             ] {
                 let key = cstring(key)?;
                 let value = cstring(value)?;
@@ -132,7 +142,7 @@ impl Db {
             }
             let mut database = std::ptr::null_mut();
             let mut error = std::ptr::null_mut();
-            let code = duckdb_open_ext(std::ptr::null(), &mut database, config, &mut error);
+            let code = duckdb_open_ext(path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()), &mut database, config, &mut error);
             duckdb_destroy_config(&mut config);
             if code != 0 {
                 let detail = text(error);
@@ -155,6 +165,10 @@ impl Db {
     }
     pub fn exec(&self, sql: &str) -> io::Result<()> {
         self.execute(sql, None).map(|_| ())
+    }
+    pub fn exec_cancel(&self, sql: &str, cancel: &AtomicBool) -> io::Result<()> {
+        self.execute(sql, Some(cancel)).map(|_| ()).map_err(|e|
+            io::Error::new(e.kind(),format!("{}: {e}",sql.chars().take(80).collect::<String>())))
     }
     pub fn query(&self, sql: &str, cancel: Option<&AtomicBool>) -> io::Result<Rows> {
         // DuckDB serializes a row with its native JSON implementation. We only

@@ -58,6 +58,27 @@ fn no_default_scan_or_implicit_history() {
 }
 
 #[test]
+fn full_scan_is_default_and_explicit_large_limits_are_supported() {
+    let f=Fixture::new();
+    let schema=json(&f.cmd().arg("schema").output().unwrap());
+    assert!(schema["limits"]["max_entries"].is_null());
+    assert!(schema["limits"]["max_duration_seconds"].is_null());
+    let out=f.cmd().args(["scan","/not-a-real-root","--max-entries","2000000"]).output().unwrap();
+    assert_eq!(out.status.code(),Some(4));
+}
+
+#[test]
+fn finder_style_256_file_limit_does_not_cut_off_a_full_scan(){
+    use std::os::unix::process::CommandExt;
+    let f=Fixture::new();let root=f.0.join("root");fs::create_dir(&root).unwrap();let mut p=root.clone();
+    for _ in 0..300{p=p.join("d");fs::create_dir(&p).unwrap();}fs::write(p.join("tiny"),b"abc").unwrap();
+    let mut cmd=f.cmd();cmd.arg("scan").arg(&root);
+    // SAFETY: child-only resource syscalls, no allocation or shared-state mutation.
+    unsafe {cmd.pre_exec(||{let mut limit=std::mem::MaybeUninit::<libc::rlimit>::uninit();if libc::getrlimit(libc::RLIMIT_NOFILE,limit.as_mut_ptr())!=0{return Err(std::io::Error::last_os_error());}let mut limit=limit.assume_init();limit.rlim_cur=256.min(limit.rlim_max);if libc::setrlimit(libc::RLIMIT_NOFILE,&limit)!=0{return Err(std::io::Error::last_os_error());}Ok(())});}
+    let out=json(&cmd.output().unwrap());assert_eq!(out["status"],"complete");assert_eq!(out["totals"]["logical_bytes"],"3");
+}
+
+#[test]
 fn saved_scan_round_trips_through_queries_and_cursor() {
     let f = Fixture::new();
     let root = f.0.join("target");

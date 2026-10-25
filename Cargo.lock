@@ -1788,6 +1788,7 @@ dependencies = [
 name = "macscan-desktop"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "macscan-analysis",
  "macscan-engine",
  "rfd",

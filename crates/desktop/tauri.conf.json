@@ -7,7 +7,7 @@
   "app":{
     "withGlobalTauri":true,
     "windows":[{"label":"main","title":"Macscan","width":1280,"height":830,"minWidth":1000,"minHeight":650,"backgroundColor":"#13161d","theme":"Dark"}],
-    "security":{"csp":"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'","capabilities":[]}
+    "security":{"csp":"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'","capabilities":[{"identifier":"entry-context-menu","windows":["main"],"permissions":["core:menu:allow-new","core:menu:allow-popup"]}]}
   },
   "bundle":{"active":true,"targets":["app"],"icon":["icons/icon.png"],"category":"Utility","shortDescription":"Local disk analysis with a Rust engine","macOS":{"minimumSystemVersion":"14.0","frameworks":["../../.build/duckdb/libduckdb.dylib"]}}
 }

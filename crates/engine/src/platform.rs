@@ -69,7 +69,7 @@ impl Metadata {
     } // SF_DATALESS, sys/stat.h
 }
 
-pub(crate) struct Directory(*mut libc::DIR);
+pub(crate) struct Directory(*mut libc::DIR, Option<crate::bulk::Bulk>);
 
 impl Directory {
     pub fn root(path: &Path) -> io::Result<Self> {
@@ -96,7 +96,7 @@ impl Directory {
             }
             return Err(error);
         }
-        Ok(Self(dir))
+        Ok(Self(dir, Some(crate::bulk::Bulk::new())))
     }
 
     pub(crate) fn fd(&self) -> libc::c_int {
@@ -178,6 +178,22 @@ impl Directory {
                 .map_err(|_| io::Error::other("embedded NUL in directory entry"));
         }
     }
+
+    pub fn next_metadata(&mut self) -> io::Result<Option<(CString, Metadata)>> {
+        if let Some(bulk)=&mut self.1 {
+            match bulk.next(unsafe {libc::dirfd(self.0)}) {
+                Ok(Some((name,metadata)))=>return Ok(Some((name.clone(),match metadata {Some(m)=>m,None=>self.child_metadata(&name)?}))),
+                Ok(None)=>return Ok(None),
+                Err(e) if !bulk.used && [Some(libc::EINVAL),Some(libc::ENOTSUP),Some(libc::ENOSYS)].contains(&e.raw_os_error())=>{
+                    // No rows consumed. Never mix readdir and bulk on an advanced cursor.
+                    unsafe {libc::rewinddir(self.0)};
+                    self.1=None;
+                },
+                Err(e)=>return Err(e),
+            }
+        }
+        self.next_name()?.map(|n|self.child_metadata(&n).map(|m|(n,m))).transpose()
+    }
 }
 
 impl Drop for Directory {
@@ -220,5 +236,35 @@ mod tests {
         let s = timestamp();
         assert_eq!(s.len(), 20);
         assert!(s.ends_with('Z'));
+    }
+    #[test]
+    fn bulk_matches_stat_for_regular_sparse_hardlinked_and_hostile_names(){
+        use std::os::unix::fs::symlink;
+        let root=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-bulk-parity-{}",std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a"),b"abc").unwrap();
+        std::fs::hard_link(root.join("a"),root.join("b")).unwrap();
+        std::fs::File::create(root.join("sparse")).unwrap().set_len(100_000_000).unwrap();
+        std::fs::write(root.join("æ\"\nname"),b"z").unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();symlink("a",root.join("link")).unwrap();
+        let mut d=Directory::root(&root).unwrap();let mut count=0;
+        while let Some((name,m))=d.next_metadata().unwrap(){let expected=d.child_metadata(&name).unwrap();
+            assert_eq!((m.mode&libc::S_IFMT,m.device,m.inode,m.links,m.logical,m.allocated,m.flags,m.mtime),(expected.mode&libc::S_IFMT,expected.device,expected.inode,expected.links,expected.logical,expected.allocated,expected.flags,expected.mtime));count+=1;
+        }
+        assert_eq!(count,6);assert!(d.1.as_ref().unwrap().used);drop(d);std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore="Creates 10,000 disposable empty files to compare metadata enumeration"]
+    fn bulk_benchmark(){
+        let root=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-bulk-bench-{}",std::process::id()));std::fs::create_dir(&root).unwrap();
+        for i in 0..10_000{std::fs::File::create(root.join(format!("f{i}"))).unwrap();}
+        for round in 0..3 {
+            let start=std::time::Instant::now();let mut d=Directory::root(&root).unwrap();let mut count=0;
+            while let Some(name)=d.next_name().unwrap(){d.child_metadata(&name).unwrap();count+=1;}
+            let stat=start.elapsed();drop(d);let start=std::time::Instant::now();let mut d=Directory::root(&root).unwrap();let mut bulk_count=0;
+            while d.next_metadata().unwrap().is_some(){bulk_count+=1;}
+            assert_eq!(count,bulk_count);assert_eq!(count,10_000);println!("round={round} stat_us={} bulk_us={}",stat.as_micros(),start.elapsed().as_micros());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

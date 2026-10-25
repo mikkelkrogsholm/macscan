@@ -7,11 +7,50 @@ oprydning, filindhold, autostart eller database-server.
 
 ## Mac-app
 
+**Hele Mac’en** scanner monterede APFS-volumener på den fysiske opstartsdisk,
+med separate resultater for Data, system, Preboot, VM osv. Umonterede volumener
+vises med macOS’ rapporterede forbrug og markeres som ikke filscannede.
+Eksterne drev og monterede diskimages/simulatorer lægges ikke oven i SSD-forbruget.
+Samlet diskforbrug kommer fra APFS-containerregnskabet; filsummer er et separat
+analysegrundlag, ikke et ekstra fysisk forbrug eller garanteret frigørbare bytes.
+Almindelige mappe-/volumenscanninger findes fortsat i sidepanelet. Systemroden
+udelader macOS-firmlinks fra `/usr/share/firmlinks` samt monteringsområder;
+deres data gennemgås ved de kanoniske volumenrødder i stedet.
+
+Under scanning vises rodgrene og deres status, antal og foreløbige allokering.
+Højst 64 grupper vises; alle filer tælles fortsat med, også små og dybtliggende.
+Foreløbige størrelser er **før hardlink-korrektion**, og afventende er ikke nul.
+Færdige volumener gemmes som normale Parquet-målinger. En lille privat
+`*.machine.json` binder dem sammen i historikken, også efter Stop; en afbrudt
+volumens ufærdige arbejdsfiler publiceres ikke. Tidligere resultater bevares.
+Klik på en volumen for filanalyse og brug “Hele Mac’en”-brødkrummen for at gå op.
+
+Streamingmotoren bruger macOS `getattrlistbulk` i 64 KiB batches til almindelige
+filers metadata, med stat-opslag for mapper, symlinks og manglende attributter.
+Filsystemer uden bulk-understøttelse falder tilbage til descriptor-relative opslag.
+En lokal varm-cache-test af 10.000 tomme filer målte cirka 1,6–1,8 gange hurtigere
+metadata-gennemgang; det er ikke et løfte om samme gevinst for en fuld scanning.
+Der læses ikke filindhold. Scanning er fortsat enkelttrådet; DuckDB-finalisering
+bruger to tråde. Fuld diskadgang skal brugeren selv give i macOS, hvis nødvendigt.
+Ingen rettigheder ændres automatisk. Beskyttede/providerområder vises som delvise.
+Knappen “Fuld diskadgang…” åbner kun den relevante side i Systemindstillinger.
+Tilføj `dist/Macscan.app` dér manuelt, og genstart appen. Lokale ad-hoc-genbygninger
+kan ugyldiggøre tidligere tilladelser; fjern og tilføj da appen igen. Appen har
+formålsbeskrivelser for musikbibliotek og standardmapper, men giver sig ikke adgang.
+Store scanninger hæver kun egen proces’ bløde grænse for åbne filer til højst8192
+(aldrig over den eksisterende hårde grænse); systemets grænser ændres ikke.
+
 Åbn `dist/Macscan.app`. Appen bruger samme Rust-scanner, Parquet og DuckDB som
 CLI'en. Klik på en farvet mappe for at gå ind, på midten eller brødkrummerne
 for at gå op. Mappelisten er også fuldt tastaturbetjent. Filklik viser metadata;
 appen åbner aldrig automatisk en fil. Kopiér sti og Vis i Finder er eksplicitte
 handlinger. Der er ingen sletteknapper.
+
+Højreklik på en sunburst-blok eller en post i mappelisten for **Vis i Finder**,
+**Kopiér filsti** og **Kopiér information**. Information kopieres som JSON med
+sti, type, størrelser, dækning og måletidspunkt fra den gemte måling, ikke live
+fildata. I listen åbner Shift+F10 også menuen. “Øvrige poster” er en samleblok;
+vælg en konkret post i listen for at få filhandlinger.
 
 - Native mappevalg, scanning med observerede tællere og Stop.
 - Gemte målinger med dato og tydelig “ikke live”-markering.
@@ -25,8 +64,8 @@ handlinger. Der er ingen sletteknapper.
 Brug “Målemappe” til at vælge den eksisterende `measurements/` fra dette projekt.
 Valget huskes lokalt i appens WebView. Standardplaceringen er den samme som
 CLI'ens. Appen kan også startes med `--store /absolute/history`.
-UI'ens samlede historikbudget er 512 MiB uden automatisk sletning; CLI-standard
-er fortsat 256 MiB. En ny måling kan afvises, når budgettet er opbrugt.
+Det samlede historikbudget er 4 GiB uden automatisk sletning af gemte målinger.
+En ny måling kan afvises, når budgettet er opbrugt; CLI kan ændre budgettet.
 
 Byg med `scripts/build-desktop.sh`. Frontend er lokal HTML/CSS/JavaScript/SVG
 uden npm-afhængigheder eller separat frontendbyg. Tauri er isoleret i sin egen
@@ -56,8 +95,9 @@ dist/macscan query --scan SCAN_ID --store /absolute/existing-parent/history \
 dist/macscan compare BEFORE_ID AFTER_ID --metric logical --store /absolute/existing-parent/history
 ```
 
-Root er altid eksplicit. Uden `--save` får man kun et kompakt preview, ikke
-historik. Standardhistorik er `~/Library/Application Support/Macscan`;
+Root er altid eksplicit. Uden `--save` bruges en privat midlertidig måling,
+som fjernes efter det kompakte svar; der beholdes ingen historik.
+Standardhistorik er `~/Library/Application Support/Macscan`;
 `--store` vælger en anden absolut placering, hvis parent eksisterer.
 Placér historik uden for det scannede træ; ellers udelades den, og scan er partial.
 
@@ -94,6 +134,8 @@ tilføjer `before_entries` og `changes`. Sidstnævnte har før-/efterværdier og
 de fulde uændrede tabeller findes fortsat som `entries` og `before_entries`.
 Den indbyggede `compare` håndterer pagination
 og ukendt dækning. Kun samme root, scanpolitik, OS og volumen kan sammenlignes.
+Gamle prototype-målinger kan stadig åbnes; den nye fulde scanpolitik er forskellig,
+så en ny fuld måling sammenlignes med en anden fuld måling, ikke en gammel prototype.
 Indlejrede mappeændringer overlapper: summer ikke alle compare-rækker.
 
 ## Hvad størrelserne betyder
@@ -112,18 +154,32 @@ Kendte cloud-roots udelades; fuld provider-/full-disk-certificering mangler.
 ## Historik og ressourcegrænser
 
 Hver måling har en lille `manifest.json`, `coverage.parquet` og
-`entries/part-*.parquet` (Zstandard, 8.192 poster pr. del).
-Ingen permanent DuckDB-database eller store JSONL-filer. DuckDB åbnes kun under
-gemning/query. Den gamle JSONL-implementering i engine er ikke CLI'ens format.
+`entries/part-*.parquet` (Zstandard, skrivegrupper på 8.192 poster og dele på omtrent 32 MB).
+Der er ingen permanent DuckDB-database eller store JSONL-filer. Scanneren
+afleverer små batches direkte til Parquet. En midlertidig diskbaseret DuckDB
+beregner hardlinks og mappesummer, så hele filtræet ikke opbevares i RAM.
+Arbejdsfiler fjernes efter succes, Stop og normale fejl. Egne markerede,
+upublicerede arbejdsmapper fra en tidligere afbrudt proces ryddes ved næste scan;
+gemte målinger og ukendte mapper slettes aldrig automatisk.
+Den gamle in-memory/JSONL-prototype findes stadig til reference-tests, men
+appen og CLI-scanning bruger den nye streamingmotor.
 
-Historik har som standard **256 MiB samlet budget**, ændres eksplicit med
+Historik har som standard **4 GiB samlet budget**, ændres eksplicit med
 `--metadata-budget BYTES`. Ingen automatisk sletning af gamle målinger.
 Gemning publiceres atomisk uden overskrivning; fejl fjerner kun eget staging.
-Standardscan: højst 1.000.000 poster/300 sekunder/64 katalogniveauer.
-DuckDB bruger 128 MiB bufferbudget ved skrivning og 256 MiB ved analyse,
-512 MiB ved to-scan-sammenligning, to tråde og ingen temp-spill. Det er **ikke**
-en grænse for hele processens RSS.
-En query kan derfor afvises ved hukommelsesgrænsen; den fylder ikke disken med spill.
+Standardscan gennemgår hele den valgte lokale volumen/root uden en fast post-,
+tids- eller 64-niveausgrænse. CLI kan stadig sætte eksplicit `--max-entries` og
+`--max-duration`. OS-adgangsfejl, provider-/volumenudeladelser og eventuelle
+ressourcefejl er synlige, ikke tavst komplette scanninger. Stop virker også
+under slutberegningen. Entry-ID-formatet understøtter op til ca. 4,3 mia. poster.
+Writerens Rust-batchbudget er højst 4 MiB plus åbne forfædre; DuckDB bruger
+512 MiB bufferbudget ved streaming/finalisering og to-scan-sammenligning,
+256 MiB ved almindelig analyse og to tråde. Det er **ikke** en grænse for hele processens RSS.
+Kun slutberegningens private arbejdsområde tillader disk-spill. Arbejdsområdet
+begrænses til højst 8 GiB (lavere ved lille metadata-budget), kontrolleres løbende,
+og afbrydes, hvis der er under 512 MiB ledigt. Kontrollernes interval er 200 ms;
+det er ikke en atomisk filesystem-kvote. Almindelige queries spilder ikke til disk
+og kan derfor afvises ved deres hukommelsesgrænse.
 
 ## Byg
 
@@ -150,7 +206,7 @@ Motoren alene er lille; denne kombination er ikke en sub-MB-distribution.
 Lokale diskmålinger, driftsnoter, test-/målebeviser og byggede binærer er
 udeladt fra Git. Egne målinger gemmes lokalt; de uploades ikke af appen.
 Det er en brugbar lokal prototype, ikke accept af alle oprindelige V1-/UI-krav.
-49 Rust-tests og fem geometriske JS-tests samt en million-entry test verificerer det
+Rust- og JS-tests samt eksplicitte million-entry tests verificerer det
 aktuelle workflow. Live filsystemer kan ændre sig under scan; det er ikke et
 atomisk APFS-snapshot. Brugt på egen Mac: ~415.500 poster på 14 sekunder,
 26,5 MB metadata pr. snapshot. Milliontesten gav 12,3 MB for to snapshots;

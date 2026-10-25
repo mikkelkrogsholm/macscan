@@ -70,7 +70,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn new(parent: Option<u32>, name: Vec<u8>, metadata: Metadata) -> Self {
+    pub(crate) fn new(parent: Option<u32>, name: Vec<u8>, metadata: Metadata) -> Self {
         let kind = if metadata.is_dir() {
             EntryKind::Directory
         } else if metadata.is_file() {
@@ -131,6 +131,17 @@ impl Default for ScanOptions {
         }
     }
 }
+impl ScanOptions {
+    /// Streaming callers do not retain the complete tree in memory.
+    pub fn full() -> Self {
+        Self {
+            max_entries: usize::MAX,
+            max_duration: Duration::MAX,
+            max_depth: usize::MAX,
+            ..Self::default()
+        }
+    }
+}
 
 pub struct Scan {
     pub id: String,
@@ -165,6 +176,7 @@ pub struct Progress {
     pub entries_seen: usize,
     pub elapsed_ms: u128,
     pub finished: bool,
+    pub branches: Vec<Value>,
 }
 
 pub fn scan_with_progress(
@@ -180,6 +192,7 @@ pub fn scan_with_progress(
         .unwrap_or_default()
         .as_nanos();
     progress(&Progress {
+        branches: Vec::new(),
         entries_seen: 0,
         elapsed_ms: 0,
         finished: false,
@@ -309,6 +322,7 @@ pub fn scan_with_progress(
     while !stack.is_empty() {
         if last_progress.elapsed() >= Duration::from_secs(1) {
             progress(&Progress {
+                branches: Vec::new(),
                 entries_seen: scan.entries.len(),
                 elapsed_ms: started.elapsed().as_millis(),
                 finished: false,
@@ -461,6 +475,7 @@ pub fn scan_with_progress(
     scan.ended_at = platform::timestamp();
     scan.duration_ms = started.elapsed().as_millis();
     progress(&Progress {
+        branches: Vec::new(),
         entries_seen: scan.entries.len(),
         elapsed_ms: scan.duration_ms,
         finished: true,
@@ -468,7 +483,7 @@ pub fn scan_with_progress(
     Ok(scan)
 }
 
-fn cloud_path(path: &Path) -> bool {
+pub(crate) fn cloud_path(path: &Path) -> bool {
     let bytes = path.as_os_str().as_bytes();
     [
         b"/Library/CloudStorage".as_slice(),
@@ -483,7 +498,7 @@ fn cloud_path(path: &Path) -> bool {
 }
 
 impl Scan {
-    fn issue(
+    pub(crate) fn issue(
         &mut self,
         id: u32,
         code: &'static str,

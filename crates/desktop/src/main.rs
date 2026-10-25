@@ -1,6 +1,6 @@
-use macscan_analysis::Store;
+use macscan_analysis::{Store, FULL_HISTORY_BUDGET};
 use macscan_engine::{
-    scan_with_progress, volumes, CompareQuery, Metric, Query, QueryKind, ScanOptions,
+    CompareQuery, Metric, Query, QueryKind, ScanOptions,
 };
 use serde_json::{json, Value};
 use std::{
@@ -13,8 +13,9 @@ use std::{
     },
 };
 use tauri::{Manager, State};
+mod machine;
 
-const HISTORY_BUDGET: u64 = 512 * 1024 * 1024;
+const HISTORY_BUDGET: u64 = FULL_HISTORY_BUDGET;
 type Reply = Result<Value, String>;
 struct Job {
     cancel: AtomicBool,
@@ -37,10 +38,13 @@ fn history(path: &std::path::Path) -> Reply {
         let store = Store::open(path, false).map_err(err)?;
         for id in store.ids().map_err(err)?.into_iter().rev().take(100) {
             if let Ok(m) = store.manifest(&id) {
-                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
+                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"policy":m["scope"]["policy_fingerprint"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
             }
         }
     }
+    scans.extend(machine::history(path));
+    scans.sort_by(|a,b|b["sort_at"].as_str().or(b["started_at"].as_str()).cmp(&a["sort_at"].as_str().or(a["started_at"].as_str())));
+    scans.truncate(100);
     Ok(json!({"store":path,"scans":scans,"metadata_budget_bytes":HISTORY_BUDGET}))
 }
 async fn blocking(f: impl FnOnce() -> Reply + Send + 'static) -> Reply {
@@ -53,7 +57,7 @@ async fn bootstrap(state: State<'_, Desktop>) -> Reply {
     blocking(move || {
         let mut result = history(&path)?;
         result["explicit_store"] = json!(explicit);
-        result["volumes"] = volumes(20, None).map_err(err)?;
+        result["volumes"] = json!({"records":machine::mounts().map_err(err)?});
         Ok(result)
     })
     .await
@@ -65,6 +69,11 @@ async fn choose_root() -> Result<Option<String>, String> {
         .pick_folder()
         .await
         .map(|p| p.path().to_string_lossy().into_owned()))
+}
+#[tauri::command]
+fn open_privacy()->Result<(),String>{
+    if !Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles").status().map_err(err)?.success(){return Err("Åbn selv Systemindstillinger → Anonymitet & sikkerhed → Fuld diskadgang".into());}
+    Ok(())
 }
 #[tauri::command]
 async fn choose_history(state: State<'_, Desktop>) -> Reply {
@@ -178,6 +187,18 @@ async fn compare_scans(
 }
 #[tauri::command]
 fn start_scan(root: String, state: State<'_, Desktop>) -> Reply {
+    launch_scan(Some(root),&state)
+}
+#[tauri::command]
+fn start_machine(state: State<'_,Desktop>)->Reply {launch_scan(None,&state)}
+#[tauri::command]
+async fn machine_session(session_id:String,state:State<'_,Desktop>)->Reply {
+    let path=store_path(&state)?;
+    blocking(move||machine::load(&path,&session_id).map_err(err)).await
+}
+fn launch_scan(root:Option<String>,state:&Desktop)->Reply {
+    let whole=root.is_none();
+    let root=root.unwrap_or_else(||"/".into());
     let root = PathBuf::from(root);
     if !root.is_absolute() {
         return Err("Vælg en absolut lokal sti".into());
@@ -186,28 +207,27 @@ fn start_scan(root: String, state: State<'_, Desktop>) -> Reply {
     let mut slot = state.job.lock().map_err(err)?;
     if let Some(job) = slot.as_ref() {
         let s = job.status.lock().map_err(err)?;
-        if s["phase"] == "scanning" || s["phase"] == "saving" {
+        if ["planning","scanning","saving"].iter().any(|p|s["phase"]==*p) {
             return Err("Der kører allerede en scanning".into());
         }
     }
     let job = Arc::new(Job {
         cancel: AtomicBool::new(false),
-        status: Mutex::new(json!({"phase":"scanning","entries_seen":0,"elapsed_ms":0,"root":root})),
+        status: Mutex::new(json!({"phase":if whole{"planning"}else{"scanning"},"whole_mac":whole,"entries_seen":0,"elapsed_ms":0,"root":root})),
     });
     *slot = Some(job.clone());
     std::thread::Builder::new().name("macscan-reader".into()).spawn(move||{
         let result=(||->Result<String,String>{
-            let mut options=ScanOptions::default();options.exclusions.push(store.clone());
-            let scan=scan_with_progress(&root,&options,&job.cancel,|p|{
-                *job.status.lock().unwrap()=json!({"phase":"scanning","entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"root":root});
-            }).map_err(err)?;
-            if job.cancel.load(Ordering::Relaxed) {return Err("cancelled".into());}
-            job.status.lock().unwrap()["phase"]=json!("saving");
-            Store::open(&store,true).map_err(err)?.save_with_cancel(&scan,HISTORY_BUDGET,&job.cancel).map_err(err)?;
-            Ok(scan.id)
+            if whole {
+                let plan=machine::plan().map_err(err)?;
+                return machine::run(&store,plan,&job.cancel,|value|{*job.status.lock().unwrap()=value;}).map_err(err);
+            }
+            Store::open(&store,true).map_err(err)?.scan_to_store(&root,&ScanOptions::full(),HISTORY_BUDGET,&job.cancel,|p|{
+                *job.status.lock().unwrap()=json!({"phase":if p.finished {"saving"}else{"scanning"},"entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"root":root,"branches":p.branches});
+            }).map_err(err)
         })();
         let mut status=job.status.lock().unwrap();
-        match result {Ok(id)=>{status["phase"]=json!("done");status["scan_id"]=json!(id);},Err(e)=>{
+        match result {Ok(id)=>{status["phase"]=json!("done");status["scan_id"]=json!(id);status["whole_mac"]=json!(whole);},Err(e)=>{
             status["phase"]=json!(if job.cancel.load(Ordering::Relaxed){"cancelled"}else{"error"});status["error"]=json!(e);
         }}
     }).map_err(err)?;
@@ -234,7 +254,7 @@ async fn file_action(
     action: String,
     state: State<'_, Desktop>,
 ) -> Reply {
-    if !["copy", "reveal"].contains(&action.as_str()) {
+    if !["copy", "copy_info", "reveal"].contains(&action.as_str()) {
         return Err("Ukendt handling".into());
     }
     let path = store_path(&state)?;
@@ -259,7 +279,12 @@ async fn file_action(
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
             .collect::<Result<Vec<_>, _>>()
             .map_err(err)?;
-        if action == "copy" {
+        if action == "copy" || action == "copy_info" {
+            let copied = if action == "copy_info" {
+                information_to_copy(&result)?
+            } else {
+                raw
+            };
             let mut child = Command::new("/usr/bin/pbcopy")
                 .stdin(Stdio::piped())
                 .spawn()
@@ -268,10 +293,10 @@ async fn file_action(
                 .stdin
                 .take()
                 .ok_or("clipboard stdin")?
-                .write_all(&raw)
+                .write_all(&copied)
                 .map_err(err)?;
             if !child.wait().map_err(err)?.success() {
-                return Err("Kunne ikke kopiere stien".into());
+                return Err("Kunne ikke kopiere til udklipsholderen".into());
             }
         } else {
             use std::os::unix::ffi::OsStringExt;
@@ -293,6 +318,45 @@ async fn file_action(
     })
     .await
 }
+fn information_to_copy(result: &Value) -> Result<Vec<u8>, String> {
+    let entry = result["records"]
+        .get(0)
+        .filter(|v| v.is_object())
+        .ok_or("Mangler information om posten")?;
+    serde_json::to_vec_pretty(&json!({
+        "app":"Macscan",
+        "source":"saved_scan_not_live",
+        "scan_id":result["scan_id"],
+        "measured_at":result["started_at"],
+        "entry":entry,
+        "note":"Størrelser er bytes. Null betyder ukendt. Allokeret plads er ikke nødvendigvis frigørbar APFS-plads."
+    })).map_err(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copied_information_preserves_exact_sizes_paths_and_measurement_context() {
+        let result = json!({"scan_id":"scan-a","started_at":"2026-10-25T12:00:00Z","records":[{
+            "path_display":"/example/a\n\"quoted\".mov","kind":"file",
+            "logical_bytes":"18446744073709551615","accounted_allocated_bytes":null,
+            "coverage_complete":false
+        }]});
+        let copy: Value = serde_json::from_slice(&information_to_copy(&result).unwrap()).unwrap();
+        assert_eq!(copy["entry"], result["records"][0]);
+        assert_eq!(copy["scan_id"], "scan-a");
+        assert_eq!(copy["measured_at"], result["started_at"]);
+        assert_eq!(copy["source"], "saved_scan_not_live");
+    }
+
+    #[test]
+    fn missing_copy_information_is_an_error_not_an_empty_success() {
+        assert!(information_to_copy(&json!({"records":[]})).is_err());
+    }
+}
+
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let explicit = args
@@ -312,12 +376,15 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             choose_root,
+            open_privacy,
             choose_history,
             restore_history,
             view_scan,
             list_children,
             compare_scans,
             start_scan,
+            start_machine,
+            machine_session,
             job_status,
             stop_scan,
             file_action

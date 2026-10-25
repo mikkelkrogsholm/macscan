@@ -7,6 +7,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+mod stream;
+pub const FULL_HISTORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 
 pub const DEFAULT_LIMIT: usize = 10;
 pub const OUTPUT_BUDGET: usize = 8 * 1024;
@@ -437,11 +439,18 @@ impl Store {
             )?
             .row(0)?;
         let trail_fields = "entry_id,parent_id,name_display,path_display";
-        let mut trail = db.query(&format!("WITH RECURSIVE trail AS (SELECT {trail_fields},0 AS hop FROM entries WHERE entry_id={entry} UNION ALL SELECT e.entry_id,e.parent_id,e.name_display,e.path_display,t.hop+1 FROM entries e JOIN trail t ON e.entry_id=t.parent_id WHERE t.hop<64) SELECT {trail_fields} FROM trail ORDER BY hop DESC"),Some(cancel))?;
-        let mut ancestors = Vec::new();
-        for i in 0..trail.len() {
-            ancestors.push(trail.row(i)?);
+        // Point lookups avoid a recursive join materializing millions of
+        // paths merely to find a short breadcrumb trail. No 64-level UI cap.
+        let mut ancestors=vec![json!({"entry_id":selected["entry_id"],"parent_id":selected["parent_id"],"name_display":selected["name_display"],"path_display":selected["path_display"]})];
+        let mut seen=std::collections::HashSet::new();
+        seen.insert(entry);
+        while let Some(parent)=ancestors.last().unwrap()["parent_id"].as_str() {
+            let parent=parent.parse::<u32>().map_err(|_|invalid("invalid parent ID"))?;
+            if !seen.insert(parent){return Err(invalid("cyclic parent trail"));}
+            let row=db.query(&format!("SELECT {trail_fields} FROM entries WHERE entry_id={parent}"),Some(cancel))?.row(0)?;
+            ancestors.push(row);
         }
+        ancestors.reverse();
         let count = db
             .query(
                 &format!("SELECT count(*) AS count FROM entries WHERE parent_id={entry}"),
@@ -621,7 +630,7 @@ fn run_query(
 }
 fn envelope(m: &Value, command: &str, metric: Metric) -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"query_engine":"DuckDB v2.0.0","scan_id":m["scan_id"],"command":command,"status":m["status"],"metric":metric.name(),
-        "scope":{"root":m["scope"]["root_display"]},"started_at":m["started_at"],"coverage":{"complete":m["status"]=="complete","error_count":m["error_count"],"excluded_count":m["excluded_count"]},
+        "scope":{"root":m["scope"]["root_display"]},"started_at":m["started_at"],"coverage":{"complete":m["status"]=="complete","entries_seen":m["entry_count"],"error_count":m["error_count"],"excluded_count":m["excluded_count"]},
         "totals":m["totals"],"records":[],"truncated":false,"next_cursor":null,
         "warnings":["allocated_is_hardlink_accounted_not_unique_APFS_or_reclaimable","null_means_unknown; lower_bounds_are_not_complete_totals","categories_are_name_based_hints_not_deletion_approval"]})
 }

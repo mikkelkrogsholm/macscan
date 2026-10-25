@@ -1,7 +1,7 @@
-use macscan_analysis::{Store, DEFAULT_LIMIT, OUTPUT_BUDGET};
+use macscan_analysis::{Store, DEFAULT_LIMIT, OUTPUT_BUDGET, FULL_HISTORY_BUDGET};
 use macscan_engine::{
-    capabilities, scan_with_progress, volumes, CompareQuery, Metric, Query, QueryKind, ScanOptions,
-    ENGINE_VERSION, STORE_BUDGET,
+    capabilities, volumes, CompareQuery, Metric, Query, QueryKind, ScanOptions,
+    ENGINE_VERSION,
 };
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -84,13 +84,13 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             limit: DEFAULT_LIMIT,
             ..Query::default()
         },
-        scan: ScanOptions::default(),
+        scan: ScanOptions::full(),
         scan_id: None,
         store: PathBuf::from(home).join("Library/Application Support/Macscan"),
         save: false,
         ndjson: false,
         progress: "off".into(),
-        metadata_budget: STORE_BUDGET,
+        metadata_budget: FULL_HISTORY_BUDGET,
         sql: None,
         before: None,
         offset: 0,
@@ -244,9 +244,8 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         return Err(Error::usage("limit must be 1..100"));
     }
     if options.scan.max_entries == 0
-        || options.scan.max_entries > 1_000_000
         || options.scan.max_duration.is_zero()
-        || options.scan.max_duration > Duration::from_secs(86_400)
+        || options.scan.max_memory_bytes < 256 * 1024
         || options.scan.max_memory_bytes > 256 * 1024 * 1024
     {
         return Err(Error::usage("scan limits out of supported range"));
@@ -285,7 +284,7 @@ fn schema() -> Value {
         "options":{"store":"absolute metadata directory","limit":"1..100, default 10; responses always <=8192 bytes","offset":"SQL pagination; use next_offset, use ORDER BY for stable SQL pages","cursor":"predefined query pagination; use next_cursor unchanged","metric":["logical","allocated"],"progress":["off","text","ndjson"],"format":["json","ndjson"]},
         "sql_examples":["SELECT path_display,accounted_allocated_bytes FROM entries WHERE kind='file' ORDER BY accounted_allocated_bytes DESC LIMIT 10","SELECT category,count(*) AS entries,sum(accounted_allocated_bytes) AS bytes FROM entries WHERE kind='file' GROUP BY category ORDER BY bytes DESC","SELECT path_display,logical_delta FROM changes WHERE logical_delta>0 ORDER BY logical_delta DESC LIMIT 10"],
         "result_contract":{"schema_version":"2.0","all_SQL_numbers":"exact decimal strings; booleans and null preserved","null":"unknown, never zero","allocated":"scoped hardlink-accounted OS allocation, not unique APFS or reclaimable bytes","partial":"unknown areas are not deletion evidence","output_budget_bytes":OUTPUT_BUDGET},
-        "limits":{"metadata_budget_bytes":STORE_BUDGET,"scanner_workers":1,"automatic_deletion":false,"UI":"deferred"}})
+        "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"automatic_deletion":false,"UI":"Tauri sunburst"}})
 }
 fn run() -> Result<u8> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -314,34 +313,23 @@ fn run() -> Result<u8> {
             if options.operands.len() != 1 {
                 return Err(Error::usage("scan requires exactly one explicit ROOT"));
             }
-            let mut scan_options = options.scan;
-            if options.save {
-                scan_options.exclusions.push(options.store.clone());
-            }
-            let data=scan_with_progress(&PathBuf::from(&options.operands[0]),&scan_options,&CANCEL,|p|{
+            let temporary=if options.save {None}else{Some(TemporaryStore::new().map_err(|e|Error::io("temporary_store",e))?)};
+            let path=temporary.as_ref().map(|t|t.0.as_path()).unwrap_or(&options.store);
+            let store=Store::open(path,true).map_err(|e|Error::io("open_store",e))?;
+            let id=store.scan_to_store(&PathBuf::from(&options.operands[0]),&options.scan,options.metadata_budget,&CANCEL,|p|{
                 match options.progress.as_str() {
                     "ndjson"=>{let _=writeln!(io::stderr(),"{}",json!({"type":"progress","entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"finished":p.finished}));},
                     "text"=>{let _=writeln!(io::stderr(),"{} entries, {} ms{}",p.entries_seen,p.elapsed_ms,if p.finished {"; scan finished"}else{""});},_=>{}
                 }
             }).map_err(|e|Error::io("scan",e))?;
-            code = data.status.exit_code();
-            let retain = options.save && !CANCEL.load(Ordering::Relaxed);
-            let mut result = if retain {
-                let store =
-                    Store::open(&options.store, true).map_err(|e| Error::io("open_store", e))?;
-                store
-                    .save_with_cancel(&data, options.metadata_budget, &CANCEL)
-                    .map_err(|e| Error::io("save_parquet", e))?;
-                let id = data.id.clone();
-                drop(data);
-                store
-                    .report(&id, &options.query, &CANCEL)
-                    .map_err(|e| Error::io("query", e))?
-            } else {
-                compact_scan(&data, options.query).map_err(|e| Error::io("query", e))?
-            };
+            let mut result=store.report(&id,&options.query,&CANCEL).map_err(|e|Error::io("query",e))?;
+            code=if result["status"]=="partial"{5}else{0};
+            if !options.save {
+                result["next_cursor"]=Value::Null;
+                result["navigation_note"]=json!("Use --save for retained Parquet history, queries and comparison.");
+            }
             result["command"] = json!("scan");
-            result["retained"] = json!(retain);
+            result["retained"] = json!(options.save);
             result
         }
         "query" => {
@@ -430,29 +418,18 @@ fn run() -> Result<u8> {
     emit(result, options.ndjson).map_err(|e| Error::io("stdout", e))?;
     Ok(code)
 }
-fn compact_scan(data: &macscan_engine::Scan, query: Query) -> io::Result<Value> {
-    let metric = if query.metric == Metric::Logical {
-        "logical_bytes"
-    } else {
-        "accounted_allocated_bytes"
-    };
-    let full = data.query(&query)?;
-    let mut result = json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"scan_id":data.id,"status":data.status.name(),"metric":query.metric.name(),
-        "scope":{"root":data.root.to_string_lossy()},"coverage":full["coverage"],"totals":{
-            "logical_bytes":full["totals"]["logical_bytes"],"accounted_allocated_bytes":full["totals"]["accounted_allocated_bytes"],
-            "private_bytes":null,"observed_lower_bound":full["totals"]["observed_lower_bound"]},
-        "records":[],"truncated":full["truncated"],"next_cursor":null,"navigation_note":"Use --save for Parquet history, queries and comparison."});
-    for entry in full["records"].as_array().into_iter().flatten() {
-        let record = json!({"entry_id":entry["entry_id"],"name_display":entry["name_display"],"kind":entry["kind"],"bytes":entry[metric],
-            "coverage_complete":entry["coverage_complete"],"lower_bound_bytes":if entry["coverage_complete"]==false {entry["observed_lower_bound"][metric].clone()}else{Value::Null}});
-        result["records"].as_array_mut().unwrap().push(record);
-        if serde_json::to_vec(&result)?.len() + 512 > OUTPUT_BUDGET {
-            result["records"].as_array_mut().unwrap().pop();
-            result["truncated"] = json!(true);
-            break;
-        }
+struct TemporaryStore(PathBuf);
+impl TemporaryStore {
+    fn new() -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let nanos=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let path=std::env::temp_dir().canonicalize()?.join(format!("macscan-preview-{}-{nanos}",std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
     }
-    Ok(result)
+}
+impl Drop for TemporaryStore {
+    fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.0); }
 }
 fn emit(result: Value, ndjson: bool) -> io::Result<()> {
     let bytes = macscan_analysis::encode_response(result, ndjson)?;
