@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/engine", "crates/analysis", "crates/cli", "crates/desktop"]
+default-members = ["crates/engine", "crates/analysis", "crates/cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+libc = "=0.2.191"
+serde_json = { version = "=1.0.154", features = ["arbitrary_precision"] }
+sha2 = { version = "=0.11.1", default-features = false }
+macscan-engine = { path = "crates/engine" }
+macscan-analysis = { path = "crates/analysis" }
+
+[profile.dev]
+debug = 0
+incremental = false
+strip = "none"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# The bundled toolchain's rust-objcopy cannot find its LLVM dylib. Local release
+# packaging uses Apple's /usr/bin/strip, not a global toolchain modification.
+strip = "none"
+panic = "abort"

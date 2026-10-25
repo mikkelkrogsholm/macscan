@@ -1,0 +1,11 @@
+/target/
+/.build/
+/dist/
+/measurements/
+# Private local validation records can contain scanned paths and disk inventories.
+/evidence/
+/STATE.md
+/ui/node_modules/
+/crates/desktop/gen/
+*.partial
+.DS_Store
