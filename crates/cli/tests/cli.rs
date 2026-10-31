@@ -389,3 +389,14 @@ fn insights_routes_schema_scope_categories_and_validation(){
  for flags in [vec!["--category","junk"],vec!["--limit","0"],vec!["--entry","99999"],vec!["--cursor","bad"]]{let out=f.cmd().args(["insights","--scan",id]).args(flags).arg("--store").arg(&store).output().unwrap();assert!(!out.status.success());}
  assert_eq!(f.cmd().arg("insights").output().unwrap().status.code(),Some(2));
 }
+#[test]
+fn growth_routes_schema_scope_filters_cursor_and_ndjson(){
+ let f=Fixture::new();let root=f.0.join("root");fs::create_dir_all(root.join("project/target")).unwrap();fs::write(root.join("project/Cargo.toml"),b"x").unwrap();fs::write(root.join("project/target/a"),b"123").unwrap();let store=f.0.join("history");
+ let a=json(&f.cmd().arg("scan").arg(&root).args(["--save","--store"]).arg(&store).output().unwrap());fs::write(root.join("project/target/a"),b"12345678").unwrap();fs::write(root.join("project/new"),b"12345").unwrap();let b=json(&f.cmd().arg("scan").arg(&root).args(["--save","--store"]).arg(&store).output().unwrap());let before=a["scan_id"].as_str().unwrap();let after=b["scan_id"].as_str().unwrap();
+ let schema=json(&f.cmd().arg("schema").output().unwrap());assert_eq!(schema["growth_contract"]["version"],"growth-1");
+ let page=json(&f.cmd().args(["growth",before,after,"--metric","logical","--grouping","category","--limit","1","--entry","0","--view","groups","--change","all"]).arg("--store").arg(&store).output().unwrap());assert_eq!(page["command"],"growth");assert_eq!(page["rule_version"],"insights-1");assert_eq!(page["contributions"]["delta_bytes"],"10");assert!(page["next_cursor"].is_string());
+ let next=json(&f.cmd().args(["growth",before,after,"--metric","logical","--grouping","category","--cursor",page["next_cursor"].as_str().unwrap()]).arg("--store").arg(&store).output().unwrap());assert_eq!(next["records"].as_array().unwrap().len(),1);
+ let detail=json(&f.cmd().args(["growth",before,after,"--metric","logical","--grouping","category","--view","files","--group","build_output","--change","grown"]).arg("--store").arg(&store).output().unwrap());assert_eq!(detail["records"][0]["delta_bytes"],"5");assert_eq!(detail["records"][0]["drilldown_scan_id"],after);
+ let nd=f.cmd().args(["growth",before,after,"--format","ndjson"]).arg("--store").arg(&store).output().unwrap();assert!(nd.status.success());assert!(nd.stdout.len()<=8192);for line in String::from_utf8(nd.stdout).unwrap().lines(){assert!(serde_json::from_str::<Value>(line).is_ok());}
+ for flags in [vec!["--grouping","junk"],vec!["--view","junk"],vec!["--change","junk"],vec!["--limit","0"],vec!["--entry","99999"],vec!["--cursor","wrong"]]{assert!(!f.cmd().args(["growth",before,after]).args(flags).arg("--store").arg(&store).output().unwrap().status.success());}assert_eq!(f.cmd().arg("growth").output().unwrap().status.code(),Some(2));
+}

@@ -178,25 +178,7 @@ impl Store {
             return Err(io::Error::new(io::ErrorKind::NotFound, "entry not found"));
         }
         self.restrict(&db)?;
-        // Materialize only candidate directories and their interval boundaries.
-        // An ASOF join assigns each leaf once, without expanding file/ancestor pairs.
-        let mut catalog = String::new();
-        for (i, (bucket, suffix, reason, guidance)) in CATALOG.iter().enumerate() {
-            catalog.push_str(&format!(" UNION ALL SELECT entry_id,path_key,{} AS bucket,{} AS rule,{} AS explanation,{} AS guidance,100 AS priority,coverage_complete AND coalesce(enumeration_complete,false) AS context_complete FROM entries_saved WHERE kind='directory' AND ends_with(hex(path_bytes),{})",literal(bucket),literal(&format!("catalog-{i}")),literal(reason),literal(guidance),literal(&hex(suffix.as_bytes()).to_uppercase())));
-        }
-        db.exec_cancel(&format!(r#"CREATE TEMP TABLE insight_scopes AS
-SELECT s.entry_id,s.path_key,
- CASE s.rule WHEN 'rust_target' THEN 'build_output' WHEN 'node_dependencies' THEN 'dependencies' WHEN 'cache_hint' THEN 'cache_hint' WHEN 'build_hint' THEN 'build_hint' WHEN 'dependency_hint' THEN 'dependency_hint' ELSE 'unclassified' END AS bucket,
- s.rule, CASE s.rule WHEN 'rust_target' THEN 'Sandsynligt Rust-buildoutput ved en gemt almindelig Cargo.toml-fil.' WHEN 'node_dependencies' THEN 'Sandsynlige afhængigheder ved en gemt almindelig package.json-fil.' WHEN 'build_hint' THEN 'Mappenavnet antyder buildoutput; formålet er ubekræftet.' WHEN 'dependency_hint' THEN 'Mappenavnet antyder afhængigheder; formålet er ubekræftet.' WHEN 'cache_hint' THEN 'Mappenavnet antyder cache; formålet er ubekræftet.' ELSE 'Ingen underbygget kontekstklassifikation; personlige data og sikkerhedskopier er ikke affald.' END AS explanation,
- CASE s.rule WHEN 'rust_target' THEN 'Gennemgå buildoutput med Cargo.' WHEN 'node_dependencies' THEN 'Gennemgå afhængigheder med projektets pakkehåndtering.' ELSE 'Gennemgå de gemte stier og deres formål manuelt.' END AS guidance,0 AS priority,coalesce(s.coverage_complete AND s.enumeration_complete AND coalesce(s.parent_complete,true),false) AS context_complete
-FROM entries_scopes s WHERE s.rule IN ('rust_target','node_dependencies','project_boundary','unverified_name','cache_hint','build_hint','dependency_hint')
-AND (s.rule<>'project_boundary' OR NOT EXISTS (SELECT 1 FROM entries_scopes d WHERE d.rule='node_dependencies' AND starts_with(hex(s.path_key),hex(d.path_key))))
-{catalog};
-CREATE TEMP TABLE insight_events AS
-WITH boundaries AS (SELECT path_key AS key FROM insight_scopes UNION SELECT unhex(substr(hex(path_key),1,length(hex(path_key))-2)||'01') FROM insight_scopes WHERE octet_length(path_key)>0)
-SELECT b.key,s.entry_id AS candidate_id,s.bucket,s.rule,s.explanation,s.guidance,s.context_complete
-FROM boundaries b LEFT JOIN LATERAL (SELECT * FROM insight_scopes s WHERE starts_with(hex(b.key),hex(s.path_key)) ORDER BY priority DESC,octet_length(s.path_key) DESC,entry_id,rule LIMIT 1) s ON true;
-"#),cancel)?;
+        prepare_events(&db, "entries", "insight", cancel)?;
         let scope = selected["key"].as_str().unwrap_or("");
         let filter = if selected["key"].is_null() {
             let raw = selected["raw_path"]
@@ -277,4 +259,35 @@ sum(observed) AS observed_lower_bound_bytes,count(*) AS file_path_count,
         }
         compact_response(answer, Some(&binding))
     }
+}
+
+// Two consumers share the exact versioned catalog and contextual precedence.
+pub(super) fn prepare_events(
+    db: &Db,
+    source: &str,
+    output: &str,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    // Materialize only candidate directories and their interval boundaries.
+    // An ASOF join assigns each leaf once, without expanding file/ancestor pairs.
+    let mut catalog = String::new();
+    for (i, (bucket, suffix, reason, guidance)) in CATALOG.iter().enumerate() {
+        catalog.push_str(&format!(" UNION ALL SELECT entry_id,path_key,{} AS bucket,{} AS rule,{} AS explanation,{} AS guidance,100 AS priority,coverage_complete AND coalesce(enumeration_complete,false) AS context_complete FROM {source}_saved WHERE kind='directory' AND ends_with(hex(path_bytes),{})",literal(bucket),literal(&format!("catalog-{i}")),literal(reason),literal(guidance),literal(&hex(suffix.as_bytes()).to_uppercase())));
+    }
+    let sql = format!(
+        r#"CREATE TEMP TABLE {output}_scopes AS
+SELECT s.entry_id,s.path_key,
+ CASE s.rule WHEN 'rust_target' THEN 'build_output' WHEN 'node_dependencies' THEN 'dependencies' WHEN 'cache_hint' THEN 'cache_hint' WHEN 'build_hint' THEN 'build_hint' WHEN 'dependency_hint' THEN 'dependency_hint' ELSE 'unclassified' END AS bucket,
+ s.rule, CASE s.rule WHEN 'rust_target' THEN 'Sandsynligt Rust-buildoutput ved en gemt almindelig Cargo.toml-fil.' WHEN 'node_dependencies' THEN 'Sandsynlige afhængigheder ved en gemt almindelig package.json-fil.' WHEN 'build_hint' THEN 'Mappenavnet antyder buildoutput; formålet er ubekræftet.' WHEN 'dependency_hint' THEN 'Mappenavnet antyder afhængigheder; formålet er ubekræftet.' WHEN 'cache_hint' THEN 'Mappenavnet antyder cache; formålet er ubekræftet.' ELSE 'Ingen underbygget kontekstklassifikation; personlige data og sikkerhedskopier er ikke affald.' END AS explanation,
+ CASE s.rule WHEN 'rust_target' THEN 'Gennemgå buildoutput med Cargo.' WHEN 'node_dependencies' THEN 'Gennemgå afhængigheder med projektets pakkehåndtering.' ELSE 'Gennemgå de gemte stier og deres formål manuelt.' END AS guidance,0 AS priority,coalesce(s.coverage_complete AND s.enumeration_complete AND coalesce(s.parent_complete,true),false) AS context_complete
+FROM {source}_scopes s WHERE s.rule IN ('rust_target','node_dependencies','project_boundary','unverified_name','cache_hint','build_hint','dependency_hint')
+AND (s.rule<>'project_boundary' OR NOT EXISTS (SELECT 1 FROM {source}_scopes d WHERE d.rule='node_dependencies' AND starts_with(hex(s.path_key),hex(d.path_key))))
+{catalog};
+CREATE TEMP TABLE {output}_events AS
+WITH boundaries AS (SELECT path_key AS key FROM {output}_scopes UNION SELECT unhex(substr(hex(path_key),1,length(hex(path_key))-2)||'01') FROM {output}_scopes WHERE octet_length(path_key)>0)
+SELECT b.key,s.entry_id AS candidate_id,s.bucket,s.rule,s.explanation,s.guidance,s.context_complete
+FROM boundaries b LEFT JOIN LATERAL (SELECT * FROM {output}_scopes s WHERE starts_with(hex(b.key),hex(s.path_key)) ORDER BY priority DESC,octet_length(s.path_key) DESC,entry_id,rule LIMIT 1) s ON true;
+"#
+    );
+    db.exec_cancel(&sql, cancel)
 }

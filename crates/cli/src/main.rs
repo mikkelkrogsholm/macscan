@@ -64,6 +64,10 @@ struct Options {
     before: Option<String>,
     offset: usize,
     category: Option<String>,
+    growth_grouping: macscan_analysis::GrowthGrouping,
+    growth_files: bool,
+    growth_group: Option<String>,
+    growth_change: String,
 }
 fn utf8(value: &OsString) -> Result<&str> {
     value
@@ -96,6 +100,10 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         before: None,
         offset: 0,
         category: None,
+        growth_grouping: macscan_analysis::GrowthGrouping::Area,
+        growth_files: false,
+        growth_group: None,
+        growth_change: "all".into(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -138,7 +146,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                         | "scans"
                         | "compare"
                         | "query"
-                        | "insights"
+                        | "insights" | "growth"
                 ) =>
             {
                 options.store = PathBuf::from(value)
@@ -158,20 +166,20 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--metric"
                 if matches!(
                     command,
-                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare" | "insights"
+                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare" | "insights" | "growth"
                 ) =>
             {
                 options.query.metric =
                     Metric::parse(utf8(value)?).map_err(|e| Error::io("metric", e))?
             }
-            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect" | "insights") => {
+            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect" | "insights" | "growth") => {
                 options.query.entry = u32::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("entry ID overflow"))?
             }
             "--limit"
                 if matches!(
                     command,
-                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights"
+                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights" | "growth"
                 ) =>
             {
                 options.query.limit =
@@ -180,11 +188,22 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--cursor"
                 if matches!(
                     command,
-                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights"
+                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights" | "growth"
                 ) =>
             {
                 options.query.cursor = Some(utf8(value)?.into())
             }
+            "--grouping" if command == "growth" => options.growth_grouping = match utf8(value)? {
+                "area" => macscan_analysis::GrowthGrouping::Area,
+                "category" => macscan_analysis::GrowthGrouping::Category,
+                _ => return Err(Error::usage("grouping must be area or category")),
+            },
+            "--view" if command == "growth" => options.growth_files = match utf8(value)? {
+                "groups" => false, "files" => true,
+                _ => return Err(Error::usage("view must be groups or files")),
+            },
+            "--group" if command == "growth" => options.growth_group = Some(utf8(value)?.into()),
+            "--change" if command == "growth" => options.growth_change = utf8(value)?.into(),
             "--category" if command == "insights" => options.category = Some(utf8(value)?.into()),
             "--sql" if command == "query" => options.sql = Some(utf8(value)?.into()),
             "--before" if command == "query" => options.before = Some(utf8(value)?.into()),
@@ -281,8 +300,9 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID"],
+        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
+        "growth_contract":{"version":"growth-1","rules":"insights-1","grouping":["area","category"],"view":["groups","files"],"change":["all","grown","shrunk","added","removed","unknown"],"group":"stable group_key from a previous response","scope":"AFTER --entry; BEFORE matched by saved raw path key","accounting":"changed regular-file contributions, no directory subtree overlap","documentation":"docs/growth.md"},
         "insights_contract":{"version":"insights-1","default":"category rollups","category":"paginated contributing candidate scopes","counts":"regular file paths including hardlinks, not physical identities","rules":"docs/insights.md"},
         "category_contract":{"version":"context-1","category":"derived from saved raw metadata; probable contextual rules or unverified name hints, never deletion approval","saved_category":"legacy snapshot value, not evidence","coverage":"complete, partial, or context_unavailable; applies to saved context, not live validity","rules":"docs/category-rules.md"},
         "query_views":{"entries":"selected scan; schema below","changes":"available with --before ID; joins selected AFTER and BEFORE scan","before_entries":"available with --before ID"},
@@ -336,6 +356,18 @@ fn run() -> Result<u8> {
             }
             result["command"] = json!("scan");
             result["retained"] = json!(options.save);
+            result
+        }
+        "growth" => {
+            if options.operands.len() != 2 { return Err(Error::usage("growth requires BEFORE_ID AFTER_ID")); }
+            let store = Store::open(&options.store, false).map_err(|e| Error::io("open_store", e))?;
+            let result = store.growth(utf8(&options.operands[0])?, utf8(&options.operands[1])?, &macscan_analysis::GrowthQuery {
+                entry: options.query.entry, metric: options.query.metric,
+                grouping: options.growth_grouping, files: options.growth_files,
+                group: options.growth_group, change: options.growth_change,
+                limit: options.query.limit, cursor: options.query.cursor,
+            }, &CANCEL).map_err(|e| Error::io("growth", e))?;
+            code = if result["coverage"]["complete"] == false { 5 } else { 0 };
             result
         }
         "insights" => {
