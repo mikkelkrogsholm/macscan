@@ -400,3 +400,17 @@ fn growth_routes_schema_scope_filters_cursor_and_ndjson(){
  let nd=f.cmd().args(["growth",before,after,"--format","ndjson"]).arg("--store").arg(&store).output().unwrap();assert!(nd.status.success());assert!(nd.stdout.len()<=8192);for line in String::from_utf8(nd.stdout).unwrap().lines(){assert!(serde_json::from_str::<Value>(line).is_ok());}
  for flags in [vec!["--grouping","junk"],vec!["--view","junk"],vec!["--change","junk"],vec!["--limit","0"],vec!["--entry","99999"],vec!["--cursor","wrong"]]{assert!(!f.cmd().args(["growth",before,after]).args(flags).arg("--store").arg(&store).output().unwrap().status.success());}assert_eq!(f.cmd().arg("growth").output().unwrap().status.code(),Some(2));
 }
+
+#[test]
+fn coverage_command_reports_saved_whole_measurement_in_json_and_ndjson(){
+    let f=Fixture::new();let source=f.0.join("source");fs::create_dir(&source).unwrap();let store=source.join("history");
+    let out=f.cmd().args(["scan"]).arg(&source).arg("--output").arg(&store).output().unwrap();assert_eq!(out.status.code(),Some(5));
+    let saved:Value=serde_json::from_slice(&out.stdout).unwrap();let id=saved["scan_id"].as_str().unwrap();
+    for format in ["json","ndjson"] {
+        let out=f.cmd().args(["coverage","--scan",id,"--reason","scanner_output","--format",format,"--store"]).arg(&store).output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(out.stdout.len()<=8192);
+        let start:Value=serde_json::from_slice(if format=="json"{&out.stdout}else{out.stdout.split(|b|*b==b'\n').next().unwrap()}).unwrap();assert_eq!(start["scope"],"whole_measurement");assert_eq!(start["reason_counts"]["scanner_output"],"1");assert_eq!(start["quality"],"event_counts");
+    }
+    let rejected=f.cmd().args(["coverage","--scan",id,"--entry","0","--store"]).arg(&store).output().unwrap();assert_eq!(rejected.status.code(),Some(2));
+    let mut m:Value=serde_json::from_slice(&fs::read(store.join(id).join("manifest.json")).unwrap()).unwrap();m.as_object_mut().unwrap().remove("coverage_diagnostics");fs::write(store.join(id).join("manifest.json"),serde_json::to_vec(&m).unwrap()).unwrap();
+    let legacy=json(&f.cmd().args(["coverage","--scan",id,"--store"]).arg(&store).output().unwrap());assert_eq!(legacy["quality"],"legacy_samples_only");assert!(legacy["reason_counts"].is_null());assert_eq!(legacy["error_count"],"1");
+}

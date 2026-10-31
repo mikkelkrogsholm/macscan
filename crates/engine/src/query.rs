@@ -144,6 +144,18 @@ impl Scan {
         response["coverage"]["issue_samples_truncated"] =
             json!(self.issue_count > self.issues.len().min(8) as u64);
 
+        // The versioned distribution is full measurement metadata. Examples
+        // have their own saved coverage API and cannot consume this query's
+        // bounded entry page header.
+        if let Some(samples)=response["coverage_diagnostics"]["samples"].as_array() {
+            let count=samples.len();
+            response["coverage_diagnostics"]["samples_omitted_for_output_budget"]=json!(count);
+            response["coverage_diagnostics"]["samples"]=json!([]);
+        }
+        while serde_json::to_vec(&response)?.len()+4096>OUTPUT_BUDGET {
+            if response["issues"].as_array_mut().unwrap().pop().is_none(){break;}
+            response["coverage"]["issue_samples_truncated"]=json!(true);
+        }
         if q.kind == QueryKind::Summary {
             return ensure_budget(response);
         }

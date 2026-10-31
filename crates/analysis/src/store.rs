@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+mod coverage;
 mod categories;
 mod insights;
 mod growth;
@@ -93,6 +94,7 @@ impl Store {
         budget: u64,
         cancel: &AtomicBool,
     ) -> io::Result<()> {
+        let global_valid=scan.coverage_globally_valid();
         // Serialize this store's publications so simultaneous saves cannot each
         // claim the same metadata budget. File close releases the advisory lock.
         use std::os::fd::AsRawFd;
@@ -160,9 +162,9 @@ impl Store {
                 app.blob(raw)?;
                 app.blob(&path_key(scan, id as u32))?;
                 app.text(e.kind.name())?;
-                app.number(e.complete.then_some(e.logical))?;
-                app.number(e.complete.then_some(e.allocated))?;
-                app.number(e.complete.then_some(e.accounted))?;
+                app.number((e.complete && global_valid).then_some(e.logical))?;
+                app.number((e.complete && global_valid).then_some(e.allocated))?;
+                app.number((e.complete && global_valid).then_some(e.accounted))?;
                 app.number(Some(e.own_allocated))?;
                 app.number(Some(e.logical))?;
                 app.number(Some(e.allocated))?;
@@ -173,8 +175,8 @@ impl Store {
                 app.number(Some(e.observed_links as u64))?;
                 app.number(e.charged_to.map(u64::from))?;
                 app.signed(e.mtime)?;
-                app.boolean(e.complete)?;
-                app.boolean(e.enumeration_complete)?;
+                app.boolean(e.complete && global_valid)?;
+                app.boolean(e.enumeration_complete && global_valid)?;
                 app.text(CATEGORIES[categories[id] as usize])?;
                 app.number(None)?;
                 app.end()?;
@@ -201,7 +203,7 @@ impl Store {
         db.exec("CREATE TABLE coverage_batch(path_key BLOB,complete BOOLEAN)")?;
         let mut cov = db.appender("coverage_batch")?;
         cov.blob(&[])?;
-        cov.boolean(scan.entries[0].enumeration_complete)?;
+        cov.boolean(scan.entries[0].enumeration_complete && global_valid)?;
         cov.end()?;
         for (id, e) in scan.entries.iter().enumerate().skip(1) {
             if id % 256 == 0 {
@@ -211,7 +213,7 @@ impl Store {
                 continue;
             }
             let parent = scan.entries[e.parent.unwrap() as usize].enumeration_complete;
-            if parent != e.enumeration_complete {
+            if global_valid && parent != e.enumeration_complete {
                 let mut key = path_key(scan, id as u32);
                 cov.blob(&key)?;
                 cov.boolean(e.enumeration_complete)?;
@@ -226,12 +228,13 @@ impl Store {
         db.exec(&format!("COPY (SELECT * FROM coverage_batch ORDER BY path_key) TO {} (FORMAT PARQUET,COMPRESSION ZSTD)",path_literal(&stage.path.join("coverage.parquet"))?))?;
         let report = scan.report(0);
         let manifest = json!({"storage_format":FORMAT,"schema_version":"2.0","engine_version":ENGINE_VERSION,
-            "scan_id":scan.id,"status":scan.status.name(),"scope":report["scope"],"context":scan.context,
+            "scan_id":scan.id,"status":scan.status.name(),"scope":report["scope"],"context":scan.measurement_context(),
             "started_at":scan.started_at,"ended_at":scan.ended_at,"duration_ms":scan.duration_ms,
+            "coverage_diagnostics":scan.context["coverage_diagnostics"],
             "entry_count":scan.entries.len(),"error_count":scan.issue_count,"excluded_count":scan.excluded_count,
             "totals":compact_totals(&report["totals"]),
             "issues":scan.issues.iter().take(8).map(|i|json!({"entry_id":i.entry_id.to_string(),"code":i.code,"operation":i.operation,"detail":i.detail})).collect::<Vec<_>>()});
-        let bytes = serde_json::to_vec(&manifest)?;
+        let bytes = manifest_bytes(&manifest)?;
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
@@ -259,7 +262,13 @@ impl Store {
     }
 
     fn attach(&self, db: &Db, id: &str, table: &str) -> io::Result<Value> {
-        let manifest = self.manifest(id)?;
+        let mut manifest = self.manifest(id)?;
+        // Old snapshots may have invalidated only the root. Proven fsid change
+        // is global; missing legacy identity by itself says nothing.
+        let before=manifest["context"]["volume_before"]["fsid"].as_str();
+        let after=manifest["context"]["volume_after"]["fsid"].as_str();
+        let invalid=before.zip(after).is_some_and(|(a,b)|a!=b)
+            || manifest["coverage_diagnostics"]["counts"]["volume_changed"].as_u64().is_some_and(|n|n>0);
         let location = self.location(id)?;
         let entries = location.join("entries/*.parquet");
         let coverage = location.join("coverage.parquet");
@@ -280,15 +289,21 @@ impl Store {
         if !columns.contains("mtime_unix_seconds") {
             fallback.push_str(",NULL::BIGINT AS mtime_unix_seconds");
         }
+        let replacement=if invalid {" REPLACE(NULL::UBIGINT AS logical_bytes,NULL::UBIGINT AS allocated_bytes,NULL::UBIGINT AS accounted_allocated_bytes,false AS coverage_complete,false AS enumeration_complete)"}else{""};
         db.exec(&format!(
-            "CREATE VIEW {table}_saved AS SELECT *{fallback},{} AS scan_id FROM read_parquet({source})",
+            "CREATE VIEW {table}_saved AS SELECT *{replacement},{} AS scan_id FROM (SELECT *{fallback} FROM read_parquet({source}))",
             literal(id)
         ))?;
         db.exec(&format!(
-            "CREATE VIEW {table}_coverage AS SELECT * FROM read_parquet({})",
-            path_literal(&coverage)?
+            "CREATE VIEW {table}_coverage AS SELECT path_key,{} AS complete FROM read_parquet({})",
+            if invalid {"false"}else{"complete"},path_literal(&coverage)?
         ))?;
         categories::attach(db, table, context_available)?;
+        if invalid {
+            manifest["status"]=json!("partial");
+            manifest["read_time_global_invalidation"]=json!(true);
+            for key in ["logical_bytes","allocated_bytes","accounted_allocated_bytes"] {manifest["totals"][key]=Value::Null;}
+        }
         Ok(manifest)
     }
     fn restrict(&self, db: &Db) -> io::Result<()> {
@@ -790,6 +805,11 @@ fn category(name: &[u8]) -> u8 {
         b"Docker.raw" => 6,
         _ => 0,
     }
+}
+fn manifest_bytes(manifest:&Value)->io::Result<Vec<u8>> {
+    let bytes=serde_json::to_vec(manifest)?;
+    if bytes.len()>64*1024 {return Err(io::Error::new(io::ErrorKind::StorageFull,"scan manifest exceeds 64 KiB; snapshot not published"));}
+    Ok(bytes)
 }
 fn path_literal(path: &Path) -> io::Result<String> {
     path.to_str()

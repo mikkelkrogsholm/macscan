@@ -99,6 +99,7 @@ fn options_for(root:&str)->io::Result<ScanOptions>{
         let links=fs::read_to_string("/usr/share/firmlinks")?;
         if links.len()>64*1024{return Err(io::Error::other("oversize firmlink inventory"));}
         options.exclusions=system_exclusions(&links);
+        options.exclusion_reasons=system_exclusion_reasons(&options.exclusions);
     }
     Ok(options)
 }
@@ -106,6 +107,9 @@ fn system_exclusions(links:&str)->Vec<PathBuf>{
     let mut roots=vec![PathBuf::from("/System/Volumes"),PathBuf::from("/Volumes"),PathBuf::from("/dev")];
     for line in links.lines(){if let Some(source)=line.split('\t').next().filter(|s|s.starts_with('/')&&*s!="/") {let path=PathBuf::from(source);if !roots.contains(&path){roots.push(path);}}}
     roots.sort();roots
+}
+fn system_exclusion_reasons(roots:&[PathBuf])->Vec<(PathBuf,macscan_engine::ExclusionReason)> {
+    roots.iter().filter(|p|p.as_path()!=Path::new("/dev")).map(|p|(p.clone(),if ["/System/Volumes","/Volumes"].contains(&p.to_str().unwrap_or("")){macscan_engine::ExclusionReason::VolumeBoundary}else{macscan_engine::ExclusionReason::FirmlinkBoundary})).collect()
 }
 pub fn run(store:&Path,mut session:Value,cancel:&AtomicBool,mut progress:impl FnMut(Value))->io::Result<String>{
     let store=Store::open(store,true)?;let start=Instant::now();let session_id=id();
@@ -151,6 +155,10 @@ fn utc()->String { // Existing engine timestamps have the same public UTC format
     #[test]fn system_aliases_and_mounted_images_are_explicitly_pruned(){
         let exclusions=system_exclusions("/Applications\tApplications\n/Library\tLibrary\n/usr/local\tusr/local\n");
         for p in ["/Applications","/Library","/usr/local","/System/Volumes","/dev","/Volumes"]{assert!(exclusions.contains(&PathBuf::from(p)));}
+        let options=ScanOptions{exclusions:exclusions.clone(),exclusion_reasons:system_exclusion_reasons(&exclusions),..ScanOptions::default()};
+        assert_eq!(options.exclusion_code(Path::new("/dev")),"EXPLICIT_EXCLUDED");
+        for p in ["/System/Volumes","/Volumes"] {assert_eq!(options.exclusion_code(Path::new(p)),"MOUNT_EXCLUDED");}
+        for p in ["/Applications","/Library","/usr/local"] {assert_eq!(options.exclusion_code(Path::new(p)),"FIRMLINK_EXCLUDED");}
         assert!(!exclusions.contains(&PathBuf::from("/")));assert!(!exclusions.contains(&PathBuf::from("/System/Library")));
         assert!(options_for("/System/Volumes/Data").unwrap().exclusions.is_empty());
     }

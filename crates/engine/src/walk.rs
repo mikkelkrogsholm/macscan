@@ -29,6 +29,7 @@ struct Frame {
 }
 struct Branches(Vec<(Vec<u8>, serde_json::Value)>);
 impl Branches {
+    // Called only after the same root scope gate admitted the traversal.
     fn discover(root:&Path)->Self {
         let mut found=Self(Vec::new());
         if let Ok(mut directory)=Directory::root(root) {
@@ -60,19 +61,12 @@ impl Branches {
     }
     fn rows(&self)->Vec<serde_json::Value>{self.0.iter().map(|(_,v)|v.clone()).collect()}
 }
-fn issue(
-    scan: &mut Scan,
-    node: &mut StreamEntry,
-    code: &'static str,
-    detail: String,
-    excluded: bool,
-) {
-    node.entry.complete = false;
-    node.entry.enumeration_complete = false;
-    scan.issue(0, code, "scan", detail, excluded);
-    if let Some(sample) = scan.issues.last_mut().filter(|_| scan.issue_count <= 128) {
-        sample.entry_id = node.id;
-    }
+fn issue(scan:&mut Scan,node:&mut StreamEntry,code:&'static str,detail:String,excluded:bool) {
+    issue_event(scan,node,code,"scope",detail,excluded,None,None);
+}
+fn issue_event(scan:&mut Scan,node:&mut StreamEntry,code:&'static str,operation:&'static str,detail:String,excluded:bool,error:Option<&io::Error>,name:Option<&[u8]>) {
+    node.entry.complete=false; node.entry.enumeration_complete=false;
+    scan.issue_event(0,node.id,code,operation,detail,excluded,error,name);
 }
 
 pub fn walk_with_progress(
@@ -113,7 +107,8 @@ pub fn walk_with_progress(
         requested.canonicalize()?
     };
     excluded_root |= cloud_path(&root);
-    let directory = if metadata.is_dir() && !excluded_root {
+    let root_excluded = options.exclusions.iter().any(|p| root.starts_with(p));
+    let directory = if metadata.is_dir() && !excluded_root && !root_excluded {
         let d = Directory::root(&root)?;
         let opened = d.metadata()?;
         if (opened.device, opened.inode) != (metadata.device, metadata.inode) {
@@ -125,7 +120,7 @@ pub fn walk_with_progress(
     };
     let capacity = if let Some(d) = &directory {
         Some(d.child(&CString::new(".").unwrap(), metadata)?)
-    } else if !excluded_root {
+    } else if !excluded_root && !root_excluded {
         root.parent().map(Directory::root).transpose()?
     } else {
         None
@@ -176,7 +171,7 @@ pub fn walk_with_progress(
                 .join(",")
         ),
         context: json!({"os_identity":crate::volume::os_identity().ok(),"volume_before":before,
-            "volume_after":null,"started_unix_ns":nanos.to_string(),"ended_unix_ns":null}),
+            "coverage_diagnostics":crate::coverage::empty(),"volume_after":null,"started_unix_ns":nanos.to_string(),"ended_unix_ns":null}),
     };
     let mut node = StreamEntry {
         id: 0,
@@ -185,7 +180,6 @@ pub fn walk_with_progress(
         relative: PathBuf::new(),
         entry: Entry::new(None, Vec::new(), metadata),
     };
-    let root_excluded = options.exclusions.iter().any(|p| root.starts_with(p));
     if excluded_root || root_excluded {
         issue(
             &mut scan,
@@ -193,9 +187,9 @@ pub fn walk_with_progress(
             if excluded_root {
                 "CLOUD_EXCLUDED"
             } else {
-                "OUTPUT_EXCLUDED"
+                options.exclusion_code(&root)
             },
-            "cloud/provider, dataless or output root excluded".into(),
+            if excluded_root {"cloud/provider or dataless root excluded"}else{"deliberate root path exclusion"}.into(),
             true,
         );
     }
@@ -206,7 +200,7 @@ pub fn walk_with_progress(
     } else {
         emit(node)?;
     }
-    let mut branches=Branches::discover(&root);
+    let mut branches=if stack.is_empty(){Branches(Vec::new())}else{Branches::discover(&root)};
     let mut last_progress = Instant::now();
     progress(&Progress {
         branches: branches.rows(),
@@ -227,25 +221,23 @@ pub fn walk_with_progress(
             });
             last_progress = Instant::now();
         }
-        let next = stack.last_mut().unwrap().directory.next_metadata();
+        let next = stack.last_mut().unwrap().directory.next_metadata_event();
         let (name,metadata) = match next {
             Ok(Some(pair)) => pair,
             ended => {
                 let mut frame = stack.pop().unwrap();
                 if let Err(e) = ended {
-                    issue(
-                        &mut scan,
-                        &mut frame.node,
-                        "ENUMERATION_ERROR",
-                        e.to_string(),
-                        false,
-                    );
+                    issue_event(&mut scan,&mut frame.node,"ENUMERATION_ERROR","readdir",e.to_string(),false,Some(&e),None);
                 }
                 frame.node.subtree_end = (count - 1) as u32;
                 branches.note(&frame.node);
                 emit(frame.node)?;
                 continue;
             }
+        };
+        let metadata = match metadata {
+            Ok(m)=>m,
+            Err(e)=>{let frame=stack.last_mut().unwrap();issue_event(&mut scan,&mut frame.node,"METADATA_ERROR","fstatat",e.to_string(),false,Some(&e),Some(name.as_bytes()));continue;}
         };
         if count >= options.max_entries || started.elapsed() >= options.max_duration {
             scan.issue(
@@ -281,11 +273,12 @@ pub fn walk_with_progress(
                 true,
             );
         } else if options.exclusions.iter().any(|p| child.path.starts_with(p)) {
+            let code=options.exclusion_code(&child.path);
             issue(
                 &mut scan,
                 &mut child,
-                "OUTPUT_EXCLUDED",
-                "metadata/output path excluded".into(),
+                code,
+                "deliberate path exclusion".into(),
                 true,
             );
         } else if metadata.dataless() || cloud_path(&child.path) {
@@ -313,13 +306,7 @@ pub fn walk_with_progress(
                     });
                     continue;
                 }
-                Err(e) => issue(
-                    &mut scan,
-                    &mut child,
-                    "OPEN_DIRECTORY_ERROR",
-                    e.to_string(),
-                    false,
-                ),
+                Err(e) => issue_event(&mut scan,&mut child,"OPEN_DIRECTORY_ERROR","openat",e.to_string(),false,Some(&e),None),
             }
         }
         branches.note(&child);

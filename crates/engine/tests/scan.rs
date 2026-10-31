@@ -433,7 +433,8 @@ fn t21_store_inside_scan_is_explicitly_excluded() {
     let data = scan(
         &f.0,
         &ScanOptions {
-            exclusions: vec![path],
+            exclusions: vec![path.clone()],
+            exclusion_reasons: vec![(path,macscan_engine::ExclusionReason::ScannerOutput)],
             ..ScanOptions::default()
         },
         &AtomicBool::new(false),

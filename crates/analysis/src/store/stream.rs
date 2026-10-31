@@ -124,10 +124,12 @@ impl Store {
                     max_depth: options.max_depth,
                     max_memory_bytes: options.max_memory_bytes,
                     exclusions: options.exclusions.clone(),
+                    exclusion_reasons: options.exclusion_reasons.clone(),
                 };
                 if !scan_options.exclusions.contains(&self.root) {
                     scan_options.exclusions.push(self.root.clone());
                 }
+                scan_options.exclusion_reasons.push((self.root.clone(), macscan_engine::ExclusionReason::ScannerOutput));
                 let batch_budget = (options.max_memory_bytes / 4).clamp(64 * 1024, 4 * 1024 * 1024);
                 let mut summary = walk_with_progress(
                     root,
@@ -154,17 +156,14 @@ impl Store {
                 }
                 summary.scan.id = id.clone();
                 cancelled(&stop)?;
-                let root_valid = !summary
-                    .scan
-                    .issues
-                    .iter()
-                    .any(|i| i.code == "VOLUME_CHANGED");
+                let root_valid = summary.scan.coverage_globally_valid();
                 let totals = finalize(&db, &stage.path, &stop, root_valid)?;
                 let scan = &summary.scan;
                 let manifest = json!({"storage_format":FORMAT,"schema_version":"2.0","engine_version":ENGINE_VERSION,
-                    "scan_id":id,"status":scan.status.name(),"scope":scan.report(0)["scope"],"context":scan.context,
+                    "scan_id":id,"status":scan.status.name(),"scope":scan.report(0)["scope"],"context":scan.measurement_context(),
                     "started_at":scan.started_at,"ended_at":scan.ended_at,"duration_ms":scan.duration_ms,
                     "entry_count":summary.entry_count,"error_count":scan.issue_count,"excluded_count":scan.excluded_count,
+                    "coverage_diagnostics":scan.context["coverage_diagnostics"],
                     "scan_mode":"streaming_full","workspace_limit_bytes":workspace_limit,
                     "totals":{"logical_bytes":totals["logical_bytes"],"allocated_bytes":totals["allocated_bytes"],"accounted_allocated_bytes":totals["accounted_allocated_bytes"],"private_bytes":null,
                       "observed_lower_bound":{"logical_bytes":totals["observed_logical_bytes"],"allocated_bytes":totals["observed_allocated_bytes"],"accounted_allocated_bytes":totals["observed_accounted_allocated_bytes"]}},
@@ -179,7 +178,7 @@ impl Store {
                     .create_new(true)
                     .mode(0o600)
                     .open(stage.path.join("manifest.json"))?;
-                file.write_all(&serde_json::to_vec(&manifest)?)?;
+                file.write_all(&manifest_bytes(&manifest)?)?;
                 file.sync_all()?;
                 if old_bytes.saturating_add(directory_bytes(&stage.path)?) > budget {
                     return Err(io::Error::new(
@@ -234,7 +233,7 @@ fn scanner_file_budget()->io::Result<()> {
 
 fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool) -> io::Result<Value> {
     db.exec(&format!(
-        "CREATE VIEW raw AS SELECT * REPLACE(enumeration_complete AND (entry_id<>0 OR {root_valid}) AS enumeration_complete) FROM read_parquet({})",
+        "CREATE VIEW raw AS SELECT * REPLACE(enumeration_complete AND {root_valid} AS enumeration_complete) FROM read_parquet({})",
         path_literal(&stage.join("raw/*.parquet"))?
     ))?;
     // Only hardlinked regular files enter this disk-backed lookup table.
@@ -330,6 +329,22 @@ fn available(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod large_tests {
     use super::*;
+
+    #[test]
+    fn globally_invalid_finalization_cannot_restore_complete_children() {
+        let path=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-invalid-finalize-{}",std::process::id()));
+        fs::create_dir(&path).unwrap();fs::create_dir(path.join("raw")).unwrap();fs::create_dir(path.join("entries")).unwrap();
+        let db=Db::new().unwrap();
+        db.exec(&format!("CREATE TABLE batch ({RAW_SCHEMA})")).unwrap();
+        for (id,parent,end,name,key,kind) in [(0,"NULL",2,"","","directory"),(1,"0",2,"child","6368696c6400","directory"),(2,"1",2,"file","6368696c640066696c6500","file")] {
+            db.exec(&format!("INSERT INTO batch VALUES ({id},{parent},{end},'{name}','/synthetic/{name}',unhex(''),unhex(''),unhex('{key}'),'{kind}',7,4096,1,{id},1,0,true,'unclassified')")).unwrap();
+        }
+        db.exec(&format!("COPY batch TO {} (FORMAT PARQUET)",path_literal(&path.join("raw/part.parquet")).unwrap())).unwrap();
+        let totals=finalize(&db,&path,&AtomicBool::new(false),false).unwrap();assert!(totals["logical_bytes"].is_null());assert_eq!(totals["observed_logical_bytes"],"21");
+        let rows=db.query("SELECT coverage_complete,logical_bytes,enumeration_complete FROM final WHERE entry_id=1",None).unwrap().row(0).unwrap();assert_eq!(rows["coverage_complete"],false);assert!(rows["logical_bytes"].is_null());assert_eq!(rows["enumeration_complete"],false);
+        let coverage=db.query(&format!("SELECT count(*) AS n FROM read_parquet({}) WHERE complete",path_literal(&path.join("coverage.parquet")).unwrap()),None).unwrap().row(0).unwrap();assert_eq!(coverage["n"],"0");
+        drop(db);fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     #[ignore = "Ten-million-row disk-backed finalization acceptance; run explicitly"]

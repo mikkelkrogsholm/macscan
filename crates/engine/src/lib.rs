@@ -4,6 +4,7 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("The first Macscan backend requires macOS.");
 
+pub mod coverage;
 mod compare;
 mod bulk;
 mod foundation;
@@ -17,7 +18,7 @@ mod walk;
 pub use compare::CompareQuery;
 pub use query::{Metric, Query, QueryKind, OUTPUT_BUDGET};
 pub use scan::{
-    capabilities, scan, scan_with_progress, Entry, EntryKind, Issue, Progress, Scan, ScanOptions,
+    capabilities, scan, scan_with_progress, Entry, EntryKind, ExclusionReason, Issue, Progress, Scan, ScanOptions,
     ScanStatus,
 };
 pub use store::{Store, STORE_BUDGET};

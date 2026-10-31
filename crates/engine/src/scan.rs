@@ -113,12 +113,19 @@ pub struct Issue {
     pub name: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ExclusionReason { ScannerOutput, VolumeBoundary, FirmlinkBoundary }
+impl ExclusionReason {
+    fn code(self)->&'static str {match self {Self::ScannerOutput=>"OUTPUT_EXCLUDED",Self::VolumeBoundary=>"MOUNT_EXCLUDED",Self::FirmlinkBoundary=>"FIRMLINK_EXCLUDED"}}
+}
 pub struct ScanOptions {
     pub max_entries: usize,
     pub max_duration: Duration,
     pub max_depth: usize,
     pub max_memory_bytes: usize,
     pub exclusions: Vec<PathBuf>,
+    /// Optional provenance for paths already in exclusions; never changes policy paths.
+    pub exclusion_reasons: Vec<(PathBuf, ExclusionReason)>,
 }
 impl Default for ScanOptions {
     fn default() -> Self {
@@ -128,10 +135,14 @@ impl Default for ScanOptions {
             max_depth: 64,
             max_memory_bytes: 224 * 1024 * 1024,
             exclusions: Vec::new(),
+            exclusion_reasons: Vec::new(),
         }
     }
 }
 impl ScanOptions {
+    pub fn exclusion_code(&self, path: &Path) -> &'static str {
+        self.exclusion_reasons.iter().find(|(p,_)| path.starts_with(p)).map(|(_,c)|c.code()).unwrap_or("EXPLICIT_EXCLUDED")
+    }
     /// Streaming callers do not retain the complete tree in memory.
     pub fn full() -> Self {
         Self {
@@ -226,7 +237,8 @@ pub fn scan_with_progress(
     // An ancestor symlink can resolve into a known provider subtree. Recheck
     // the canonical path before any directory open/enumeration.
     cloud_root |= cloud_path(&root);
-    let directory = if metadata.is_dir() && !cloud_root {
+    let root_excluded = options.exclusions.iter().any(|p| root.starts_with(p));
+    let directory = if metadata.is_dir() && !cloud_root && !root_excluded {
         let directory = Directory::root(&root)?;
         let opened = directory.metadata()?;
         if (opened.device, opened.inode) != (metadata.device, metadata.inode) {
@@ -238,7 +250,7 @@ pub fn scan_with_progress(
     };
     let capacity_directory = if let Some(d) = directory.as_ref() {
         Some(d.child(&CString::new(".").unwrap(), metadata)?)
-    } else if !cloud_root && !metadata.is_dir() {
+    } else if !cloud_root && !root_excluded && !metadata.is_dir() {
         let parent = Directory::root(
             root.parent()
                 .ok_or_else(|| io::Error::other("root has no parent"))?,
@@ -293,7 +305,7 @@ pub fn scan_with_progress(
                 .join(",")
         ),
         context: json!({"os_identity":crate::volume::os_identity().ok(),"volume_before":before_capacity,
-            "volume_after":null,"started_unix_ns":nanos.to_string(),"ended_unix_ns":null}),
+            "coverage_diagnostics":crate::coverage::empty(),"volume_after":null,"started_unix_ns":nanos.to_string(),"ended_unix_ns":null}),
     };
     scan.entries.push(Entry::new(None, Vec::new(), metadata));
     let mut stack: Vec<_> = directory.into_iter().map(|d| (0_u32, d)).collect();
@@ -303,10 +315,10 @@ pub fn scan_with_progress(
             if cloud_root {
                 "CLOUD_EXCLUDED"
             } else {
-                "OUTPUT_EXCLUDED"
+                options.exclusion_code(&scan.root)
             },
             "scope",
-            "cloud/provider or dataless root excluded".into(),
+            if cloud_root {"cloud/provider or dataless root excluded"}else{"deliberate root path exclusion"}.into(),
             true,
         );
         stack.clear();
@@ -354,7 +366,7 @@ pub fn scan_with_progress(
                 continue;
             }
             Err(e) => {
-                scan.issue(parent, "ENUMERATION_ERROR", "readdir", e.to_string(), false);
+                scan.issue_event(parent, parent, "ENUMERATION_ERROR", "readdir", e.to_string(), false, Some(&e), None);
                 stack.pop();
                 continue;
             }
@@ -366,10 +378,7 @@ pub fn scan_with_progress(
         let metadata = match directory.child_metadata(&name) {
             Ok(m) => m,
             Err(e) => {
-                scan.issue(parent, "METADATA_ERROR", "fstatat", e.to_string(), false);
-                if let Some(issue) = scan.issues.last_mut().filter(|_| scan.issue_count <= 128) {
-                    issue.name = Some(name.as_bytes().to_vec());
-                }
+                scan.issue_event(parent, parent, "METADATA_ERROR", "fstatat", e.to_string(), false, Some(&e), Some(name.as_bytes()));
                 continue;
             }
         };
@@ -413,9 +422,9 @@ pub fn scan_with_progress(
         } else if options.exclusions.iter().any(|p| child_path.starts_with(p)) {
             scan.issue(
                 id,
-                "OUTPUT_EXCLUDED",
+                options.exclusion_code(&child_path),
                 "scope",
-                "explicit metadata/output path excluded".into(),
+                "deliberate path exclusion".into(),
                 true,
             );
         } else if metadata.dataless() || cloud_path(&child_path) {
@@ -442,7 +451,7 @@ pub fn scan_with_progress(
                 .child(&name, metadata);
             match opened {
                 Ok(child) => stack.push((id, child)),
-                Err(e) => scan.issue(id, "OPEN_DIRECTORY_ERROR", "openat", e.to_string(), false),
+                Err(e) => scan.issue_event(id, id, "OPEN_DIRECTORY_ERROR", "openat", e.to_string(), false, Some(&e), None),
             }
         }
     }
@@ -498,6 +507,14 @@ pub(crate) fn cloud_path(path: &Path) -> bool {
 }
 
 impl Scan {
+    pub fn measurement_context(&self)->Value {
+        let mut context=self.context.clone();
+        if let Some(object)=context.as_object_mut(){object.remove("coverage_diagnostics");}
+        context
+    }
+    pub fn coverage_globally_valid(&self)->bool {
+        self.context["coverage_diagnostics"]["counts"]["volume_changed"].as_u64().unwrap_or(0)==0
+    }
     pub(crate) fn issue(
         &mut self,
         id: u32,
@@ -506,17 +523,26 @@ impl Scan {
         detail: String,
         excluded: bool,
     ) {
+        self.issue_event(id, id, code, operation, detail, excluded, None, None);
+    }
+    pub(crate) fn issue_event(&mut self, mark_id:u32, saved_id:u32, code:&'static str, operation:&'static str, detail:String, excluded:bool, error:Option<&io::Error>, name:Option<&[u8]>) {
+        crate::coverage::record(&mut self.context["coverage_diagnostics"], saved_id, code, operation, &detail, error, name);
+        if code == "VOLUME_CHANGED" {
+            for e in &mut self.entries { e.complete=false; e.enumeration_complete=false; }
+        }
         self.issue_count += 1;
         self.excluded_count += u64::from(excluded);
-        self.entries[id as usize].complete = false;
-        self.entries[id as usize].enumeration_complete = false;
-        if self.issues.len() < 128 {
+        self.entries[mark_id as usize].complete = false;
+        self.entries[mark_id as usize].enumeration_complete = false;
+        let sampled_bytes:usize=self.issues.iter().map(|i|128+i.code.len()+i.operation.len()+i.detail.len()+i.name.as_ref().map_or(0,|n|n.len()*2)).sum();
+        let sample_bytes=128+code.len()+operation.len()+80+name.filter(|n|n.len()<=255).map_or(0,|n|n.len()*2);
+        if self.issues.len() < 128 && sampled_bytes.saturating_add(sample_bytes)<=40*1024 {
             self.issues.push(Issue {
-                entry_id: id,
+                entry_id: saved_id,
                 code: code.into(),
                 operation: operation.into(),
-                detail,
-                name: None,
+                detail: crate::coverage::bounded(&detail,80),
+                name: name.filter(|n|n.len()<=255).map(|n|n.to_vec()),
             });
         }
         if self.status != ScanStatus::Cancelled {
@@ -596,19 +622,20 @@ impl Scan {
     pub fn entry_json(&self, id: u32) -> Value {
         let entry = &self.entries[id as usize];
         let path = self.path(id);
+        let complete=entry.complete && self.coverage_globally_valid();
         json!({"entry_id": id.to_string(), "parent_id": entry.parent.map(|p| p.to_string()),
             "name_display": String::from_utf8_lossy(&entry.name), "path_display": path.to_string_lossy(),
             "path_bytes_hex": hex(path.as_os_str().as_bytes()), "kind": entry.kind.name(),
-            "logical_bytes": entry.complete.then(|| entry.logical.to_string()),
-            "allocated_bytes": entry.complete.then(|| entry.allocated.to_string()),
-            "accounted_allocated_bytes": entry.complete.then(|| entry.accounted.to_string()), "private_bytes": null,
+            "logical_bytes": complete.then(|| entry.logical.to_string()),
+            "allocated_bytes": complete.then(|| entry.allocated.to_string()),
+            "accounted_allocated_bytes": complete.then(|| entry.accounted.to_string()), "private_bytes": null,
             "observed_lower_bound": {"logical_bytes": entry.logical.to_string(), "allocated_bytes": entry.allocated.to_string(), "accounted_allocated_bytes": entry.accounted.to_string()},
             "own_allocated_bytes": entry.own_allocated.to_string(),
             "device_id": entry.device.to_string(), "inode": entry.inode.to_string(),
             "link_count": entry.links.to_string(), "observed_link_count": entry.observed_links,
             "charged_to": entry.charged_to.map(|id| id.to_string()), "mtime_unix_seconds": entry.mtime.to_string(),
-            "coverage_complete": entry.complete, "allocation_source": "darwin_stat_st_blocks_times_512",
-            "enumeration_complete":entry.enumeration_complete,
+            "coverage_complete": complete, "allocation_source": "darwin_stat_st_blocks_times_512",
+            "enumeration_complete":entry.enumeration_complete && self.coverage_globally_valid(),
             "quality": "measured", "private_quality": "unavailable", "reclaimable_bytes": null,
             "streams": "logical=data_fork; allocated=OS_stat_blocks_including_reported_metadata_and_other_forks; no_independent_fork_accounting"})
     }
@@ -629,8 +656,9 @@ impl Scan {
                 "same_volume": true, "follow_symlinks": false, "dedup_scope": "root", "policy_fingerprint": self.policy},
             "started_at": self.started_at, "ended_at": self.ended_at, "duration_ms": self.duration_ms,
             "metric": "allocated", "consistency": "live_filesystem_non_atomic",
-            "context": self.context,
-            "coverage": {"complete": self.entries[0].complete, "error_count": self.issue_count,
+            "context": self.measurement_context(),
+            "coverage_diagnostics":self.context["coverage_diagnostics"],
+            "coverage": {"complete": self.entries[0].complete && self.coverage_globally_valid(), "error_count": self.issue_count,
                 "excluded_count": self.excluded_count, "entries_seen": self.entries.len(),
                 "issue_samples_truncated": self.issue_count > self.issues.len() as u64},
             "totals": self.entry_json(0),
@@ -649,4 +677,75 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         out.push(DIGITS[(b & 15) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    fn synthetic()->Scan {
+        let m=Metadata{mode:libc::S_IFDIR,device:1,inode:1,links:1,logical:0,allocated:0,flags:0,mtime:0};
+        Scan{id:"600-1".into(),root:"/synthetic".into(),entries:vec![Entry::new(None,vec![],m),Entry::new(Some(0),b"child".to_vec(),m)],issues:vec![],issue_count:0,excluded_count:0,status:ScanStatus::Complete,started_at:"2026-10-31T00:00:00Z".into(),ended_at:String::new(),duration_ms:0,policy:"synthetic".into(),context:json!({"coverage_diagnostics":crate::coverage::empty()})}
+    }
+    #[test]
+    fn full_event_counts_survive_sample_caps_and_late_global_invalidation() {
+        let mut s=synthetic();
+        let denied=io::Error::from_raw_os_error(libc::EACCES);
+        for _ in 0..150 {s.issue_event(0,0,"METADATA_ERROR","fstatat","æ".repeat(2000),false,Some(&denied),Some(b"missing"));}
+        let missing=io::Error::from_raw_os_error(libc::ENOENT);
+        s.issue_event(0,0,"METADATA_ERROR","fstatat",missing.to_string(),false,Some(&missing),None);
+        let other=io::Error::other("not localized evidence");
+        s.issue_event(0,0,"ENUMERATION_ERROR","readdir",other.to_string(),false,Some(&other),None);
+        s.issue(0,"VOLUME_CHANGED","fstatfs","late volume identity change".into(),false);
+        let d=&s.context["coverage_diagnostics"];
+        assert_eq!(s.issue_count,153); assert_eq!(s.issues.len(),128);
+        assert_eq!(d["counts"]["access_denied"],150);assert_eq!(d["counts"]["disappeared"],1);assert_eq!(d["counts"]["io_error"],1);assert_eq!(d["counts"]["volume_changed"],1);
+        assert_eq!(d["samples"].as_array().unwrap().len(),5);
+        assert_eq!(d["samples"][0]["errno"],libc::EACCES);assert_eq!(d["samples"][0]["detail_truncated"],true);
+        assert!(s.entries.iter().all(|e|!e.complete&&!e.enumeration_complete));
+        assert!(s.entry_json(1)["logical_bytes"].is_null());
+        assert!(serde_json::to_vec(&s.report(0)).unwrap().len()<64*1024);
+    }
+    #[test]
+    fn legacy_query_keeps_full_counts_when_diagnostic_examples_are_omitted() {
+        let mut s=synthetic();
+        for _ in 0..2 {
+            for errno in [libc::EACCES,libc::ENOENT,libc::EIO] {
+                let e=io::Error::from_raw_os_error(errno);
+                s.issue_event(0,0,"METADATA_ERROR","fstatat","æ".repeat(1000),false,Some(&e),Some(&vec![b'x';255]));
+            }
+            for code in ["CLOUD_EXCLUDED","MOUNT_EXCLUDED","FIRMLINK_EXCLUDED","OUTPUT_EXCLUDED","SCAN_LIMIT","VOLUME_CHANGED"] {s.issue(0,code,"scope","æ".repeat(1000),false);}
+        }
+        for kind in [crate::QueryKind::Summary,crate::QueryKind::Children,crate::QueryKind::Inspect] {
+            let q=s.query(&crate::Query{kind,..crate::Query::default()}).unwrap();
+            assert!(serde_json::to_vec(&q).unwrap().len()<crate::OUTPUT_BUDGET);
+            for r in crate::coverage::REASONS{assert_eq!(q["coverage_diagnostics"]["counts"][r],2);}
+            assert_eq!(q["coverage_diagnostics"]["samples_omitted_for_output_budget"],18);
+            assert!(q["coverage_diagnostics"]["samples"].as_array().unwrap().is_empty());
+            assert_eq!(q["coverage"]["issue_samples_truncated"],true);
+        }
+    }
+    #[test]
+    fn deliberate_reasons_and_limit_events_are_distinct() {
+        let mut s=synthetic();
+        for code in ["CLOUD_EXCLUDED","MOUNT_EXCLUDED","FIRMLINK_EXCLUDED","OUTPUT_EXCLUDED","DEPTH_LIMIT","EXPLICIT_EXCLUDED"] {s.issue(0,code,"scope",code.into(),true);}
+        for r in ["provider_excluded","volume_boundary","firmlink_boundary","scanner_output"] {assert_eq!(s.context["coverage_diagnostics"]["counts"][r],1);}
+        assert_eq!(s.context["coverage_diagnostics"]["counts"]["explicit_limit"],2);assert_eq!(s.excluded_count,6);
+        assert_eq!(ScanOptions::default().exclusion_code(Path::new("/any")),"EXPLICIT_EXCLUDED");
+    }
+    #[test]
+    fn excluded_roots_never_open_or_enumerate_even_for_progress() {
+        let base=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-root-gate-{}",std::process::id()));
+        let provider=base.join("Library/CloudStorage/synthetic"); std::fs::create_dir_all(&provider).unwrap();
+        let explicit=base.join("explicit");std::fs::create_dir(&explicit).unwrap();
+        for root in [&provider,&explicit] {
+            let mut options=ScanOptions::default(); if root==&explicit {options.exclusions.push(explicit.clone());}
+            for streaming in [false,true] {
+                platform::CALLS.with(|c|c.set((0,0)));
+                if streaming {let mut emitted=0;crate::walk_with_progress(root,&options,&AtomicBool::new(false),|_|{emitted+=1;Ok(())},|p|assert!(p.branches.is_empty())).unwrap();assert_eq!(emitted,1);}
+                else {scan(root,&options,&AtomicBool::new(false)).unwrap();}
+                platform::CALLS.with(|c|assert_eq!(c.get(),(0,0)));
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

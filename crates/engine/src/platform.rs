@@ -69,10 +69,13 @@ impl Metadata {
     } // SF_DATALESS, sys/stat.h
 }
 
+#[cfg(test)]
+thread_local! {pub(crate) static CALLS: std::cell::Cell<(usize,usize)> = const {std::cell::Cell::new((0,0))};}
 pub(crate) struct Directory(*mut libc::DIR, Option<crate::bulk::Bulk>);
 
 impl Directory {
     pub fn root(path: &Path) -> io::Result<Self> {
+        #[cfg(test)] CALLS.with(|c|{let(a,b)=c.get();c.set((a+1,b));});
         let path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in root"))?;
         // O_NOFOLLOW_ANY is public in the minimum supported Mac SDK.
@@ -145,6 +148,7 @@ impl Directory {
     }
 
     pub fn next_name(&mut self) -> io::Result<Option<CString>> {
+        #[cfg(test)] CALLS.with(|c|{let(a,b)=c.get();c.set((a,b+1));});
         loop {
             // SAFETY: errno is thread local; this Directory is used on one thread.
             unsafe {
@@ -180,20 +184,23 @@ impl Directory {
     }
 
     pub fn next_metadata(&mut self) -> io::Result<Option<(CString, Metadata)>> {
+        self.next_metadata_event()?.map(|(name,m)|m.map(|m|(name,m))).transpose()
+    }
+    pub fn next_metadata_event(&mut self) -> io::Result<Option<(CString, io::Result<Metadata>)>> {
+        #[cfg(test)] CALLS.with(|c|{let(a,b)=c.get();c.set((a,b+1));});
         if let Some(bulk)=&mut self.1 {
             match bulk.next(unsafe {libc::dirfd(self.0)}) {
-                Ok(Some((name,metadata)))=>return Ok(Some((name.clone(),match metadata {Some(m)=>m,None=>self.child_metadata(&name)?}))),
+                Ok(Some((name,metadata)))=>return Ok(Some((name.clone(),match metadata {Some(m)=>Ok(m),None=>self.child_metadata(&name)}))),
                 Ok(None)=>return Ok(None),
                 Err(e) if !bulk.used && [Some(libc::EINVAL),Some(libc::ENOTSUP),Some(libc::ENOSYS)].contains(&e.raw_os_error())=>{
-                    // No rows consumed. Never mix readdir and bulk on an advanced cursor.
-                    unsafe {libc::rewinddir(self.0)};
-                    self.1=None;
+                    unsafe {libc::rewinddir(self.0)}; self.1=None;
                 },
                 Err(e)=>return Err(e),
             }
         }
-        self.next_name()?.map(|n|self.child_metadata(&n).map(|m|(n,m))).transpose()
+        Ok(self.next_name()?.map(|n|{let m=self.child_metadata(&n);(n,m)}))
     }
+
 }
 
 impl Drop for Directory {

@@ -55,6 +55,7 @@ struct Options {
     query: Query,
     scan: ScanOptions,
     scan_id: Option<String>,
+    reason: Option<String>,
     store: PathBuf,
     save: bool,
     ndjson: bool,
@@ -92,6 +93,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         },
         scan: ScanOptions::full(),
         scan_id: None,
+        reason: None,
         store: PathBuf::from(home).join("Library/Application Support/Macscan"),
         save: false,
         ndjson: false,
@@ -154,7 +156,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                         | "scans"
                         | "compare"
                         | "query"
-                        | "insights" | "growth" | "profile"
+                        | "insights" | "growth" | "profile" | "coverage"
                 ) =>
             {
                 options.store = PathBuf::from(value)
@@ -166,11 +168,12 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--scan"
                 if matches!(
                     command,
-                    "summary" | "children" | "largest" | "inspect" | "query" | "insights" | "profile"
+                    "summary" | "children" | "largest" | "inspect" | "query" | "insights" | "profile" | "coverage"
                 ) =>
             {
                 options.scan_id = Some(utf8(value)?.into())
             }
+            "--reason" if command == "coverage" => options.reason=Some(utf8(value)?.into()),
             "--metric"
                 if matches!(
                     command,
@@ -187,7 +190,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--limit"
                 if matches!(
                     command,
-                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights" | "growth" | "profile"
+                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights" | "growth" | "profile" | "coverage"
                 ) =>
             {
                 options.query.limit =
@@ -196,7 +199,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--cursor"
                 if matches!(
                     command,
-                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights" | "growth" | "profile"
+                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights" | "growth" | "profile" | "coverage"
                 ) =>
             {
                 options.query.cursor = Some(utf8(value)?.into())
@@ -322,7 +325,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
+        "commands":["coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
         "profile_contract":{"version":"file-profile-1","view":["files","types"],"sort":["bytes","count"],"scope":"saved --entry with raw path component boundaries","age":"saved ended_unix_ns; inclusive integer threshold; unknown/future mtime excluded","type":"raw final suffix hint; ASCII lowercase; opaque type_key preserves non-UTF8 identity","documentation":"docs/file-profile.md"},
         "growth_contract":{"version":"growth-1","rules":"insights-1","grouping":["area","category"],"view":["groups","files"],"change":["all","grown","shrunk","added","removed","unknown"],"group":"stable group_key from a previous response","scope":"AFTER --entry; BEFORE matched by saved raw path key","accounting":"changed regular-file contributions, no directory subtree overlap","documentation":"docs/growth.md"},
@@ -465,6 +468,12 @@ fn run() -> Result<u8> {
                     &CANCEL,
                 )
                 .map_err(|e| Error::io("compare", e))?
+        }
+        "coverage" => {
+            if !options.operands.is_empty() {return Err(Error::usage("unexpected operands"));}
+            let id=options.scan_id.as_deref().ok_or_else(||Error::usage("--scan ID is required"))?;
+            let store=Store::open(&options.store,false).map_err(|e|Error::io("open_store",e))?;
+            store.coverage(id,options.reason.as_deref(),options.query.cursor.as_deref(),options.query.limit,&CANCEL).map_err(|e|Error::io("coverage",e))?
         }
         "summary" | "children" | "largest" | "inspect" => {
             if !options.operands.is_empty() {

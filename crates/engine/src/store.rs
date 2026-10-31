@@ -118,8 +118,8 @@ impl Store {
                 e.observed_links,
                 e.charged_to.map(|p| p.to_string()),
                 e.mtime.to_string(),
-                e.complete,
-                e.enumeration_complete
+                e.complete && scan.coverage_globally_valid(),
+                e.enumeration_complete && scan.coverage_globally_valid()
             ]);
             entries_digest.update(write_record(&mut buffered, &row, &mut consumed, remaining)?);
             entries_digest.update(b"\n");
@@ -148,9 +148,9 @@ impl Store {
                 hex(relative.as_os_str().as_bytes()),
                 id.to_string(),
                 entry.kind.name(),
-                entry.complete.then(|| entry.logical.to_string()),
-                entry.complete.then(|| entry.accounted.to_string()),
-                entry.enumeration_complete
+                (entry.complete && scan.coverage_globally_valid()).then(|| entry.logical.to_string()),
+                (entry.complete && scan.coverage_globally_valid()).then(|| entry.accounted.to_string()),
+                entry.enumeration_complete && scan.coverage_globally_valid()
             ]);
             index_digest.update(write_record(&mut buffer, &row, &mut consumed, remaining)?);
             index_digest.update(b"\n");
@@ -176,7 +176,8 @@ impl Store {
         let manifest = json!({"format_version": "1.2", "schema_version": SCHEMA_VERSION,
             "engine_version": ENGINE_VERSION, "scan_id": scan.id,
             "root_bytes_hex": hex(scan.root.as_os_str().as_bytes()), "policy": scan.policy,
-            "context":scan.context,
+            "context":scan.measurement_context(),
+            "coverage_diagnostics":scan.context["coverage_diagnostics"],
             "entries_sha256":hex(&entries_digest.finalize()),"paths_sha256":hex(&index_digest.finalize()),
             "status": scan.status.name(), "started_at": scan.started_at, "ended_at": scan.ended_at,
             "duration_ms": scan.duration_ms.to_string(), "entry_count": scan.entries.len(),
@@ -370,6 +371,8 @@ impl Store {
             "cancelled" => ScanStatus::Cancelled,
             _ => return Err(invalid("invalid saved status")),
         };
+        let mut context=manifest["context"].clone();
+        if manifest["coverage_diagnostics"]["version"]==1 {context["coverage_diagnostics"]=manifest["coverage_diagnostics"].clone();}
         Ok(Scan {
             id: id.into(),
             root,
@@ -384,7 +387,7 @@ impl Store {
                 .parse()
                 .map_err(|_| invalid("invalid duration"))?,
             policy: string(&manifest["policy"])?.into(),
-            context: manifest["context"].clone(),
+            context,
         })
     }
 
