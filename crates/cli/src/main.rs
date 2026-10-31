@@ -68,6 +68,7 @@ struct Options {
     growth_files: bool,
     growth_group: Option<String>,
     growth_change: String,
+    profile: macscan_analysis::FileProfileQuery,
 }
 fn utf8(value: &OsString) -> Result<&str> {
     value
@@ -104,6 +105,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         growth_files: false,
         growth_group: None,
         growth_change: "all".into(),
+        profile: Default::default(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -123,6 +125,12 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                 return Err(Error::usage("--save is only valid for scan"));
             }
             options.save = true;
+            index += 1;
+            continue;
+        }
+        if flag == "--no-extension" && command == "profile" {
+            if options.profile.type_key.is_some() { return Err(Error::usage("choose one extension/type filter")); }
+            options.profile.type_key = Some("none".into());
             index += 1;
             continue;
         }
@@ -146,7 +154,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                         | "scans"
                         | "compare"
                         | "query"
-                        | "insights" | "growth"
+                        | "insights" | "growth" | "profile"
                 ) =>
             {
                 options.store = PathBuf::from(value)
@@ -158,7 +166,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--scan"
                 if matches!(
                     command,
-                    "summary" | "children" | "largest" | "inspect" | "query" | "insights"
+                    "summary" | "children" | "largest" | "inspect" | "query" | "insights" | "profile"
                 ) =>
             {
                 options.scan_id = Some(utf8(value)?.into())
@@ -166,20 +174,20 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--metric"
                 if matches!(
                     command,
-                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare" | "insights" | "growth"
+                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare" | "insights" | "growth" | "profile"
                 ) =>
             {
                 options.query.metric =
                     Metric::parse(utf8(value)?).map_err(|e| Error::io("metric", e))?
             }
-            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect" | "insights" | "growth") => {
+            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect" | "insights" | "growth" | "profile") => {
                 options.query.entry = u32::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("entry ID overflow"))?
             }
             "--limit"
                 if matches!(
                     command,
-                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights" | "growth"
+                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights" | "growth" | "profile"
                 ) =>
             {
                 options.query.limit =
@@ -188,11 +196,25 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--cursor"
                 if matches!(
                     command,
-                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights" | "growth"
+                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights" | "growth" | "profile"
                 ) =>
             {
                 options.query.cursor = Some(utf8(value)?.into())
             }
+            "--min-age-days" if command == "profile" => options.profile.min_age_days = Some(unsigned(value)?),
+            "--min-bytes" if command == "profile" => options.profile.min_bytes = Some(unsigned(value)?),
+            "--extension" | "--type-key" if command == "profile" => {
+                if options.profile.type_key.is_some() { return Err(Error::usage("choose one extension/type filter")); }
+                options.profile.type_key = Some(if flag == "--extension" {
+                    macscan_analysis::FileProfileQuery::extension_key(utf8(value)?).map_err(|e|Error::io("extension",e))?
+                } else { utf8(value)?.into() });
+            },
+            "--view" if command == "profile" => options.profile.types = match utf8(value)? {
+                "files" => false, "types" => true, _ => return Err(Error::usage("view must be files or types")),
+            },
+            "--sort" if command == "profile" => options.profile.sort_count = match utf8(value)? {
+                "bytes" => false, "count" => true, _ => return Err(Error::usage("sort must be bytes or count")),
+            },
             "--grouping" if command == "growth" => options.growth_grouping = match utf8(value)? {
                 "area" => macscan_analysis::GrowthGrouping::Area,
                 "category" => macscan_analysis::GrowthGrouping::Category,
@@ -300,8 +322,9 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
+        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
+        "profile_contract":{"version":"file-profile-1","view":["files","types"],"sort":["bytes","count"],"scope":"saved --entry with raw path component boundaries","age":"saved ended_unix_ns; inclusive integer threshold; unknown/future mtime excluded","type":"raw final suffix hint; ASCII lowercase; opaque type_key preserves non-UTF8 identity","documentation":"docs/file-profile.md"},
         "growth_contract":{"version":"growth-1","rules":"insights-1","grouping":["area","category"],"view":["groups","files"],"change":["all","grown","shrunk","added","removed","unknown"],"group":"stable group_key from a previous response","scope":"AFTER --entry; BEFORE matched by saved raw path key","accounting":"changed regular-file contributions, no directory subtree overlap","documentation":"docs/growth.md"},
         "insights_contract":{"version":"insights-1","default":"category rollups","category":"paginated contributing candidate scopes","counts":"regular file paths including hardlinks, not physical identities","rules":"docs/insights.md"},
         "category_contract":{"version":"context-1","category":"derived from saved raw metadata; probable contextual rules or unverified name hints, never deletion approval","saved_category":"legacy snapshot value, not evidence","coverage":"complete, partial, or context_unavailable; applies to saved context, not live validity","rules":"docs/category-rules.md"},
@@ -356,6 +379,17 @@ fn run() -> Result<u8> {
             }
             result["command"] = json!("scan");
             result["retained"] = json!(options.save);
+            result
+        }
+        "profile" => {
+            if !options.operands.is_empty() { return Err(Error::usage("unexpected operands")); }
+            let id = options.scan_id.as_deref().ok_or_else(|| Error::usage("--scan ID is required"))?;
+            let store = Store::open(&options.store,false).map_err(|e|Error::io("open_store",e))?;
+            let mut q = options.profile;
+            q.entry = options.query.entry; q.metric = options.query.metric;
+            q.limit = options.query.limit; q.cursor = options.query.cursor;
+            let result = store.file_profile(id,&q,&CANCEL).map_err(|e|Error::io("profile",e))?;
+            code = if result["coverage"]["complete"] == false { 5 } else { 0 };
             result
         }
         "growth" => {

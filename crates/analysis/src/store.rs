@@ -11,6 +11,8 @@ mod stream;
 mod categories;
 mod insights;
 mod growth;
+mod file_profile;
+pub use file_profile::FileProfileQuery;
 pub use growth::{GrowthQuery, GrowthGrouping};
 pub use insights::InsightsQuery;
 pub const FULL_HISTORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
@@ -274,6 +276,9 @@ impl Store {
                 fallback.push_str(&format!(",NULL::{ty} AS {name}"));
                 context_available = false;
             }
+        }
+        if !columns.contains("mtime_unix_seconds") {
+            fallback.push_str(",NULL::BIGINT AS mtime_unix_seconds");
         }
         db.exec(&format!(
             "CREATE VIEW {table}_saved AS SELECT *{fallback},{} AS scan_id FROM read_parquet({source})",
