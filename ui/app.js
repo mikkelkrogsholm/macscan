@@ -35,7 +35,7 @@ $('#app').innerHTML=`
  <div id="coverage" class="coverage hidden"></div>
  <section class="workspace">
   <div class="chart-panel"><div class="chart-top"><span id="chart-context">Pladsfordeling</span><span class="read-only-pill">Kun analyse</span></div>
-   <div class="chart-wrap"><svg id="sunburst" viewBox="0 0 600 600" role="group" aria-label="Interaktiv pladsfordeling"></svg><button id="chart-center" class="chart-center" disabled><span id="center-label">Et klart overblik</span><strong id="center-size">Din disk.</strong><span id="center-note">Vælg en måling eller scan en mappe</span><span id="center-up"></span></button></div>
+   <div class="chart-wrap"><svg id="sunburst" viewBox="0 0 600 600" role="group" aria-label="Interaktiv pladsfordeling"></svg><button id="chart-center" class="chart-center" disabled><span id="center-label">Et klart overblik</span><strong id="center-size">Din disk.</strong><span id="center-note" role="note">Vælg en måling eller scan en mappe</span><span id="center-up"></span></button></div>
    <div id="hover-caption" class="hover-caption">Klik på en mappe for at åbne den</div>
    <div class="chart-legend"><span><i class="legend-circle"></i> Hver ring er et mappeniveau</span><span><i class="legend-other"></i> Øvrige poster</span></div>
   </div>
@@ -50,7 +50,7 @@ $('#app').innerHTML=`
    <div class="list-head"><span id="list-label">Navn</span><span id="size-heading">Størrelse ↓</span></div><div id="rows" class="rows" tabindex="-1" role="list" aria-label="Filer og mapper"></div><button id="more" class="more hidden">Vis flere poster</button><div id="list-message" class="list-message">Her kommer din mappeoversigt.</div>
   </div>
  </section>
- <section id="inspector" class="inspector"><div class="inspector-symbol">${''}</div><div class="inspector-main"><strong id="inspect-name">Ingen måling valgt</strong><div id="inspect-category"></div><div id="inspect-path">Vælg en mappe eller en eksisterende måling i venstre side.</div></div><div class="inspector-numbers"><span id="inspect-logical"></span><span id="inspect-allocated"></span></div><div class="inspector-actions"><button id="copy" class="plain" disabled>Kopiér sti</button><button id="reveal" class="plain" disabled>Vis i Finder ↗</button></div></section>
+ <section id="inspector" class="inspector"><div class="inspector-symbol">${''}</div><div class="inspector-main"><strong id="inspect-name">Ingen måling valgt</strong><div id="inspect-category" role="note"></div><div id="inspect-path">Vælg en mappe eller en eksisterende måling i venstre side.</div></div><div class="inspector-numbers"><span id="inspect-logical"></span><span id="inspect-allocated"></span></div><div class="inspector-actions"><button id="copy" class="plain" disabled>Kopiér sti</button><button id="reveal" class="plain" disabled>Vis i Finder ↗</button></div></section>
  <footer><span id="provenance">Rust · Parquet · DuckDB</span><span id="measure-note">Allokeret er ikke nødvendigvis frigørbar APFS-plads.</span></footer>
 </main><dialog id="rescan-dialog" aria-label="Genmål valgt område"></dialog><div id="toast" class="toast hidden" role="status"></div><dialog id="coverage-dialog" aria-labelledby="coverage-title"><header class="coverage-heading"><h2 id="coverage-title">Dækning fra gemte målinger</h2><form method="dialog"><button class="primary" autofocus>Luk</button></form></header><div id="coverage-body"></div></dialog>`;
 
@@ -192,8 +192,11 @@ function renderChart(){
  }
  $('#center-label').textContent=view.selected.name_display||rootName(view.scope.root_display);
  $('#center-size').textContent=formatBytes(view.selected.bytes??view.selected.observed_bytes);
- $('#center-note').textContent=view.selected.bytes===null?'Mindst observeret':metricLabel(state.metric);
- $('#chart-center').disabled=view.selected.parent_id===null;$('#chart-center').title='Gå ét mappeniveau op';$('#center-up').textContent=view.selected.parent_id===null?'':'↑ Tilbage';
+ const fullNote=(state.overview?'Diskforbrug fra macOS':metricLabel(state.metric))+(view.selected.bytes===null?' · Mindst observeret':'');
+ $('#center-note').textContent=view.selected.bytes===null?'Mindst observeret':state.metric===APFS&&!state.overview?'APFS DATA':metricLabel(state.metric);
+ $('#center-note').title=fullNote;$('#center-note').setAttribute('aria-label',fullNote);
+ if(state.metric===APFS&&!state.overview)$('#chart-center').setAttribute('aria-label',($('#center-label').textContent+' · '+$('#center-size').textContent+' · '+fullNote)+(view.selected.parent_id===null?'':' · Gå ét mappeniveau op'));else $('#chart-center').removeAttribute('aria-label');
+ $('#chart-center').disabled=view.selected.parent_id===null;$('#chart-center').title=state.metric===APFS&&!state.overview?fullNote+(view.selected.parent_id===null?'':' · Gå ét mappeniveau op'):'Gå ét mappeniveau op';$('#center-up').textContent=view.selected.parent_id===null?'':'↑ Tilbage';
  $('#chart-context').textContent=view.selected.kind==='file'?'Valgt fil':'Pladsfordeling · 3 niveauer';
  if(!arcs.length)$('#hover-caption').textContent=weight(view.selected)===0n?'Ingen målbare bytes i dette udvalg.':'Dette udvalg har ingen målte underposter.';
  else $('#hover-caption').textContent='Klik på en mappe for at åbne · midten går ét niveau op';
@@ -232,6 +235,7 @@ function renderInspector(){
  if(state.metric===APFS&&!state.overview){$('#inspect-allocated').textContent='APFS DATA '+formatBytes(n.bytes??n.observed_bytes);}
  const c=categoryPresentation(n);$('#inspect-category').textContent=state.overview?'':`${c.label} · ${c.reason} ${c.coverage}`;$('#inspect-category').title=c.detail;
  if(state.metric===APFS&&!state.overview){$('#inspect-category').textContent+=' · '+apfsContribution(n)+(n.apfs_data_clone_owner!=null?' · Global ejerpost '+n.apfs_data_clone_owner:'');if(apfsZeroNonowner(n))$('#inspect-category').textContent+=' · Nul eget bidrag skyldes global tilskrivning; filen er ikke dermed tom eller frigørbar.';}
+ if(state.metric===APFS&&!state.overview){const explanation=[$('#inspect-category').textContent,c.detail].filter(Boolean).join(' · ');$('#inspect-category').title=explanation;$('#inspect-category').setAttribute('aria-label',explanation);}else $('#inspect-category').removeAttribute('aria-label');
  if(state.overview){$('#inspect-logical').textContent='APFS-kapacitet '+formatBytes(state.machine.capacity_bytes);$('#inspect-allocated').textContent='Ledigt '+formatBytes(state.machine.free_bytes);}
  $('#copy').disabled=state.overview;$('#reveal').disabled=state.overview;
 }
