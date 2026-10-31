@@ -1,4 +1,4 @@
-use macscan_analysis::{GrowthGrouping, GrowthQuery, InsightsQuery, Store, FULL_HISTORY_BUDGET};
+use macscan_analysis::{FileProfileQuery, GrowthGrouping, GrowthQuery, InsightsQuery, Store, FULL_HISTORY_BUDGET};
 use macscan_engine::{
     CompareQuery, Metric, Query, QueryKind, ScanOptions,
 };
@@ -175,6 +175,31 @@ async fn growth(
             files, group, change, cursor, limit: 10,
         })
     }).await
+}
+// Decimal strings keep UI thresholds exact across the JavaScript boundary.
+fn profile_integer(value: Option<String>) -> Result<Option<u64>, String> {
+    value.map(|s| {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("Filter skal være et ikke-negativt heltal i decimalformat".into());
+        }
+        s.parse::<u64>().map_err(|_| "Filter er større end u64".into())
+    }).transpose()
+}
+fn file_profile_at(path: &std::path::Path, scan_id: &str, query: &FileProfileQuery) -> Reply {
+    Store::open(path, false).map_err(err)?.file_profile(scan_id, query, &AtomicBool::new(false)).map_err(err)
+}
+#[tauri::command]
+async fn file_profile(
+    scan_id: String, entry: u32, metric: String, min_age_days: Option<String>,
+    min_bytes: Option<String>, type_key: Option<String>, types: bool,
+    sort_count: bool, cursor: Option<String>, state: State<'_, Desktop>,
+) -> Reply {
+    let path = store_path(&state)?;
+    blocking(move || file_profile_at(&path, &scan_id, &FileProfileQuery {
+        entry, metric: Metric::parse(&metric).map_err(err)?,
+        min_age_days: profile_integer(min_age_days)?, min_bytes: profile_integer(min_bytes)?,
+        type_key, types, sort_count, cursor, limit: 10,
+    })).await
 }
 #[tauri::command]
 async fn list_children(
@@ -410,6 +435,23 @@ mod tests {
             };
             store.save_with_cancel(&scan, STORE_BUDGET, &AtomicBool::new(false)).unwrap();
         }
+        for types in [false, true] {
+            for sort_count in [false, true] {
+                if sort_count && !types { continue; }
+                let q = FileProfileQuery {entry:1,metric:Metric::Logical,types,sort_count,
+                    min_bytes:profile_integer(Some("7".into())).unwrap(),
+                    min_age_days:profile_integer(Some("180".into())).unwrap(),..Default::default()};
+                let native = file_profile_at(&path,"600-2",&q).unwrap();
+                assert_eq!(native,store.file_profile("600-2",&q,&AtomicBool::new(false)).unwrap());
+                assert_eq!(native["totals"]["bytes"],"7");
+                assert_eq!(native["totals"]["file_path_count"],"1");
+                assert_eq!(native["records"][0]["type_key"],"none");
+            }
+        }
+        assert_eq!(profile_integer(Some(u64::MAX.to_string())).unwrap(),Some(u64::MAX));
+        for invalid in ["18446744073709551616", "-1", "+1", "1.5", "", " 1"] {
+            assert!(profile_integer(Some(invalid.into())).is_err());
+        }
         for grouping in [GrowthGrouping::Area, GrowthGrouping::Category] {
             for files in [false,true] {
                 let q = GrowthQuery {entry:1,metric:Metric::Logical,grouping,files,limit:10,..Default::default()};
@@ -473,6 +515,7 @@ fn main() {
             list_children,
             insights,
             growth,
+            file_profile,
             compare_scans,
             start_scan,
             start_machine,

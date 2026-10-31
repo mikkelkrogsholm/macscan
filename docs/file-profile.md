@@ -2,7 +2,8 @@
 
 `Store::file_profile(scan_id, &FileProfileQuery, &AtomicBool)` and the CLI analyze
 only immutable saved Parquet metadata. They never look up live paths or read
-contents. The native UI can consume this shared API in a later delivery.
+contents. The desktop `file_profile` command calls this same shared API with a fixed
+10-row limit and the existing 8192-byte response budget.
 
 ```sh
 macscan profile --scan ID
@@ -112,3 +113,42 @@ module's legacy unit regression, and `crates/cli/tests/file_profile.rs`. Set
 `MACSCAN_PROFILE_EVIDENCE` to an absolute new history directory when running only
 `retain_native_synthetic_history_when_requested` to retain the small synthetic
 native handoff. It constructs Scan rows directly without scanning any paths.
+
+
+## Desktop: Find filer
+
+Open **Indhold → Find filer…** in a saved file scan. The panel keeps its own
+results; ordinary direct children, Ændringer and Indsigter retain their existing
+roles. **Direkte underposter** returns to the ordinary child list. A whole-Mac
+summary requires choosing a scanned volume first.
+
+The default scope is the current saved map/project. Choose the whole saved scan,
+minimum days since modification (empty means all ages), an integer minimum size
+with explicit B/KiB/MiB/GiB units, files or types, and bytes/count type ordering.
+Thresholds cross the native boundary as validated decimal u64 strings. Returned
+bytes/counts remain exact BigInt-backed decimal displays, including aggregates
+beyond u64. The saved reference and inclusive threshold appear with expandable
+exact timestamp values. Missing reference errors offer clearing age and retry;
+resource errors explain choosing a smaller saved map/current scope.
+
+Type drilldown passes the returned raw key unchanged. Raw keys remain visible
+beside type labels, so identical lossy labels and no-extension groups are
+selectable distinctly. A file opens its returned saved scan/entry pair. Each
+**Næste side** replaces the current bounded page; totals cover all filtered
+observed files. Scope, metric, graph, scan, filters, type, view and sort changes
+invalidate the cursor and pending answers. Metric and graph navigation preserve
+the active panel and useful filters. Form controls keep their DOM identity while
+results load so keyboard and pointer editing do not lose focus.
+
+Only explicitly selecting a saved directory named Downloads offers the Downloads
+preset (at least 100 MiB and 180 days). Elsewhere the generic large/old preset is
+available with guidance to select the saved Downloads map. Both apply editable
+filters to current scope; neither looks up a live home directory. No deletion or
+selection-for-deletion flow is present.
+
+Synthetic checks: `node --test ui/*.test.mjs`, desktop shared-Store parity in
+`crates/desktop/src/main.rs`, and `ui/file-profile.browser.mjs` (using an existing
+Playwright/Chrome installation). The browser fixture has nonempty ordinary
+children without optional `path_display`, exact oversized totals, opaque raw
+types, paging, Downloads, partial/unknown diagnostics, recovery, metric/graph
+navigation, file drilldown and pending-request/tab races. It never scans paths.

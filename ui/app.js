@@ -1,3 +1,4 @@
+import {createProfileState,renderProfile} from './file-profile.mjs';
 import {createGrowthState,exactBytes,signedDelta,knownBytes,growthTarget,growthCounts,elapsedLabel} from './growth.mjs';
 import {createInsightsState,insightLabel,insightBytes,contextLabel,insightTarget,insightGuidance} from './insights.mjs';
 import {categoryPresentation} from './categories.mjs';
@@ -10,6 +11,7 @@ const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className
 const icons={folder:'M3 7h6l2 2h10v11H3z M3 7V4h6l2 3',disk:'M4 3h16v18H4z M8 17h.01 M12 17h4',arrow:'m9 5 7 7-7 7',up:'m6 14 6-6 6 6',search:'M21 21l-5-5 M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',file:'M6 3h8l4 4v14H6z M14 3v5h5',back:'m14 6-6 6 6 6',clock:'M12 8v5l3 2 M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0'};
 function icon(name){const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 24 24');s.setAttribute('aria-hidden','true');s.classList.add('icon');const p=document.createElementNS(s.namespaceURI,'path');p.setAttribute('d',icons[name]??icons.file);s.append(p);return s;}
 const state={view:null,scan:null,metric:'allocated',scans:[],volumes:[],store:'',rows:[],cursor:null,colors:new Map(),request:0,listRequest:0,selected:null,scanning:false,mode:'files',compareBefore:null,searchTimer:null};
+const profile=createProfileState();
 const insights=createInsightsState();
 const growth=createGrowthState();
 state.machine=null;state.overview=false;
@@ -36,6 +38,8 @@ $('#app').innerHTML=`
   <div class="listing"><div class="list-tabs" role="group" aria-label="Visning"><button id="files-tab" aria-pressed="true">Indhold <span id="child-count"></span></button><button id="changes-tab" aria-pressed="false">Ændringer</button><button id="insights-tab" aria-pressed="false" disabled>Indsigter</button></div>
    <p id="insights-hint" class="insights-hint">Vælg en gemt måling for at se indsigter.</p>
    <section id="insights-panel" class="insights-panel hidden" aria-label="Indsigter fra gemt måling"></section>
+   <div id="profile-entry"><button id="find-files" class="more" disabled>Find filer…</button><p id="profile-hint" class="muted">Vælg en gemt måling for filanalyse.</p></div>
+   <section id="profile-panel" tabindex="-1" class="insights-panel hidden" aria-label="Find filer i gemt måling"></section>
    <div id="file-controls" class="search-row"><label for="search">${''}<span>Søg i denne mappe</span></label><input id="search" type="search" placeholder="Fil- eller mappenavn…" autocomplete="off"></div>
    <div id="compare-controls" class="compare-controls hidden"><label for="before-scan">Sammenlign med</label><select id="before-scan"></select></div>
    <section id="growth-panel" tabindex="-1" class="insights-panel hidden" aria-label="Vækst mellem gemte målinger"></section>
@@ -80,6 +84,7 @@ function renderVolumes(){
 }
 async function refresh(){const r=await invoke('bootstrap');state.scans=r.scans;state.volumes=r.volumes.records;state.store=r.store;renderHistory();renderVolumes();$('#history-location').title=state.store;return r;}
 async function openScan(id,keepMachine=false,entry='0'){
+ profile.reset({active:false,scope:'current',age:'',size:'',typeKey:null,typeLabel:null,types:false,sortCount:false});
  if(state.scans.find(s=>s.scan_id===id)?.kind==='machine')return showMachine(await invoke('machine_session',{sessionId:id}));
  if(!keepMachine)state.machine=null;state.overview=false;$('#search').disabled=false;$('#changes-tab').disabled=false;
  for(const m of ['allocated','logical'])$('#'+m).disabled=false;
@@ -87,6 +92,7 @@ async function openScan(id,keepMachine=false,entry='0'){
  state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate(entry);renderHistory();
 }
 function showMachine(session){
+ profile.reset({active:false});
  insights.reset({scope:'all',category:null});growth.reset();$('#insights-tab').disabled=true;
  ++state.request;++state.listRequest;clearError();state.machine=session;state.overview=true;state.scan=session.session_id;state.mode='files';state.colors.clear();
  const view=machineView(session);state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=null;
@@ -99,6 +105,7 @@ function showMachine(session){
  $('#provenance').textContent=formatBytes(session.free_bytes)+' ledigt · eksterne drev og diskimages tælles ikke oveni';
 }
 async function navigate(entry){
+ profile.reset();if(profile.active&&state.mode==='files'){profile.busy=true;renderFileProfile();}
  insights.reset({category:null});growth.reset({group:null,files:false});
  const token=++state.request;++state.listRequest;clearTimeout(state.searchTimer);clearError();$('.workspace').classList.add('loading');
  try{const view=await invoke('view_scan',{scanId:state.scan,entry:Number(entry),metric:state.metric});if(token!==state.request)return;
@@ -112,10 +119,11 @@ async function navigate(entry){
     const list=$('#coverage-issues');list.replaceChildren();for(const issue of view.issues??[])list.append(el('li','',(issue.path_display??'Post '+issue.entry_id)+' — '+issue.detail));
     if(!list.children.length)list.append(el('li','','Se scanbegrænsningen ovenfor; manglende adgang eller udeladte områder er ikke målt som nul.'));
     $('#coverage-dialog').showModal();});$('#coverage').append(details);}
+  if(state.mode==='files'&&profile.active)loadProfile();
   if(state.mode==='insights')loadInsights();
   if(state.mode==='changes')loadGrowth();
   $('#provenance').textContent=(view.status==='complete'?'Komplet':'Delvis')+' måling · '+(state.metric==='logical'?'Logiske filstørrelser':'Hardlink-tilskrevet allokering');
- }catch(e){if(token===state.request)error(e);}finally{if(token===state.request)$('.workspace').classList.remove('loading');}
+ }catch(e){if(token===state.request){error(e);if(profile.active){profile.busy=false;profile.error=String(e);renderFileProfile();}}}finally{if(token===state.request)$('.workspace').classList.remove('loading');}
 }
 function renderCrumbs(){const box=$('#breadcrumbs');box.replaceChildren();if(state.machine){const b=el('button','crumb','Hele Mac’en');b.addEventListener('click',()=>showMachine(state.machine));box.append(b);}
  for(const [i,a]of state.view.ancestors.entries()){if(i||state.machine)box.append(el('span','crumb-separator','›'));const b=el('button','crumb',i===0?rootName(state.view.scope.root_display):a.name_display);b.title=a.path_display;b.addEventListener('click',()=>navigate(a.entry_id));box.append(b);}}
@@ -173,15 +181,33 @@ function renderInspector(){
  $('#copy').disabled=state.overview;$('#reveal').disabled=state.overview;
 }
 function renderMode(){
- const changes=state.mode==='changes',active=state.mode==='insights';
+ const changes=state.mode==='changes',active=state.mode==='insights',profiling=state.mode==='files'&&profile.active;
+ $('#profile-panel').classList.toggle('hidden',!profiling);$('#profile-entry').classList.toggle('hidden',changes||active||profiling);
+ $('#find-files').disabled=!state.view||state.overview;$('#profile-hint').textContent=state.overview?'Vælg en scannet volumen i grafen eller listen for at finde filer.':!state.view?'Vælg en gemt måling for filanalyse.':'Filstørrelse, alder og endelser fra den gemte måling.';
  for(const mode of ['files','changes','insights'])$('#'+mode+'-tab').setAttribute('aria-pressed',String(state.mode===mode));
- $('#file-controls').classList.toggle('hidden',changes||active);$('#compare-controls').classList.toggle('hidden',!changes);
+ $('#file-controls').classList.toggle('hidden',changes||active||profiling);$('#compare-controls').classList.toggle('hidden',!changes);
  $('#insights-panel').classList.toggle('hidden',!active);
  $('#growth-panel').classList.toggle('hidden',!changes);
- for(const selector of ['.list-head','#rows','#more','#list-message'])$(selector).classList.toggle('hidden',active||changes||selector==='#more'&&!state.cursor||selector==='#list-message'&&state.rows.length>0);
+ for(const selector of ['.list-head','#rows','#more','#list-message'])$(selector).classList.toggle('hidden',active||changes||profiling||selector==='#more'&&!state.cursor||selector==='#list-message'&&state.rows.length>0);
  $('#insights-hint').classList.toggle('hidden',!!state.view&&!state.overview);
  $('#insights-hint').textContent=state.overview?'Indsigter gælder én gemt filscanning. Vælg en scannet volumen i grafen eller listen.':'Vælg en gemt måling for at se indsigter.';
 }
+
+async function loadProfile(next=false){
+ if(state.overview||!state.view||state.mode!=='files'||!profile.active)return;
+ ++state.listRequest;clearTimeout(state.searchTimer);
+ const pending=profile.load(args=>invoke('file_profile',args),{scanId:state.scan,entry:Number(profile.scope==='all'?'0':state.view.selected.entry_id),metric:state.metric},next);
+ renderFileProfile();if(await pending&&state.mode==='files'&&profile.active)renderFileProfile();
+}
+function renderFileProfile(){
+ if(!state.view)return;
+ renderProfile($('#profile-panel'),profile,{selected:state.view.selected,load:loadProfile,close:()=>{profile.reset({active:false});renderMode();renderRows();$('#find-files').focus();},open:row=>{
+  profile.reset({active:false});state.mode='files';renderMode();
+  if(row.drilldown_scan_id===state.scan)navigate(row.drilldown_entry_id);else openScan(row.drilldown_scan_id,false,row.drilldown_entry_id);
+ }});
+}
+$('#find-files').addEventListener('click',()=>{if(!state.view||state.overview)return;profile.reset({active:true});renderMode();loadProfile();$('#profile-scope')?.focus();});
+
 async function loadInsights(next=false){
  if(state.overview||!state.view||state.mode!=='insights')return;
  ++state.listRequest;clearTimeout(state.searchTimer);
@@ -224,11 +250,11 @@ function renderCompareOptions(){
  select.title='Tidligere målinger med samme rod og politik. API’en kontrollerer også OS, volumen og gemt format.';
 }
 async function loadRows(append=false){
- if(state.overview||state.mode==='insights')return;
+ if(state.overview||state.mode==='insights'||state.mode==='files'&&profile.active)return;
  if(state.mode==='changes')return loadGrowth(append);
  const token=++state.listRequest;clearError();try{
  const r=await invoke('list_children',{scanId:state.scan,entry:Number(state.view.selected.entry_id),metric:state.metric,cursor:append?state.cursor:null,search:$('#search').value});
- if(token!==state.listRequest)return;state.cursor=r.next_cursor;state.rows=append?[...state.rows,...r.records]:r.records;renderRows();
+ if(token!==state.listRequest||profile.active||state.mode!=='files')return;state.cursor=r.next_cursor;state.rows=append?[...state.rows,...r.records]:r.records;renderRows();
  }catch(e){if(token!==state.listRequest)return;state.rows=[];state.cursor=null;renderRows();error(e);}
 }
 async function loadGrowth(next=false){
@@ -306,8 +332,8 @@ $('#choose-folder').addEventListener('click',folderScan);$('#rescan').addEventLi
 $('#stop').addEventListener('click',async()=>{await invoke('stop_scan');$('#stop').textContent='Stopper…';$('#stop').disabled=true;});
 $('#chart-center').addEventListener('click',()=>{if(state.view?.selected.parent_id!==null)navigate(state.view.selected.parent_id);});
 for(const metric of ['allocated','logical'])$('#'+metric).addEventListener('click',()=>{state.metric=metric;for(const m of ['allocated','logical'])$('#'+m).setAttribute('aria-pressed',String(m===metric));if(state.view)navigate(state.view.selected.entry_id);});
-$('#files-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();state.mode='files';renderMode();loadRows();});$('#changes-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();state.mode='changes';renderMode();loadGrowth();});
-$('#insights-tab').addEventListener('click',()=>{if(!state.view||state.overview)return;insights.reset({category:null});growth.reset();state.mode='insights';renderMode();loadInsights();});
+$('#files-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();profile.reset({active:false});state.mode='files';renderMode();loadRows();});$('#changes-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();profile.reset({active:false});state.mode='changes';renderMode();loadGrowth();});
+$('#insights-tab').addEventListener('click',()=>{if(!state.view||state.overview)return;insights.reset({category:null});growth.reset();profile.reset({active:false});state.mode='insights';renderMode();loadInsights();});
 $('#before-scan').addEventListener('change',()=>{state.compareBefore=$('#before-scan').value;growth.reset({group:null,files:false});loadGrowth();});$('#more').addEventListener('click',()=>loadRows(true));
 $('#search').addEventListener('input',()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>loadRows(),200);});
 for(const [id,action]of [['copy','copy'],['reveal','reveal']])$('#'+id).addEventListener('click',()=>runFileAction(action,{scanId:state.scan,entry:Number(state.selected.entry_id)}).catch(error));
