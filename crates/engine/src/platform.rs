@@ -71,6 +71,10 @@ impl Metadata {
 
 #[cfg(test)]
 thread_local! {pub(crate) static CALLS: std::cell::Cell<(usize,usize)> = const {std::cell::Cell::new((0,0))};}
+#[cfg(test)]
+type MetadataEventHook=fn()->io::Result<Option<(CString,io::Result<Metadata>)>>;
+#[cfg(test)]
+thread_local! {pub(crate) static METADATA_EVENT_HOOK:std::cell::Cell<Option<MetadataEventHook>>=const {std::cell::Cell::new(None)};}
 pub(crate) struct Directory(*mut libc::DIR, Option<crate::bulk::Bulk>);
 
 impl Directory {
@@ -188,6 +192,7 @@ impl Directory {
     }
     pub fn next_metadata_event(&mut self) -> io::Result<Option<(CString, io::Result<Metadata>)>> {
         #[cfg(test)] CALLS.with(|c|{let(a,b)=c.get();c.set((a,b+1));});
+        #[cfg(test)] if let Some(hook)=METADATA_EVENT_HOOK.with(|c|c.get()){return hook();}
         if let Some(bulk)=&mut self.1 {
             match bulk.next(unsafe {libc::dirfd(self.0)}) {
                 Ok(Some((name,metadata)))=>return Ok(Some((name.clone(),match metadata {Some(m)=>Ok(m),None=>self.child_metadata(&name)}))),

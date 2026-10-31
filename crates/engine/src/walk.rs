@@ -9,7 +9,14 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+thread_local! {static TEST_ELAPSED:std::cell::Cell<Option<Duration>>=const {std::cell::Cell::new(None)};}
+fn duration_expired(started:Instant,maximum:Duration)->bool {
+    #[cfg(test)] if let Some(elapsed)=TEST_ELAPSED.with(|c|c.get()){return elapsed>=maximum;}
+    started.elapsed()>=maximum
+}
 
 pub struct StreamEntry {
     pub id: u32,
@@ -30,10 +37,12 @@ struct Frame {
 struct Branches(Vec<(Vec<u8>, serde_json::Value)>);
 impl Branches {
     // Called only after the same root scope gate admitted the traversal.
-    fn discover(root:&Path)->Self {
+    fn discover(root:&Path,started:Instant,maximum:Duration,cancel:&AtomicBool)->Self {
         let mut found=Self(Vec::new());
+        if duration_expired(started,maximum) || cancel.load(Ordering::Relaxed){return found;}
         if let Ok(mut directory)=Directory::root(root) {
             for _ in 0..4096 {
+                if duration_expired(started,maximum) || cancel.load(Ordering::Relaxed){break;}
                 match directory.next_metadata() {
                     Ok(Some((name,m))) if m.is_dir()=>{found.slot(name.as_bytes());},
                     Ok(Some(_))=>{}, _=>break,
@@ -200,7 +209,7 @@ pub fn walk_with_progress(
     } else {
         emit(node)?;
     }
-    let mut branches=if stack.is_empty(){Branches(Vec::new())}else{Branches::discover(&root)};
+    let mut branches=if stack.is_empty(){Branches(Vec::new())}else{Branches::discover(&root,started,options.max_duration,cancel)};
     let mut last_progress = Instant::now();
     progress(&Progress {
         branches: branches.rows(),
@@ -212,6 +221,12 @@ pub fn walk_with_progress(
         if cancel.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
+        // Failed child metadata reads continue below; enforce the configured
+        // budget before every iteration, including those error-only paths.
+        if duration_expired(started,options.max_duration) {
+            scan.issue(0,"SCAN_LIMIT","scan","explicit duration limit reached".into(),false);
+            break;
+        }
         if last_progress.elapsed().as_millis() >= 500 {
             progress(&Progress {
                 branches: branches.rows(),
@@ -220,6 +235,9 @@ pub fn walk_with_progress(
                 finished: false,
             });
             last_progress = Instant::now();
+            // A synchronous progress callback can consume the remaining time.
+            // Return through the loop's limit accounting before another read.
+            if duration_expired(started,options.max_duration){continue;}
         }
         let next = stack.last_mut().unwrap().directory.next_metadata_event();
         let (name,metadata) = match next {
@@ -239,7 +257,7 @@ pub fn walk_with_progress(
             Ok(m)=>m,
             Err(e)=>{let frame=stack.last_mut().unwrap();issue_event(&mut scan,&mut frame.node,"METADATA_ERROR","fstatat",e.to_string(),false,Some(&e),Some(name.as_bytes()));continue;}
         };
-        if count >= options.max_entries || started.elapsed() >= options.max_duration {
+        if count >= options.max_entries || duration_expired(started,options.max_duration) {
             scan.issue(
                 0,
                 "SCAN_LIMIT",
@@ -347,4 +365,77 @@ pub fn walk_with_progress(
         scan,
         entry_count: count,
     })
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+    use std::cell::Cell;
+    thread_local! {static FAILURES:Cell<usize>=const {Cell::new(0)};}
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_ELAPSED.with(|c|c.set(None));
+            platform::METADATA_EVENT_HOOK.with(|c|c.set(None));
+        }
+    }
+    fn failed_child()->io::Result<Option<(CString,io::Result<Metadata>)>> {
+        let calls=FAILURES.with(|c|{c.set(c.get()+1);c.get()});
+        // Finite even without the fix: the old error-only loop would count
+        // three failures and incorrectly finish without a duration event.
+        if calls>3{return Ok(None);}
+        TEST_ELAPSED.with(|c|c.set(Some(Duration::from_secs(1))));
+        Ok(Some((CString::new(format!("synthetic-child-{calls}")).unwrap(),Err(io::Error::from_raw_os_error(libc::EACCES)))))
+    }
+    fn progress_directory()->io::Result<Option<(CString,io::Result<Metadata>)>> {
+        let calls=FAILURES.with(|c|{c.set(c.get()+1);c.get()});
+        if calls>3{return Ok(None);}
+        TEST_ELAPSED.with(|c|c.set(Some(Duration::from_secs(1))));
+        Ok(Some((CString::new(format!("synthetic-branch-{calls}")).unwrap(),Ok(Metadata{mode:libc::S_IFDIR,device:1,inode:1,links:1,logical:0,allocated:0,flags:0,mtime:0}))))
+    }
+    fn fixture(label:&str)->PathBuf {
+        let root=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-duration-{label}-{}",std::process::id()));
+        std::fs::create_dir(&root).unwrap();root
+    }
+    #[test]
+    fn repeated_child_metadata_failures_respect_the_existing_duration_budget() {
+        let _reset=Reset;let root=fixture("errors");FAILURES.with(|c|c.set(0));
+        TEST_ELAPSED.with(|c|c.set(Some(Duration::ZERO)));
+        let options=ScanOptions{max_duration:Duration::from_secs(1),..ScanOptions::default()};
+        let mut emitted=Vec::new();
+        let result=walk_with_progress(&root,&options,&AtomicBool::new(false),|node|{emitted.push(node);Ok(())},|p|{
+            if !p.finished {platform::METADATA_EVENT_HOOK.with(|c|c.set(Some(failed_child)));}
+        }).unwrap();
+        FAILURES.with(|c|assert_eq!(c.get(),1));
+        assert_eq!(result.scan.issue_count,2);
+        assert_eq!(result.scan.context["coverage_diagnostics"]["counts"]["access_denied"],1);
+        assert_eq!(result.scan.context["coverage_diagnostics"]["counts"]["explicit_limit"],1);
+        assert_eq!(result.scan.issues[0].code,"METADATA_ERROR");assert_eq!(result.scan.issues[1].code,"SCAN_LIMIT");
+        assert_eq!(result.entry_count,1);assert_eq!(emitted.len(),1);assert!(!emitted[0].entry.enumeration_complete);
+        assert_eq!(result.scan.status,ScanStatus::Partial);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn progress_discovery_stops_when_its_first_read_consumes_the_duration() {
+        let _reset=Reset;let root=fixture("progress-read");FAILURES.with(|c|c.set(0));
+        TEST_ELAPSED.with(|c|c.set(Some(Duration::ZERO)));
+        platform::METADATA_EVENT_HOOK.with(|c|c.set(Some(progress_directory)));
+        let options=ScanOptions{max_duration:Duration::from_secs(1),..ScanOptions::default()};
+        let result=walk_with_progress(&root,&options,&AtomicBool::new(false),|_|Ok(()),|p|assert_eq!(p.branches.len(),1)).unwrap();
+        FAILURES.with(|c|assert_eq!(c.get(),1));
+        assert_eq!(result.entry_count,1);assert_eq!(result.scan.issue_count,1);
+        assert_eq!(result.scan.context["coverage_diagnostics"]["counts"]["explicit_limit"],1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn expired_duration_skips_progress_discovery_and_traversal_enumeration() {
+        let _reset=Reset;let root=fixture("progress");std::fs::create_dir(root.join("branch")).unwrap();
+        TEST_ELAPSED.with(|c|c.set(Some(Duration::from_secs(1))));platform::CALLS.with(|c|c.set((0,0)));
+        let options=ScanOptions{max_duration:Duration::from_secs(1),..ScanOptions::default()};
+        let result=walk_with_progress(&root,&options,&AtomicBool::new(false),|_|Ok(()),|p|assert!(p.branches.is_empty())).unwrap();
+        platform::CALLS.with(|c|assert_eq!(c.get(),(1,0))); // Primary root open only; no discovery open/read.
+        assert_eq!(result.scan.context["coverage_diagnostics"]["counts"]["explicit_limit"],1);
+        assert_eq!(result.entry_count,1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

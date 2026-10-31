@@ -110,3 +110,11 @@ saved synthetic measurements, not scans of real paths. `fixtures.json` records
 IDs, fixed dates, expected counters and sample truncation. Their roots begin
 `/synthetic/`; these paths need not exist. Run B must still implement and
 verify desktop presentation. Run A does not close the full issue.
+
+Explicit duration budgets also apply before each streaming traversal iteration
+and during progress branch discovery. A child metadata failure is counted
+before the next budget check; repeated failures cannot bypass the duration
+limit. An expired budget prevents discovery from opening/enumerating the root.
+Synchronous OS calls or progress callbacks already in flight are not preempted;
+the scanner checks the deadline before the next read. Unlimited scans retain
+the existing initial breadth discovery.
