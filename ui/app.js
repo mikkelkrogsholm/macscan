@@ -9,7 +9,7 @@ const $=s=>document.querySelector(s);
 const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
 const icons={folder:'M3 7h6l2 2h10v11H3z M3 7V4h6l2 3',disk:'M4 3h16v18H4z M8 17h.01 M12 17h4',arrow:'m9 5 7 7-7 7',up:'m6 14 6-6 6 6',search:'M21 21l-5-5 M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',file:'M6 3h8l4 4v14H6z M14 3v5h5',back:'m14 6-6 6 6 6',clock:'M12 8v5l3 2 M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0'};
 function icon(name){const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 24 24');s.setAttribute('aria-hidden','true');s.classList.add('icon');const p=document.createElementNS(s.namespaceURI,'path');p.setAttribute('d',icons[name]??icons.file);s.append(p);return s;}
-const state={view:null,scan:null,metric:'allocated',scans:[],volumes:[],store:'',rows:[],cursor:null,colors:new Map(),request:0,listRequest:0,selected:null,scanning:false,mode:'files',compareBefore:null,compareCursor:null,searchTimer:null};
+const state={view:null,scan:null,metric:'allocated',scans:[],volumes:[],store:'',rows:[],cursor:null,colors:new Map(),request:0,listRequest:0,selected:null,scanning:false,mode:'files',compareBefore:null,searchTimer:null};
 const insights=createInsightsState();
 const growth=createGrowthState();
 state.machine=null;state.overview=false;
@@ -89,7 +89,7 @@ async function openScan(id,keepMachine=false,entry='0'){
 function showMachine(session){
  insights.reset({scope:'all',category:null});growth.reset();$('#insights-tab').disabled=true;
  ++state.request;++state.listRequest;clearError();state.machine=session;state.overview=true;state.scan=session.session_id;state.mode='files';state.colors.clear();
- const view=machineView(session);state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=null;state.compareCursor=null;
+ const view=machineView(session);state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=null;
  $('#view-title').textContent='Hele Mac’en';$('#scan-stamp').textContent='Målt '+date(session.started_at)+' · '+new Intl.NumberFormat('da-DK').format(session.entry_count??0)+' poster · '+(session.status==='cancelled'?'stoppet':'gemt lokalt');
  $('#rescan').textContent='Scan hele Mac’en';$('#child-count').textContent=view.child_count;$('#search').value='';$('#search').disabled=true;$('#changes-tab').disabled=true;
  for(const m of ['allocated','logical'])$('#'+m).disabled=true;
@@ -102,7 +102,7 @@ async function navigate(entry){
  insights.reset({category:null});growth.reset({group:null,files:false});
  const token=++state.request;++state.listRequest;clearTimeout(state.searchTimer);clearError();$('.workspace').classList.add('loading');
  try{const view=await invoke('view_scan',{scanId:state.scan,entry:Number(entry),metric:state.metric});if(token!==state.request)return;
-  state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=view.children.next_cursor;state.compareCursor=null;$('#search').value='';
+  state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=view.children.next_cursor;$('#search').value='';
   $('#view-title').textContent=view.selected.name_display||rootName(view.scope.root_display);$('#scan-stamp').textContent='Målt '+date(view.started_at)+' · '+new Intl.NumberFormat('da-DK').format(view.entry_count)+' poster · ikke live';
   $('#rescan').textContent='Scan igen';$('#child-count').textContent=view.child_count;renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderCompareOptions();
   const partial=view.status!=='complete';$('#coverage').classList.toggle('hidden',!partial);
@@ -144,25 +144,26 @@ function highlight(node,aggregate=false){
 }
 async function chooseNode(n){if(state.overview){const row=state.rows.find(r=>r.entry_id===n.entry_id)??n;if(row.scan_id)return openScan(row.scan_id,true);toast(row.error??(row.phase==='unmounted'?'Volumen er ikke monteret. Dets forbrug vises fra macOS.':'Ingen filscanning for dette område.'));return;}
  if(n.kind==='directory')return navigate(n.entry_id);try{const scan=state.scan;const data=await invoke('view_scan',{scanId:scan,entry:Number(n.entry_id),metric:state.metric});if(scan===state.scan){state.selected=data.selected;renderInspector();}}catch(e){error(e);}}
+// This renderer consumes ordinary children only. Growth owns its separate panel
+// and never changes the schema of state.rows, including during graph refreshes.
 function renderRows(){
- const box=$('#rows');box.replaceChildren();const changed=state.mode==='changes';
- for(const r of state.rows){const id=changed?r.after_entry_id:r.entry_id,b=el('button','file-row');b.dataset.entry=id??'';
-  const swatch=el('span','file-symbol');swatch.style.color=changed?(BigInt(r.delta_bytes??0)>0n?'#f2a382':'#65d5bb'):colorFor(r);swatch.append(icon(r.kind==='directory'?'folder':'file'));
-  const content=el('span','file-label'),name=changed?r.path_display.split('/').filter(Boolean).at(-1):r.name_display;content.append(el('span','file-name',name));
-  if(!state.overview&&!changed){const c=categoryPresentation(r),hint=el('span','file-subtitle',c.label+' · '+c.coverage);hint.title=c.reason+' '+c.detail;content.append(hint);}
+ const box=$('#rows');box.replaceChildren();
+ for(const r of state.rows){const id=r.entry_id,b=el('button','file-row');b.dataset.entry=id??'';
+  const swatch=el('span','file-symbol');swatch.style.color=colorFor(r);swatch.append(icon(r.kind==='directory'?'folder':'file'));
+  const content=el('span','file-label'),name=r.name_display;content.append(el('span','file-name',name));
+  if(!state.overview){const c=categoryPresentation(r),hint=el('span','file-subtitle',c.label+' · '+c.coverage);hint.title=c.reason+' '+c.detail;content.append(hint);}
   if(state.overview)content.append(el('span','file-subtitle',r.kind==='capacity'?'Ikke klassificeret som junk':phaseLabel(r)));
-  if(changed){content.append(el('span','file-subtitle',r.delta_bytes===null?'Ukendt dækning':formatBytes(r.before_bytes)+' → '+formatBytes(r.after_bytes)));if(id===null)b.disabled=true;}
-  const value=changed?r.delta_bytes:r.bytes??r.lower_bound_bytes;const bytes=el('span','file-bytes',(changed&&value!==null&&BigInt(value)>0n?'+':'')+formatBytes(value));
-  if(!changed&&r.bytes===null)bytes.prepend(el('small','lower-label','mindst '));b.title=(r.path_display??state.view.selected.path_display+'/'+name)+' · '+bytes.textContent;
+  const bytes=el('span','file-bytes',formatBytes(r.bytes??r.lower_bound_bytes));
+  if(r.bytes===null)bytes.prepend(el('small','lower-label','mindst '));b.title=(r.path_display??state.view.selected.path_display+'/'+name)+' · '+bytes.textContent;
   const arrow=el('span','row-arrow',r.kind==='directory'?'›':'');b.append(swatch,content,bytes,arrow);
-  b.addEventListener('click',()=>{if(id!==null){if(changed)navigate(id);else chooseNode({...r,path_display:r.path_display??state.view.selected.path_display+'/'+r.name_display});}});
-  b.addEventListener('contextmenu',e=>{if(id!==null)showEntryMenu(e,id);});
-  b.addEventListener('keydown',e=>{if(id!==null&&(e.key==='ContextMenu'||e.shiftKey&&e.key==='F10'))showEntryMenu(e,id);});
-  b.addEventListener('pointerenter',()=>{if(!changed)highlight(r);});b.addEventListener('pointerleave',()=>highlight(null));const item=el('div');item.setAttribute('role','listitem');item.append(b);box.append(item);
+  b.addEventListener('click',()=>{if(id!=null)chooseNode({...r,path_display:r.path_display??state.view.selected.path_display+'/'+r.name_display});});
+  b.addEventListener('contextmenu',e=>{if(id!=null)showEntryMenu(e,id);});
+  b.addEventListener('keydown',e=>{if(id!=null&&(e.key==='ContextMenu'||e.shiftKey&&e.key==='F10'))showEntryMenu(e,id);});
+  b.addEventListener('pointerenter',()=>highlight(r));b.addEventListener('pointerleave',()=>highlight(null));const item=el('div');item.setAttribute('role','listitem');item.append(b);box.append(item);
  }
- $('#more').classList.toggle('hidden',!(changed?state.compareCursor:state.cursor));$('#list-message').classList.toggle('hidden',state.rows.length>0);
- $('#list-message').textContent=state.mode==='changes'?'Ingen ændringer i dette udvalg.':state.view?.selected.kind==='file'?'Dette er en fil, ikke en mappe.':$('#search').value?'Ingen navne matcher søgningen.':'Mappen har ingen viste underposter.';
- $('#size-heading').textContent=changed?'Ændring ↓':'Størrelse ↓';
+ $('#more').classList.toggle('hidden',!state.cursor);$('#list-message').classList.toggle('hidden',state.rows.length>0);
+ $('#list-message').textContent=state.view?.selected.kind==='file'?'Dette er en fil, ikke en mappe.':$('#search').value?'Ingen navne matcher søgningen.':'Mappen har ingen viste underposter.';
+ $('#size-heading').textContent='Størrelse ↓';
 }
 function renderInspector(){
  const n=state.selected;if(!n)return;$('#inspect-name').textContent=n.name_display||rootName(n.path_display);$('#inspect-path').textContent=n.path_display||'';$('#inspect-path').title=n.path_display||'';
@@ -177,7 +178,7 @@ function renderMode(){
  $('#file-controls').classList.toggle('hidden',changes||active);$('#compare-controls').classList.toggle('hidden',!changes);
  $('#insights-panel').classList.toggle('hidden',!active);
  $('#growth-panel').classList.toggle('hidden',!changes);
- for(const selector of ['.list-head','#rows','#more','#list-message'])$(selector).classList.toggle('hidden',active||changes||selector==='#more'&&!(changes?state.compareCursor:state.cursor)||selector==='#list-message'&&state.rows.length>0);
+ for(const selector of ['.list-head','#rows','#more','#list-message'])$(selector).classList.toggle('hidden',active||changes||selector==='#more'&&!state.cursor||selector==='#list-message'&&state.rows.length>0);
  $('#insights-hint').classList.toggle('hidden',!!state.view&&!state.overview);
  $('#insights-hint').textContent=state.overview?'Indsigter gælder én gemt filscanning. Vælg en scannet volumen i grafen eller listen.':'Vælg en gemt måling for at se indsigter.';
 }

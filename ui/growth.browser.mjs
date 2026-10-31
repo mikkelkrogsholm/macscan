@@ -24,7 +24,7 @@ try{
    if(name==='view_scan'){
     if(window.holdView)await new Promise(r=>window.finishView=r);
     const selected={entry_id:String(args.entry),parent_id:args.entry?'0':null,name_display:args.entry===3?'project':args.entry===4?'removed':'synthetic',path_display:'/synthetic/'+(args.entry===3?'project':args.entry===4?'removed':''),kind:args.entry===4?'file':'directory',bytes:'20',coverage_complete:true};
-    return {selected,ancestors:[{entry_id:'0',name_display:'synthetic'}],nodes:args.entry?[selected]:[selected,{...selected,entry_id:'3',parent_id:'0',name_display:'project',path_display:'/synthetic/project',bytes:'17'}],children:{records:[],next_cursor:null},scope:{root_display:'/synthetic'},started_at:scans.find(s=>s.scan_id===args.scanId).started_at,status:'complete',entry_count:'5',child_count:'0'};
+    return {selected,ancestors:[{entry_id:'0',name_display:'synthetic'}],nodes:args.entry?[selected]:[selected,{...selected,entry_id:'3',parent_id:'0',name_display:'project',path_display:'/synthetic/project',bytes:'17'}],children:{records:args.entry===4?[]:[{entry_id:args.entry?'5':'3',parent_id:String(args.entry),name_display:args.entry?'ordinary-child':'project',kind:args.entry?'file':'directory',bytes:'7',coverage_complete:true}],next_cursor:null},scope:{root_display:'/synthetic'},started_at:scans.find(s=>s.scan_id===args.scanId).started_at,status:'complete',entry_count:'5',child_count:args.entry===4?'0':'1'};
    }
    if(name==='list_children')return {records:[],next_cursor:null};
    if(name==='growth'){
@@ -38,16 +38,24 @@ try{
   }}};
  });
  await page.goto('http://127.0.0.1:'+server.address().port);await page.waitForFunction(()=>document.querySelector('#view-title').textContent==='synthetic');
+ await page.locator('#rows .file-row').click();await page.waitForFunction(()=>document.querySelector('#view-title').textContent==='project');
  await page.click('#changes-tab');await page.waitForSelector('#growth-scope');await page.waitForFunction(()=>document.querySelector('#growth-panel').textContent.includes('Ændringsbidrag: -3 B'));
  assert.match(await page.locator('#growth-panel').innerText(),/86\.400\.000\.000\.000 ns/);
  assert.match(await page.locator('#growth-panel').innerText(),/Alle almindelige filer/);
  await page.getByRole('button',{name:'Næste side',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#growth-panel').textContent.includes('page-two'));
  assert.equal(await page.locator('#growth-panel .insight-row').count(),1);assert.equal(await page.locator('#growth-panel .insight-row').innerText().then(s=>s.includes('/synthetic/project')),false);
  await page.selectOption('#growth-scope','current');
- await page.click('#logical');await page.waitForFunction(()=>document.querySelector('#growth-panel').textContent.includes('· Logisk'));
+ await page.click('#logical');await page.waitForFunction(()=>!document.querySelector('.workspace').classList.contains('loading'));
+ assert.equal(await page.locator('#error').isVisible(),false,await page.locator('#error').innerText());
+ await page.waitForFunction(()=>document.querySelector('#growth-panel').textContent.includes('· Logisk')&&document.querySelector('#growth-panel').textContent.includes('Ændringsbidrag: -3 B'));
+ assert.deepEqual(await page.evaluate(()=>{const q=window.calls.filter(c=>c.name==='growth').at(-1).args;return {entry:q.entry,metric:q.metric,before:q.before,after:q.after};}),{entry:3,metric:'logical',before:'400-1',after:'400-2'});
+ assert.equal(await page.locator('#rows').isVisible(),false);
  assert.equal(await page.locator('#changes-tab').getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#growth-scope').inputValue(),'current');
  // Navigate in the graph while changes stay active; current scope must use AFTER id.
+ await page.click('#chart-center');await page.waitForFunction(()=>window.calls.filter(c=>c.name==='growth').at(-1).args.entry===0);
+ assert.equal(await page.locator('#error').isVisible(),false,await page.locator('#error').innerText());
  const point=await page.locator('#sunburst').evaluate(svg=>{const p=svg.createSVGPoint();p.x=425;p.y=300;const result=p.matrixTransform(svg.getScreenCTM());return {x:result.x,y:result.y};});await page.mouse.click(point.x,point.y);await page.waitForFunction(()=>window.calls.filter(c=>c.name==='growth').at(-1).args.entry===3);
+ assert.equal(await page.locator('#error').isVisible(),false,await page.locator('#error').innerText());assert.match(await page.locator('#growth-panel').innerText(),/Ændringsbidrag: -3 B/);
  assert.equal(await page.locator('#before-scan').inputValue(),'400-1');assert.equal(await page.locator('#growth-scope').inputValue(),'current');
  await page.evaluate(()=>window.mockCase='partial');await page.selectOption('#growth-change','unknown');await page.waitForFunction(()=>document.querySelector('#growth-panel').textContent.includes('Ukendt ændring'));
  assert.match(await page.locator('#growth-panel').innerText(),/mindst observeret 90 B/);
@@ -62,5 +70,5 @@ try{
  // Changing tab during a graph request must not reopen Changes on resolution.
  await page.click('#changes-tab');await page.evaluate(()=>{window.holdView=true;document.querySelector('#logical').click();});await page.waitForFunction(()=>typeof window.finishView==='function');await page.locator('#files-tab').focus();await page.locator('#files-tab').press('Enter');await page.evaluate(()=>{window.holdView=false;window.finishView();});await page.waitForFunction(()=>!document.querySelector('.workspace').classList.contains('loading'));
  assert.equal(await page.locator('#files-tab').getAttribute('aria-pressed'),'true');
- assert.deepEqual(errors,[]);console.log('PASS: panel totals, exact interval/delta, bounded page replacement, scope/metric preservation, partial/resource recovery, category drilldown, BEFORE file open, tab race; no page errors');
+ assert.deepEqual(errors,[]);console.log('PASS: nonempty ordinary children through project metric/graph refresh without error banner, logical project -3 B; panel totals, exact interval/delta, bounded page replacement, scope/metric preservation, partial/resource recovery, category drilldown, BEFORE file open, tab race; no page errors');
 }finally{await browser?.close();await new Promise(r=>server.close(r));}
