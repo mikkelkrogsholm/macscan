@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
 mod categories;
+mod insights;
+pub use insights::InsightsQuery;
 pub const FULL_HISTORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 
 pub const DEFAULT_LIMIT: usize = 10;

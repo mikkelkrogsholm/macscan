@@ -63,6 +63,7 @@ struct Options {
     sql: Option<String>,
     before: Option<String>,
     offset: usize,
+    category: Option<String>,
 }
 fn utf8(value: &OsString) -> Result<&str> {
     value
@@ -94,6 +95,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         sql: None,
         before: None,
         offset: 0,
+        category: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -136,6 +138,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                         | "scans"
                         | "compare"
                         | "query"
+                        | "insights"
                 ) =>
             {
                 options.store = PathBuf::from(value)
@@ -147,7 +150,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--scan"
                 if matches!(
                     command,
-                    "summary" | "children" | "largest" | "inspect" | "query"
+                    "summary" | "children" | "largest" | "inspect" | "query" | "insights"
                 ) =>
             {
                 options.scan_id = Some(utf8(value)?.into())
@@ -155,20 +158,20 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--metric"
                 if matches!(
                     command,
-                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare"
+                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare" | "insights"
                 ) =>
             {
                 options.query.metric =
                     Metric::parse(utf8(value)?).map_err(|e| Error::io("metric", e))?
             }
-            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect") => {
+            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect" | "insights") => {
                 options.query.entry = u32::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("entry ID overflow"))?
             }
             "--limit"
                 if matches!(
                     command,
-                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query"
+                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights"
                 ) =>
             {
                 options.query.limit =
@@ -177,11 +180,12 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--cursor"
                 if matches!(
                     command,
-                    "children" | "largest" | "scans" | "compare" | "volumes"
+                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights"
                 ) =>
             {
                 options.query.cursor = Some(utf8(value)?.into())
             }
+            "--category" if command == "insights" => options.category = Some(utf8(value)?.into()),
             "--sql" if command == "query" => options.sql = Some(utf8(value)?.into()),
             "--before" if command == "query" => options.before = Some(utf8(value)?.into()),
             "--offset" if command == "query" => {
@@ -277,8 +281,9 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID"],
+        "commands":["capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
+        "insights_contract":{"version":"insights-1","default":"category rollups","category":"paginated contributing candidate scopes","counts":"regular file paths including hardlinks, not physical identities","rules":"docs/insights.md"},
         "category_contract":{"version":"context-1","category":"derived from saved raw metadata; probable contextual rules or unverified name hints, never deletion approval","saved_category":"legacy snapshot value, not evidence","coverage":"complete, partial, or context_unavailable; applies to saved context, not live validity","rules":"docs/category-rules.md"},
         "query_views":{"entries":"selected scan; schema below","changes":"available with --before ID; joins selected AFTER and BEFORE scan","before_entries":"available with --before ID"},
         "columns":["entry_id","parent_id","name_display","path_display","name_bytes","path_bytes","path_key","kind","logical_bytes","allocated_bytes","accounted_allocated_bytes","own_allocated_bytes","observed_logical_bytes","observed_allocated_bytes","observed_accounted_allocated_bytes","device_id","inode","link_count","observed_link_count","charged_to","mtime_unix_seconds","coverage_complete","enumeration_complete","category","saved_category","category_rule_id","category_rule_version","category_reason","category_coverage","category_evidence_source","private_bytes"],
@@ -331,6 +336,24 @@ fn run() -> Result<u8> {
             }
             result["command"] = json!("scan");
             result["retained"] = json!(options.save);
+            result
+        }
+        "insights" => {
+            if !options.operands.is_empty() {
+                return Err(Error::usage("unexpected operands"));
+            }
+            let id = options.scan_id.as_deref()
+                .ok_or_else(|| Error::usage("--scan ID is required"))?;
+            let store = Store::open(&options.store, false)
+                .map_err(|e| Error::io("open_store", e))?;
+            let result = store.insights(id, &macscan_analysis::InsightsQuery {
+                entry: options.query.entry,
+                metric: options.query.metric,
+                category: options.category,
+                limit: options.query.limit,
+                cursor: options.query.cursor,
+            }, &CANCEL).map_err(|e| Error::io("insights", e))?;
+            code = if result["coverage"]["complete"] == false { 5 } else { 0 };
             result
         }
         "query" => {

@@ -388,6 +388,8 @@ fn contextual_navigation_stays_bounded_on_broad_deep_metadata() {
     store.save_with_cancel(&data,STORE_BUDGET,&AtomicBool::new(false)).unwrap();
     let result=store.query_sql(&data.id,None,"SELECT category,count(*) AS n FROM entries WHERE kind='file' GROUP BY category ORDER BY category",10,0,&AtomicBool::new(false)).unwrap();
     assert_eq!(result["records"][0]["category"],"build_output");assert_eq!(result["records"][0]["n"],"3200");
+    let insights=store.insights(&data.id,&macscan_analysis::InsightsQuery{metric:Metric::Logical,..Default::default()},&AtomicBool::new(false)).unwrap();
+    assert_eq!(insights["records"][0]["category"],"build_output");assert_eq!(insights["records"][0]["bytes"],"3200");
     let view=store.sunburst(&data.id,0,Metric::Logical,&AtomicBool::new(false)).unwrap();
     assert!(view["nodes"].as_array().unwrap().len()<=320);
     let mut query=Query::default();let mut seen=std::collections::HashSet::new();

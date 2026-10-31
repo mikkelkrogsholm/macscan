@@ -378,3 +378,14 @@ fn contextual_classification_reaches_schema_navigation_and_sql() {
     }
     let schema=json(&f.cmd().arg("schema").output().unwrap());assert_eq!(schema["category_contract"]["version"],"context-1");
 }
+
+#[test]
+fn insights_routes_schema_scope_categories_and_validation(){
+ let f=Fixture::new();let root=f.0.join("root");fs::create_dir_all(root.join("target")).unwrap();fs::write(root.join("Cargo.toml"),b"x").unwrap();fs::write(root.join("target/a"),b"12345").unwrap();let store=f.0.join("store");let saved=json(&f.cmd().arg("scan").arg(&root).arg("--save").arg("--store").arg(&store).output().unwrap());let id=saved["scan_id"].as_str().unwrap();
+ let schema=json(&f.cmd().arg("schema").output().unwrap());assert_eq!(schema["insights_contract"]["version"],"insights-1");
+ let page=json(&f.cmd().args(["insights","--scan",id,"--metric","logical","--limit","1"]).arg("--store").arg(&store).output().unwrap());assert_eq!(page["records"][0]["category"],"build_output");assert_eq!(page["records"][0]["bytes"],"5");assert!(page["next_cursor"].is_string());
+ let details=json(&f.cmd().args(["insights","--scan",id,"--category","build_output","--metric","logical","--entry","0"]).arg("--store").arg(&store).output().unwrap());assert_eq!(details["mode"],"candidates");assert!(details["records"][0]["entry_id"].is_string());
+ let out=f.cmd().args(["insights","--scan",id,"--category","build_output","--format","ndjson"]).arg("--store").arg(&store).output().unwrap();assert_eq!(out.status.code(),Some(0));assert!(out.stdout.len()<=8192);for line in String::from_utf8(out.stdout).unwrap().lines(){assert!(serde_json::from_str::<Value>(line).is_ok());}
+ for flags in [vec!["--category","junk"],vec!["--limit","0"],vec!["--entry","99999"],vec!["--cursor","bad"]]{let out=f.cmd().args(["insights","--scan",id]).args(flags).arg("--store").arg(&store).output().unwrap();assert!(!out.status.success());}
+ assert_eq!(f.cmd().arg("insights").output().unwrap().status.code(),Some(2));
+}

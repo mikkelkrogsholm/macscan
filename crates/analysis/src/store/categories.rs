@@ -109,6 +109,7 @@ mod tests {
         let root = temp.join("root");
         fs::create_dir_all(root.join("target")).unwrap();
         fs::write(root.join("Cargo.toml"), b"x").unwrap();
+        fs::write(root.join("target/object"), b"abc").unwrap();
         let data = scan(&root, &ScanOptions::default(), &AtomicBool::new(false)).unwrap();
         let store = Store::open(&temp.join("store"), true).unwrap();
         store
@@ -121,7 +122,7 @@ mod tests {
         let full_bytes = fs::read(&part).unwrap();
         let replacement = temp.join("old.parquet");
         let db = Db::new().unwrap();
-        db.exec(&format!("COPY (SELECT * EXCLUDE(name_bytes,enumeration_complete) FROM read_parquet({})) TO {} (FORMAT PARQUET)",crate::duck::literal(part.to_str().unwrap()),crate::duck::literal(replacement.to_str().unwrap()))).unwrap();
+        db.exec(&format!("COPY (SELECT * EXCLUDE(name_bytes,enumeration_complete,path_key) FROM read_parquet({})) TO {} (FORMAT PARQUET)",crate::duck::literal(part.to_str().unwrap()),crate::duck::literal(replacement.to_str().unwrap()))).unwrap();
         fs::rename(replacement, &part).unwrap();
         let bytes = fs::read(&part).unwrap();
         let result = store
@@ -139,6 +140,12 @@ mod tests {
             result["records"][0]["category_coverage"],
             "context_unavailable"
         );
+        let insights=store.insights(&data.id,&super::super::InsightsQuery::default(),&AtomicBool::new(false)).unwrap();
+        assert_eq!(insights["context_coverage"],"context_unavailable");
+        let target=data.entries.iter().position(|e| e.name==b"target").unwrap() as u32;
+        let scoped=store.insights(&data.id,&super::super::InsightsQuery{entry:target,metric:macscan_engine::Metric::Logical,..Default::default()},&AtomicBool::new(false)).unwrap();
+        assert_eq!(scoped["totals"]["bytes"],"3");assert_eq!(scoped["totals"]["file_path_count"],"1");
+        assert!(insights["records"].as_array().unwrap().iter().all(|r|r["category"]=="unclassified"));
         assert_eq!(fs::read(&part).unwrap(), bytes);
         fs::write(&part, full_bytes).unwrap();
         store.attach(&db, &data.id, "entries").unwrap();
