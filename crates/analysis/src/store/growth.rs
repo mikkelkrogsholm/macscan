@@ -91,6 +91,7 @@ impl Store {
         let new = self.attach(&db, after, "entries")?;
         let old = self.attach(&db, before, "before_entries")?;
         compatible(&old, &new)?;
+        apfs::pair(&old,&new,q.metric)?;
         for source in ["entries", "before_entries"] {
             if db.query(&format!("SELECT count(*) AS missing FROM {source}_saved WHERE path_key IS NULL OR name_bytes IS NULL OR enumeration_complete IS NULL"),Some(cancel))?.row(0)?["missing"] != "0" {
                 return Err(io::Error::new(io::ErrorKind::Unsupported,"saved raw/context metadata unavailable; create two current-format measurements"));
@@ -125,7 +126,7 @@ impl Store {
         let complete = before_complete && selected["coverage_complete"] == true;
         db.exec(&changes_view(
             old["status"] == "complete",
-            new["status"] == "complete",
+            new["status"] == "complete", q.metric==Metric::ApfsDataClone,
         ))?;
         self.restrict(&db)?;
         insights::prepare_events(&db, "entries", "growth_after", cancel)?;
@@ -137,11 +138,7 @@ impl Store {
         ] {
             db.exec_cancel(&format!("CREATE TEMP VIEW {view} AS SELECT e.path_key,hex(e.path_bytes) AS path_bytes_hex,e.{observed} AS observed_bytes,coalesce(c.context_complete,true) AS context_complete,coalesce(c.bucket,'unclassified') AS category FROM {source}_saved e ASOF LEFT JOIN {events}_events c ON e.path_key>=c.key WHERE e.kind='file'"),cancel)?;
         }
-        let metric = if q.metric == Metric::Logical {
-            "logical"
-        } else {
-            "allocated"
-        };
+        let metric=match q.metric {Metric::Logical=>"logical",Metric::ApfsDataClone=>"apfs_data_clone",Metric::Allocated=>"allocated",Metric::Private=>return Err(invalid("private metric is unavailable"))};
         let area = format!(
             "concat({},regexp_extract(substr(hex(c.path_key),{}),'^((?:[0-9A-F]{{2}})*?00)',1))",
             literal(key),

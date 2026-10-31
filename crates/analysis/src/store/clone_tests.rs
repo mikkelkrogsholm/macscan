@@ -3,9 +3,11 @@ use macscan_engine::{scan, ScanOptions};
 struct Tree(PathBuf);
 impl Tree {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
-            "macscan-old-clone-{}-{}",
+            "macscan-old-clone-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

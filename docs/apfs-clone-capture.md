@@ -1,10 +1,11 @@
-# Optional raw APFS metadata capture (#8, run A)
+# Optional APFS metadata capture (#8)
 
 Streaming callers may explicitly set `ScanOptions.capture_clones = true`.
-The default is false, including existing CLI and desktop callers. Legacy
+The default is false. CLI callers can explicitly pass `scan --capture-apfs-clones`; desktop scanning remains capture-off in this run. Legacy
 in-memory `scan`/`scan_with_progress` reject true with `Unsupported`; they do
-not silently ignore it. No user CLI flag, UI, derived clone metric, automatic
-enrichment or accounting change is included in this run.
+not silently ignore it. The separate limited metric and CLI contract are described in
+[apfs-data-clone.md](apfs-data-clone.md). No UI opt-in, automatic enrichment or
+change to primary accounting is included.
 
 The supplemental contract is version 1 (`CLONE_CAPTURE_VERSION`), independent
 of traversal policy and the existing Parquet format/schema version. Capture on
@@ -126,7 +127,7 @@ identity, unsupported initial fallback, root/child exclusion, root-file
 unavailability, legacy/Parquet roundtrip and historical optional-column attach.
 Cancellation and exhausted budgets preserve snapshots and remove unpublished
 stages. Private command logs and the sanitized native matrix are retained under
-ignored `evidence/issue-8A/`. Run A leaves #8 open for later consumer work.
+ignored `evidence/issue-8A/`. Run A established capture; run B adds the shared limited metric and CLI. #8 remains open for UI/native consumer acceptance.
 
 The A2 correction removes unrequested per-file counters and physical clone
 columns from the capture-off production path. A controlled, same-window owned

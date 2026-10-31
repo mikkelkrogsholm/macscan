@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+mod apfs;
 #[cfg(test)]
 mod clone_tests;
 pub use stream::StreamingProfile;
@@ -308,7 +309,10 @@ impl Store {
                 else {fallback.push_str(&format!(",NULL::{ty} AS {name}"));}
             }
         }
-        let replacement=if invalid {" REPLACE(NULL::UBIGINT AS logical_bytes,NULL::UBIGINT AS allocated_bytes,NULL::UBIGINT AS accounted_allocated_bytes,false AS coverage_complete,false AS enumeration_complete)"}else{""};
+        let derived_available=apfs::FIELDS.iter().all(|(name,_)| columns.contains(*name));
+        for (name,ty) in apfs::FIELDS { if !columns.contains(name) { fallback.push_str(&format!(",NULL::{ty} AS {name}")); } }
+        if manifest["apfs_data_clone"].is_object() { manifest["apfs_data_clone"]["columns_available"]=json!(derived_available); }
+        let replacement=if invalid {" REPLACE(NULL::UBIGINT AS logical_bytes,NULL::UBIGINT AS allocated_bytes,NULL::UBIGINT AS accounted_allocated_bytes,NULL::UBIGINT AS apfs_data_clone_bytes,observed_accounted_allocated_bytes AS observed_apfs_data_clone_bytes,CASE WHEN charged_to IS NOT NULL THEN 0 ELSE own_allocated_bytes END::UBIGINT AS own_apfs_data_clone_bytes,NULL::UBIGINT AS apfs_data_clone_owner,'filesystem_or_volume_fallback' AS apfs_data_clone_reason,false AS coverage_complete,false AS enumeration_complete)"}else{""};
         db.exec(&format!(
             "CREATE VIEW {table}_saved AS SELECT *{replacement},{} AS scan_id FROM (SELECT *{fallback} FROM read_parquet({source}))",
             literal(id)
@@ -321,7 +325,13 @@ impl Store {
         if invalid {
             manifest["status"]=json!("partial");
             manifest["read_time_global_invalidation"]=json!(true);
-            for key in ["logical_bytes","allocated_bytes","accounted_allocated_bytes"] {manifest["totals"][key]=Value::Null;}
+            if manifest["apfs_data_clone"].is_object() {
+                manifest["apfs_data_clone"]["status"]=json!("fallback");
+                manifest["apfs_data_clone"]["comparison_ready"]=json!(false);
+                manifest["apfs_data_clone"]["read_time_global_invalidation"]=json!(true);
+                manifest["totals"]["observed_lower_bound"]["apfs_data_clone_bytes"]=manifest["totals"]["observed_lower_bound"]["accounted_allocated_bytes"].clone();
+            }
+            for key in ["logical_bytes","allocated_bytes","accounted_allocated_bytes","apfs_data_clone_bytes"] {manifest["totals"][key]=Value::Null;}
         }
         Ok(manifest)
     }
@@ -348,7 +358,7 @@ impl Store {
             compatible(&old, &after)?;
             db.exec(&changes_view(
                 old["status"] == "complete",
-                after["status"] == "complete",
+                after["status"] == "complete", false,
             ))?;
             Some(old)
         } else {
@@ -379,6 +389,7 @@ impl Store {
         }
         let db = Db::analysis()?;
         let manifest = self.attach(&db, id, "entries")?;
+        apfs::require(&manifest,q.metric)?;
         self.restrict(&db)?;
         let command = match q.kind {
             QueryKind::Summary => "summary",
@@ -397,7 +408,7 @@ impl Store {
         let offset = cursor_offset(q.cursor.as_deref(), &binding)?;
         let metric = metric_column(q.metric);
         let observed = observed_column(q.metric);
-        let selected=db.query(&format!("SELECT entry_id,logical_bytes,allocated_bytes,accounted_allocated_bytes,observed_logical_bytes,observed_accounted_allocated_bytes,coverage_complete,hex(path_key) AS key FROM entries_saved WHERE entry_id={}",q.entry),None)?.row(0)?;
+        let selected=db.query(&format!("SELECT entry_id,logical_bytes,allocated_bytes,accounted_allocated_bytes,observed_logical_bytes,observed_accounted_allocated_bytes,apfs_data_clone_bytes,observed_apfs_data_clone_bytes,coverage_complete,hex(path_key) AS key FROM entries_saved WHERE entry_id={}",q.entry),None)?.row(0)?;
         if selected["entry_id"].is_null() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "entry not found"));
         }
@@ -415,7 +426,7 @@ impl Store {
             return fit(answer);
         }
         let sql = if q.kind == QueryKind::Inspect {
-            format!("SELECT entry_id,parent_id,name_display,path_display,hex(path_bytes) AS path_bytes_hex,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,private_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id,coverage_complete,enumeration_complete,{} FROM entries_classified([{}])",categories::FIELDS,q.entry)
+            format!("SELECT entry_id,parent_id,name_display,path_display,hex(path_bytes) AS path_bytes_hex,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,private_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id,apfs_data_clone_bytes,observed_apfs_data_clone_bytes,own_apfs_data_clone_bytes,apfs_data_clone_owner,apfs_data_clone_reason,coverage_complete,enumeration_complete,{} FROM entries_classified([{}])",categories::FIELDS,q.entry)
         } else {
             let mut filter = if q.kind == QueryKind::Children {
                 format!("parent_id={}", q.entry)
@@ -490,10 +501,12 @@ impl Store {
         }
         let db = Db::analysis()?;
         let manifest = self.attach(&db, id, "entries")?;
+        apfs::require(&manifest,metric)?;
         self.restrict(&db)?;
         let column = metric_column(metric);
         let observed = observed_column(metric);
-        let fields = format!("entry_id,parent_id,name_display,path_display,kind,{column} AS bytes,{observed} AS observed_bytes,logical_bytes,allocated_bytes,accounted_allocated_bytes,coverage_complete,link_count,{}",categories::FIELDS);
+        let clone_fields=if metric==Metric::ApfsDataClone {",own_apfs_data_clone_bytes,apfs_data_clone_owner,apfs_data_clone_reason"}else{""};
+        let fields = format!("entry_id,parent_id,name_display,path_display,kind{clone_fields},{column} AS bytes,{observed} AS observed_bytes,logical_bytes,allocated_bytes,accounted_allocated_bytes,coverage_complete,link_count,{}",categories::FIELDS);
         let selected = db
             .query(
                 &format!("SELECT {fields} FROM entries_classified([{entry}])"),
@@ -561,7 +574,7 @@ impl Store {
             }
         }
         Ok(
-            json!({"scan_id":id,"metric":metric.name(),"selected":selected,"ancestors":ancestors,"nodes":nodes,
+            json!({"scan_id":id,"metric":metric.name(),"apfs_data_clone":manifest["apfs_data_clone"],"selected":selected,"ancestors":ancestors,"nodes":nodes,
           "child_count":count["count"],"status":manifest["status"],"started_at":manifest["started_at"],
           "scope":manifest["scope"],"entry_count":manifest["entry_count"],"error_count":manifest["error_count"],
           "origin":manifest["origin"],"measurement_context":manifest["context"],"issues":issues,"capacity":manifest["context"]["volume_after"],
@@ -581,15 +594,20 @@ impl Store {
                 "private metric is unavailable",
             ));
         }
-        let metric = if q.metric == Metric::Logical {
-            "logical"
-        } else {
-            "allocated"
-        };
+        let old=self.manifest(before)?; let new=self.manifest(after)?;
+        apfs::pair(&old,&new,q.metric)?;
+        let metric = match q.metric { Metric::Logical=>"logical",Metric::ApfsDataClone=>"apfs_data_clone",Metric::Allocated=>"allocated",Metric::Private=>return Err(invalid("private metric is unavailable")) };
         let binding = format!("pc1:{before}:{after}:{metric}");
         let offset = cursor_offset(q.cursor.as_deref(), &binding)?;
         let sql=format!("SELECT before_entry_id,after_entry_id,path_display,kind,{metric}_before AS before_bytes,{metric}_after AS after_bytes,{metric}_delta AS delta_bytes,CASE WHEN {metric}_delta IS NULL THEN 'not_observed_or_incomplete' WHEN before_entry_id IS NULL THEN 'added' WHEN after_entry_id IS NULL THEN 'removed' WHEN {metric}_delta>0 THEN 'grown' WHEN {metric}_delta<0 THEN 'shrunk' ELSE 'type_changed' END AS change FROM changes WHERE path_key<>''::BLOB AND ({metric}_delta IS NULL OR {metric}_delta<>0 OR before_entry_id IS NULL OR after_entry_id IS NULL OR kind_before<>kind_after) ORDER BY ({metric}_delta IS NULL) DESC,abs({metric}_delta) DESC,path_key");
-        let mut result = self.query_sql(after, Some(before), &sql, q.limit, offset, cancel)?;
+        let mut result = if q.metric==Metric::ApfsDataClone {
+            let db=Db::comparison()?; let new=self.attach(&db,after,"entries")?;let old=self.attach(&db,before,"before_entries")?;
+            compatible(&old,&new)?;apfs::pair(&old,&new,q.metric)?;
+            db.exec(&changes_view(true,true,true))?;self.restrict(&db)?;
+            let mut value=envelope(&new,"compare",q.metric);
+            value["before_scan_id"]=json!(before);value["coverage"]["before_status"]=old["status"].clone();value["coverage"]["after_status"]=new["status"].clone();
+            run_query(&db,&sql,q.limit,offset,cancel,&mut value)?;value
+        } else { self.query_sql(after, Some(before), &sql, q.limit, offset, cancel)? };
         result["command"] = json!("compare");
         result["warnings"].as_array_mut().unwrap().push(json!(
             "nested_changes_overlap_do_not_sum; metadata_only_not_process_attribution"
@@ -691,13 +709,13 @@ fn run_query(
     Ok(())
 }
 fn envelope(m: &Value, command: &str, metric: Metric) -> Value {
-    json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"query_engine":"DuckDB v2.0.0","scan_id":m["scan_id"],"command":command,"status":m["status"],"metric":metric.name(),
+    json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"query_engine":"DuckDB v2.0.0","apfs_data_clone":m["apfs_data_clone"],"scan_id":m["scan_id"],"command":command,"status":m["status"],"metric":metric.name(),
         "scope":{"root":m["scope"]["root_display"]},"started_at":m["started_at"],"coverage":{"complete":m["status"]=="complete","entries_seen":m["entry_count"],"error_count":m["error_count"],"excluded_count":m["excluded_count"]},
         "totals":m["totals"],"records":[],"truncated":false,"next_cursor":null,
         "warnings":["allocated_is_hardlink_accounted_not_unique_APFS_or_reclaimable","null_means_unknown; lower_bounds_are_not_complete_totals","categories_are_contextual_metadata_hints_not_deletion_approval"]})
 }
 fn compact_totals(v: &Value) -> Value {
-    json!({"logical_bytes":v["logical_bytes"],"allocated_bytes":v["allocated_bytes"],"accounted_allocated_bytes":v["accounted_allocated_bytes"],"private_bytes":null,"observed_lower_bound":v["observed_lower_bound"]})
+    json!({"logical_bytes":v["logical_bytes"],"allocated_bytes":v["allocated_bytes"],"accounted_allocated_bytes":v["accounted_allocated_bytes"],"private_bytes":null,"apfs_data_clone_bytes":v["apfs_data_clone_bytes"],"observed_lower_bound":v["observed_lower_bound"]})
 }
 fn compatible(a: &Value, b: &Value) -> io::Result<()> {
     let fail = || {
@@ -738,7 +756,8 @@ fn compatible(a: &Value, b: &Value) -> io::Result<()> {
     }
     Ok(())
 }
-fn changes_view(before_complete: bool, after_complete: bool) -> String {
+fn changes_view(before_complete: bool, after_complete: bool, clones: bool) -> String {
+    let clone_changes=if clones {" OR cb IS DISTINCT FROM ca"}else{""};
     let mut joins = String::new();
     let before = if before_complete {
         "true"
@@ -758,34 +777,29 @@ fn changes_view(before_complete: bool, after_complete: bool) -> String {
     format!("CREATE VIEW changes AS WITH pairs AS (
       SELECT COALESCE(b.path_key,a.path_key) AS path_key,b.entry_id AS before_entry_id,a.entry_id AS after_entry_id,
       COALESCE(a.path_display,b.path_display) AS path_display,COALESCE(a.kind,b.kind) AS kind,b.kind AS kind_before,a.kind AS kind_after,
-      b.logical_bytes AS lb,a.logical_bytes AS la,b.accounted_allocated_bytes AS ab,a.accounted_allocated_bytes AS aa
+      b.logical_bytes AS lb,a.logical_bytes AS la,b.accounted_allocated_bytes AS ab,a.accounted_allocated_bytes AS aa,b.apfs_data_clone_bytes AS cb,a.apfs_data_clone_bytes AS ca
       FROM before_entries_saved b FULL OUTER JOIN entries_saved a ON b.path_key=a.path_key
     ), relevant AS (
       SELECT * FROM pairs WHERE before_entry_id IS NULL OR after_entry_id IS NULL
       OR lb IS NULL OR la IS NULL OR ab IS NULL OR aa IS NULL
-      OR lb IS DISTINCT FROM la OR ab IS DISTINCT FROM aa OR kind_before IS DISTINCT FROM kind_after
+      OR lb IS DISTINCT FROM la OR ab IS DISTINCT FROM aa OR kind_before IS DISTINCT FROM kind_after{clone_changes}
     ), covered AS ({covered}), computed AS (
       SELECT *,CASE WHEN before_entry_id IS NULL AND before_known THEN 0 ELSE lb END AS logical_before,
       CASE WHEN after_entry_id IS NULL AND after_known THEN 0 ELSE la END AS logical_after,
       CASE WHEN before_entry_id IS NULL AND before_known THEN 0 ELSE ab END AS allocated_before,
-      CASE WHEN after_entry_id IS NULL AND after_known THEN 0 ELSE aa END AS allocated_after FROM covered
+      CASE WHEN after_entry_id IS NULL AND after_known THEN 0 ELSE aa END AS allocated_after,
+      CASE WHEN before_entry_id IS NULL AND before_known THEN 0 ELSE cb END AS apfs_data_clone_before,
+      CASE WHEN after_entry_id IS NULL AND after_known THEN 0 ELSE ca END AS apfs_data_clone_after FROM covered
     ) SELECT *,CAST(logical_after AS HUGEINT)-CAST(logical_before AS HUGEINT) AS logical_delta,
-      CAST(allocated_after AS HUGEINT)-CAST(allocated_before AS HUGEINT) AS allocated_delta FROM computed")
+      CAST(allocated_after AS HUGEINT)-CAST(allocated_before AS HUGEINT) AS allocated_delta,
+      CAST(apfs_data_clone_after AS HUGEINT)-CAST(apfs_data_clone_before AS HUGEINT) AS apfs_data_clone_delta FROM computed")
 }
-fn metric_column(m: Metric) -> &'static str {
-    if m == Metric::Logical {
-        "logical_bytes"
-    } else {
-        "accounted_allocated_bytes"
-    }
-}
-fn observed_column(m: Metric) -> &'static str {
-    if m == Metric::Logical {
-        "observed_logical_bytes"
-    } else {
-        "observed_accounted_allocated_bytes"
-    }
-}
+fn metric_column(m: Metric) -> &'static str { match m {
+    Metric::Logical=>"logical_bytes", Metric::Allocated=>"accounted_allocated_bytes", Metric::ApfsDataClone=>"apfs_data_clone_bytes", Metric::Private=>"private_bytes"
+}}
+fn observed_column(m: Metric) -> &'static str { match m {
+    Metric::Logical=>"observed_logical_bytes", Metric::Allocated=>"observed_accounted_allocated_bytes", Metric::ApfsDataClone=>"observed_apfs_data_clone_bytes", Metric::Private=>"private_bytes"
+}}
 fn path_key(scan: &Scan, id: u32) -> Vec<u8> {
     let path = scan.path(id);
     let relative = path

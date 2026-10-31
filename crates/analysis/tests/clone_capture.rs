@@ -305,7 +305,7 @@ fn native_owned_apfs_clone_capture_roundtrip() {
     let off = capture(&store, root, false);
     let on = capture(&store, root, true);
     assert_eq!(primary(&store, &off), primary(&store, &on));
-    let saved=rows(&store,&on,"name_display,kind,logical_bytes,own_allocated_bytes,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id,device_id,inode,charged_to");
+    let saved=rows(&store,&on,"entry_id,name_display,kind,logical_bytes,own_allocated_bytes,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id,device_id,inode,charged_to,apfs_data_clone_bytes,own_apfs_data_clone_bytes,apfs_data_clone_owner,apfs_data_clone_reason");
     let files: Vec<_> = saved
         .as_array()
         .unwrap()
@@ -372,8 +372,78 @@ fn native_owned_apfs_clone_capture_roundtrip() {
         )
         .unwrap();
     assert!(compared["records"].as_array().unwrap().is_empty());
+    let raw_total: u64=files.iter().map(|r|number(r,"own_allocated_bytes")).sum();
+    let limited_total: u64=files.iter().map(|r|number(r,"own_apfs_data_clone_bytes")).sum();
+    assert_eq!(raw_total,5_312_512);
+    assert_eq!(limited_total,2_166_784);
+    assert_eq!(number(get("forked"),"own_apfs_data_clone_bytes"),1_114_112);
+    assert_eq!(get("full")["own_apfs_data_clone_bytes"],"0");
+    assert_eq!(get("hardlink")["own_apfs_data_clone_bytes"],"0");
+    assert_eq!(get("source")["own_apfs_data_clone_bytes"],"0");
+    let manifest=store.manifest(&on).unwrap();
+    assert_eq!(manifest["apfs_data_clone"]["algorithm_version"],"apfs-data-clone-1");
+    assert_eq!(manifest["apfs_data_clone"]["status"],"limited");
+    let sum=rows(&store,&on,"sum(CASE WHEN kind='file' THEN accounted_allocated_bytes ELSE 0 END) OVER () AS files_accounted");
+    assert_eq!(sum[0]["files_accounted"],"4263936");
+    // The production persisted metric reaches every shared consumer.
+    use macscan_engine::{Query,QueryKind};
+    for kind in [QueryKind::Summary,QueryKind::Children,QueryKind::Largest,QueryKind::Inspect] {
+        let result=store.report(&on,&Query{kind,metric:Metric::ApfsDataClone,limit:2,..Query::default()},&STOP).unwrap();
+        assert_eq!(result["metric"],"apfs-data-clone");
+        assert_eq!(result["apfs_data_clone"]["label"],"Begrænset DATA-klonkorrigeret allokering");
+        assert!(macscan_analysis::encode_response(result,false).unwrap().len()<=8192);
+    }
+    let sun=store.sunburst(&on,0,Metric::ApfsDataClone,&STOP).unwrap();
+    assert_eq!(sun["selected"]["bytes"],manifest["totals"]["apfs_data_clone_bytes"]);
+    let zero=store.sunburst(&on,get("full")["entry_id"].as_str().unwrap().parse().unwrap(),Metric::ApfsDataClone,&STOP).unwrap();
+    assert_eq!(zero["selected"]["bytes"],"0");
+    assert_eq!(zero["selected"]["apfs_data_clone_reason"],"full_data_nonowner");
+    assert_eq!(zero["selected"]["apfs_data_clone_owner"],get("forked")["entry_id"]);
+
+    let insight=store.insights(&on,&macscan_analysis::InsightsQuery{metric:Metric::ApfsDataClone,..Default::default()},&STOP).unwrap();
+    assert_eq!(insight["totals"]["bytes"],"2166784");
+    for types in [true,false] {
+        let profile=store.file_profile(&on,&macscan_analysis::FileProfileQuery{metric:Metric::ApfsDataClone,types,..Default::default()},&STOP).unwrap();
+        assert_eq!(profile["totals"]["bytes"],"2166784");
+    }
+    let next=capture(&store,root,true);
+    assert!(store.compare(&on,&next,&CompareQuery{metric:Metric::ApfsDataClone,limit:10,cursor:None},&STOP).unwrap()["records"].as_array().unwrap().is_empty());
+    let growth=store.growth(&on,&next,&macscan_analysis::GrowthQuery{metric:Metric::ApfsDataClone,..Default::default()},&STOP).unwrap();
+    assert!(growth["records"].as_array().unwrap().is_empty());
+    assert!(store.report(&off,&Query{metric:Metric::ApfsDataClone,..Query::default()},&STOP).is_err());
+    let full=fs::OpenOptions::new().write(true).open(root.join("full")).unwrap();
+    full.write_all_at(&[0x6b;4096],0).unwrap();full.sync_all().unwrap();
+    let changed=capture(&store,root,true);
+    let primary_changes=store.compare(&next,&changed,&CompareQuery{metric:Metric::Allocated,limit:10,cursor:None},&STOP).unwrap();
+    assert!(primary_changes["records"].as_array().unwrap().is_empty());
+    let clone_changes=store.compare(&next,&changed,&CompareQuery{metric:Metric::ApfsDataClone,limit:10,cursor:None},&STOP).unwrap();
+    assert!(clone_changes["records"].as_array().unwrap().iter().any(|r|r["delta_bytes"]=="1048576"));
+    let clone_growth=store.growth(&next,&changed,&macscan_analysis::GrowthQuery{metric:Metric::ApfsDataClone,files:true,..Default::default()},&STOP).unwrap();
+    assert!(clone_growth["records"].as_array().unwrap().iter().any(|r|r["delta_bytes"]=="1048576"));
+    assert!(store.query_sql(&changed,Some(&next),"SELECT path_display FROM changes",10,0,&STOP).unwrap()["records"].as_array().unwrap().is_empty());
+
+    // Only these owned synthetic histories are altered to simulate old/incompatible
+    // manifests and a read-time global invalidation; production never rewrites them.
+    let manifest_path=store.path().join(&on).join("manifest.json");
+    let mut invalid=store.manifest(&on).unwrap();
+    invalid["context"]["volume_before"]["fsid"]=json!("synthetic-before");
+    invalid["context"]["volume_after"]["fsid"]=json!("synthetic-after");
+    fs::write(&manifest_path,serde_json::to_vec(&invalid).unwrap()).unwrap();
+    let invalid_result=store.report(&on,&Query{kind:QueryKind::Summary,metric:Metric::ApfsDataClone,..Query::default()},&STOP).unwrap();
+    assert!(invalid_result["totals"]["apfs_data_clone_bytes"].is_null());
+    assert_eq!(invalid_result["totals"]["observed_lower_bound"]["apfs_data_clone_bytes"],invalid["totals"]["observed_lower_bound"]["accounted_allocated_bytes"]);
+    assert_eq!(invalid_result["apfs_data_clone"]["status"],"fallback");
+    assert!(store.compare(&on,&next,&CompareQuery{metric:Metric::ApfsDataClone,limit:10,cursor:None},&STOP).is_err());
+    let mut old=manifest.clone();old.as_object_mut().unwrap().remove("apfs_data_clone");
+    fs::write(&manifest_path,serde_json::to_vec(&old).unwrap()).unwrap();
+    assert!(store.report(&on,&Query{metric:Metric::ApfsDataClone,..Query::default()},&STOP).is_err());
+    store.report(&on,&Query::default(),&STOP).unwrap();
+    old["apfs_data_clone"]=manifest["apfs_data_clone"].clone();
+    old["apfs_data_clone"]["algorithm_version"]=json!("future-version");
+    fs::write(&manifest_path,serde_json::to_vec(&old).unwrap()).unwrap();
+    assert!(store.report(&on,&Query{metric:Metric::ApfsDataClone,..Query::default()},&STOP).is_err());
     // Sanitized matrix uses symbolic ID/device relations, no fixture path or persistent identifiers.
-    let matrix:Vec<_>=files.iter().map(|r|json!({"fixture":r["name_display"],"status":r["clone_status"],"clone_id_relation":if r["clone_id"]==src["clone_id"]{"source"}else{"different"},"extended_flags":r["clone_extended_flags"],"total":r["own_allocated_bytes"],"data":r["clone_data_allocated_bytes"]})).collect();
+    let matrix:Vec<_>=files.iter().map(|r|json!({"fixture":r["name_display"],"status":r["clone_status"],"clone_id_relation":if r["clone_id"]==src["clone_id"]{"source"}else{"different"},"extended_flags":r["clone_extended_flags"],"total":r["own_allocated_bytes"],"data":r["clone_data_allocated_bytes"],"limited":r["own_apfs_data_clone_bytes"],"reason":r["apfs_data_clone_reason"]})).collect();
     println!(
         "{}",
         json!({"native_matrix":matrix,"primary_parity":true,"capture_context":store.manifest(&on).unwrap()["context"]["clone_capture"]})
@@ -435,4 +505,36 @@ fn supplemental_capture_respects_root_and_child_scope_exclusions() {
     assert!(raw[0]["clone_id"].is_null());
     assert_eq!(raw[0]["logical_bytes"], "5");
     assert_eq!(raw[0]["coverage_complete"], true);
+}
+
+#[test]
+fn captured_metric_pagination_scope_and_unavailable_snapshot_contract() {
+    use macscan_engine::{Query,QueryKind};
+    let tree=Tree::new();let history=Tree::new();
+    for n in 0..37 {fs::write(tree.0.join(format!("file-{n:02}.bin")),vec![0x5a;4096+n]).unwrap();}
+    let store=Store::open(&history.0.join("history"),true).unwrap();
+    let id=capture(&store,&tree.0,true);let off=capture(&store,&tree.0,false);
+    let mut query=Query{metric:Metric::ApfsDataClone,kind:QueryKind::Children,limit:3,..Query::default()};
+    let mut seen=std::collections::HashSet::new();
+    loop {
+        let result=store.report(&id,&query,&STOP).unwrap();
+        for ndjson in [false,true] {assert!(macscan_analysis::encode_response(result.clone(),ndjson).unwrap().len()<=8192);}
+        for row in result["records"].as_array().unwrap() {assert!(seen.insert(row["entry_id"].clone().to_string()));}
+        if let Some(cursor)=result["next_cursor"].as_str() {
+            let wrong=Query{metric:Metric::Allocated,cursor:Some(cursor.into()),limit:3,..Query::default()};assert!(store.report(&id,&wrong,&STOP).is_err());
+            query.cursor=Some(cursor.into());
+        } else {break;}
+    }
+    assert_eq!(seen.len(),37);
+    for kind in [QueryKind::Summary,QueryKind::Children,QueryKind::Largest,QueryKind::Inspect] {
+        assert_eq!(store.report(&off,&Query{kind,metric:Metric::ApfsDataClone,..Query::default()},&STOP).unwrap_err().kind(),std::io::ErrorKind::Unsupported);
+    }
+    assert!(store.sunburst(&off,0,Metric::ApfsDataClone,&STOP).is_err());
+    assert!(store.insights(&off,&macscan_analysis::InsightsQuery{metric:Metric::ApfsDataClone,..Default::default()},&STOP).is_err());
+    assert!(store.file_profile(&off,&macscan_analysis::FileProfileQuery{metric:Metric::ApfsDataClone,..Default::default()},&STOP).is_err());
+    assert!(store.compare(&off,&id,&CompareQuery{metric:Metric::ApfsDataClone,..Default::default()},&STOP).is_err());
+    assert!(store.growth(&off,&id,&macscan_analysis::GrowthQuery{metric:Metric::ApfsDataClone,..Default::default()},&STOP).is_err());
+    let legacy=macscan_engine::scan(&tree.0,&ScanOptions::default(),&STOP).unwrap();
+    assert_eq!(legacy.query(&Query{metric:Metric::ApfsDataClone,..Query::default()}).unwrap_err().kind(),std::io::ErrorKind::Unsupported);
+    assert!(legacy.query(&Query{metric:Metric::Private,..Query::default()}).unwrap_err().to_string().contains("private"));
 }

@@ -122,6 +122,9 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             continue;
         }
         let flag = utf8(arg)?;
+        if flag == "--capture-apfs-clones" && command=="scan" {
+            options.scan.capture_clones=true;index+=1;continue;
+        }
         if flag == "--save" {
             if command != "scan" {
                 return Err(Error::usage("--save is only valid for scan"));
@@ -313,6 +316,9 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "store/output cannot contain dot or parent components",
         ));
     }
+    if command=="scan" && options.query.metric==Metric::ApfsDataClone && !options.scan.capture_clones {
+        return Err(Error::usage("scan --metric apfs-data-clone requires explicit --capture-apfs-clones"));
+    }
     if options.query.metric == Metric::Private {
         return Err(Error {
             exit: 6,
@@ -325,15 +331,16 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
+        "commands":["coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save] [--capture-apfs-clones]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
+        "apfs_data_clone_contract":{"algorithm_version":"apfs-data-clone-1","capture_version":1,"label":"Begrænset DATA-klonkorrigeret allokering","opt_in":"scan --capture-apfs-clones","limitations":"Within measurement root; full DATA only, partial and non-DATA retained; global raw-path owners; not unique/private/reclaimable space","documentation":"docs/apfs-data-clone.md"},
         "profile_contract":{"version":"file-profile-1","view":["files","types"],"sort":["bytes","count"],"scope":"saved --entry with raw path component boundaries","age":"saved ended_unix_ns; inclusive integer threshold; unknown/future mtime excluded","type":"raw final suffix hint; ASCII lowercase; opaque type_key preserves non-UTF8 identity","documentation":"docs/file-profile.md"},
         "growth_contract":{"version":"growth-1","rules":"insights-1","grouping":["area","category"],"view":["groups","files"],"change":["all","grown","shrunk","added","removed","unknown"],"group":"stable group_key from a previous response","scope":"AFTER --entry; BEFORE matched by saved raw path key","accounting":"changed regular-file contributions, no directory subtree overlap","documentation":"docs/growth.md"},
         "insights_contract":{"version":"insights-1","default":"category rollups","category":"paginated contributing candidate scopes","counts":"regular file paths including hardlinks, not physical identities","rules":"docs/insights.md"},
         "category_contract":{"version":"context-1","category":"derived from saved raw metadata; probable contextual rules or unverified name hints, never deletion approval","saved_category":"legacy snapshot value, not evidence","coverage":"complete, partial, or context_unavailable; applies to saved context, not live validity","rules":"docs/category-rules.md"},
         "query_views":{"entries":"selected scan; schema below","changes":"available with --before ID; joins selected AFTER and BEFORE scan","before_entries":"available with --before ID"},
-        "columns":["entry_id","parent_id","name_display","path_display","name_bytes","path_bytes","path_key","kind","logical_bytes","allocated_bytes","accounted_allocated_bytes","own_allocated_bytes","observed_logical_bytes","observed_allocated_bytes","observed_accounted_allocated_bytes","device_id","inode","link_count","observed_link_count","charged_to","mtime_unix_seconds","coverage_complete","enumeration_complete","category","saved_category","category_rule_id","category_rule_version","category_reason","category_coverage","category_evidence_source","private_bytes"],
-        "options":{"store":"absolute metadata directory","limit":"1..100, default 10; responses always <=8192 bytes","offset":"SQL pagination; use next_offset, use ORDER BY for stable SQL pages","cursor":"predefined query pagination; use next_cursor unchanged","metric":["logical","allocated"],"progress":["off","text","ndjson"],"format":["json","ndjson"]},
+        "columns":["entry_id","parent_id","name_display","path_display","name_bytes","path_bytes","path_key","kind","logical_bytes","allocated_bytes","accounted_allocated_bytes","own_allocated_bytes","observed_logical_bytes","observed_allocated_bytes","observed_accounted_allocated_bytes","device_id","inode","link_count","observed_link_count","charged_to","mtime_unix_seconds","coverage_complete","enumeration_complete","category","saved_category","category_rule_id","category_rule_version","category_reason","category_coverage","category_evidence_source","private_bytes","clone_status","clone_id","clone_extended_flags","clone_data_allocated_bytes","clone_device_id","apfs_data_clone_bytes","observed_apfs_data_clone_bytes","own_apfs_data_clone_bytes","apfs_data_clone_owner","apfs_data_clone_reason"],
+        "options":{"store":"absolute metadata directory","limit":"1..100, default 10; responses always <=8192 bytes","offset":"SQL pagination; use next_offset, use ORDER BY for stable SQL pages","cursor":"predefined query pagination; use next_cursor unchanged","metric":["logical","allocated","apfs-data-clone"],"progress":["off","text","ndjson"],"format":["json","ndjson"]},
         "sql_examples":["SELECT path_display,accounted_allocated_bytes FROM entries WHERE kind='file' ORDER BY accounted_allocated_bytes DESC LIMIT 10","SELECT category,count(*) AS entries,sum(accounted_allocated_bytes) AS bytes FROM entries WHERE kind='file' GROUP BY category ORDER BY bytes DESC","SELECT path_display,logical_delta FROM changes WHERE logical_delta>0 ORDER BY logical_delta DESC LIMIT 10"],
         "result_contract":{"schema_version":"2.0","all_SQL_numbers":"exact decimal strings; booleans and null preserved","null":"unknown, never zero","allocated":"scoped hardlink-accounted OS allocation, not unique APFS or reclaimable bytes","partial":"unknown areas are not deletion evidence","output_budget_bytes":OUTPUT_BUDGET},
         "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"automatic_deletion":false,"UI":"Tauri sunburst"}})

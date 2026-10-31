@@ -414,3 +414,21 @@ fn coverage_command_reports_saved_whole_measurement_in_json_and_ndjson(){
     let mut m:Value=serde_json::from_slice(&fs::read(store.join(id).join("manifest.json")).unwrap()).unwrap();m.as_object_mut().unwrap().remove("coverage_diagnostics");fs::write(store.join(id).join("manifest.json"),serde_json::to_vec(&m).unwrap()).unwrap();
     let legacy=json(&f.cmd().args(["coverage","--scan",id,"--store"]).arg(&store).output().unwrap());assert_eq!(legacy["quality"],"legacy_samples_only");assert!(legacy["reason_counts"].is_null());assert_eq!(legacy["error_count"],"1");
 }
+
+#[test]
+fn apfs_data_clone_requires_explicit_scan_capture_and_routes_saved_consumers() {
+    let f=Fixture::new();let root=f.0.join("root");fs::create_dir(&root).unwrap();fs::write(root.join("file.bin"),vec![3;4096]).unwrap();let history=f.0.join("history");
+    let reject=f.cmd().args(["scan","/does-not-exist","--metric","apfs-data-clone"]).output().unwrap();
+    assert_eq!(reject.status.code(),Some(2));assert!(String::from_utf8_lossy(&reject.stderr).contains("--capture-apfs-clones"));assert!(!history.exists());
+    let off=json(&f.cmd().arg("scan").arg(&root).arg("--output").arg(&history).output().unwrap());
+    let on=json(&f.cmd().arg("scan").arg(&root).arg("--output").arg(&history).args(["--capture-apfs-clones","--metric","apfs-data-clone"]).output().unwrap());
+    assert_eq!(on["metric"],"apfs-data-clone");assert_eq!(on["apfs_data_clone"]["algorithm_version"],"apfs-data-clone-1");
+    for command in ["summary","children","largest","inspect","insights","profile"] {
+        let out=f.cmd().args([command,"--scan",on["scan_id"].as_str().unwrap(),"--metric","apfs-data-clone"]).arg("--store").arg(&history).output().unwrap();
+        assert!(out.stdout.len()<=8192);let value=json(&out);assert_eq!(value["metric"],"apfs-data-clone");
+        assert_eq!(value["apfs_data_clone"]["label"],"Begrænset DATA-klonkorrigeret allokering");
+    }
+    let out=f.cmd().args(["summary","--scan",off["scan_id"].as_str().unwrap(),"--metric","apfs-data-clone"]).arg("--store").arg(&history).output().unwrap();
+    assert_eq!(out.status.code(),Some(6));assert!(String::from_utf8_lossy(&out.stderr).contains("rescan"));
+    let schema=json(&f.cmd().arg("schema").output().unwrap());assert!(schema["options"]["metric"].as_array().unwrap().iter().any(|v|v=="apfs-data-clone"));
+}

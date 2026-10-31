@@ -38,7 +38,7 @@ fn history(path: &std::path::Path) -> Reply {
         let store = Store::open(path, false).map_err(err)?;
         for id in store.ids().map_err(err)?.into_iter().rev().take(100) {
             if let Ok(m) = store.manifest(&id) {
-                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
+                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"apfs_data_clone":m["apfs_data_clone"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
             }
         }
     }
@@ -232,7 +232,8 @@ async fn list_children(
         let key=search.as_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>();
         let binding=format!("ui-search:{scan_id}:{entry}:{metric}:{key}:");
         let offset=match cursor {None=>0,Some(c)=>c.strip_prefix(&binding).ok_or("Ugyldig søgeside")?.parse::<usize>().map_err(err)?};
-        let (col,observed)=if parsed==Metric::Logical {("logical_bytes","observed_logical_bytes")}else{("accounted_allocated_bytes","observed_accounted_allocated_bytes")};
+        let (col,observed)=match parsed {Metric::Logical=>("logical_bytes","observed_logical_bytes"),Metric::ApfsDataClone=>("apfs_data_clone_bytes","observed_apfs_data_clone_bytes"),Metric::Allocated=>("accounted_allocated_bytes","observed_accounted_allocated_bytes"),Metric::Private=>return Err("private metric unavailable".into())};
+        if parsed==Metric::ApfsDataClone { store.report(&scan_id,&Query{metric:parsed,kind:macscan_engine::QueryKind::Summary,..Query::default()},&AtomicBool::new(false)).map_err(err)?; }
         let value=search.replace('\'',"''");
         let sql=format!("SELECT entry_id,name_display,kind,{col} AS bytes,CASE WHEN NOT coverage_complete THEN {observed} END AS lower_bound_bytes,coverage_complete,category,category_rule_id,category_rule_version,category_reason,category_coverage,category_evidence_source FROM entries_classified((SELECT list(entry_id) FROM (SELECT entry_id FROM entries_saved WHERE parent_id={entry} AND contains(lower(name_display),lower('{value}')) ORDER BY COALESCE({col},{observed}) DESC,entry_id LIMIT 33 OFFSET {offset}))) ORDER BY COALESCE({col},{observed}) DESC,entry_id");
         let mut answer=store.query_sql(&scan_id,None,&sql,32,0,&AtomicBool::new(false)).map_err(err)?;

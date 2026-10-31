@@ -173,6 +173,7 @@ impl Store {
         let offset = cursor_offset(q.cursor.as_deref(), &binding)?;
         let db = Db::analysis()?;
         let manifest = self.attach(&db, id, "entries")?;
+        apfs::require(&manifest,q.metric)?;
         let selected = db.query(&format!("SELECT entry_id,hex(path_key) AS key,coverage_complete,path_display,hex(path_bytes) AS raw_path,(name_bytes IS NOT NULL AND path_key IS NOT NULL AND enumeration_complete IS NOT NULL) AS context_available FROM entries_saved WHERE entry_id={}",q.entry),Some(cancel))?.row(0)?;
         if selected["entry_id"].is_null() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "entry not found"));

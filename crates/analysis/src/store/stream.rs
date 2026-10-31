@@ -245,10 +245,10 @@ impl Store {
                 cancelled(&stop)?;
                 let root_valid = summary.scan.coverage_globally_valid();
                 let start = enabled.then(Instant::now);
-                let totals = finalize(&db, &stage.path, &stop, root_valid, options.capture_clones)?;
+                let totals = finalize(&db, &stage.path, &stop, root_valid, options.capture_clones, options.capture_clones && summary.scan.context["volume_before"]["filesystem"] == "apfs")?;
                 timings.finalize = elapsed(start);
                 let scan = &summary.scan;
-                let manifest = json!({"storage_format":FORMAT,"schema_version":"2.0","engine_version":ENGINE_VERSION,
+                let mut manifest = json!({"storage_format":FORMAT,"schema_version":"2.0","engine_version":ENGINE_VERSION,
                     "scan_id":id,"status":scan.status.name(),"scope":scan.report(0)["scope"],"context":scan.measurement_context(),
                     "started_at":scan.started_at,"ended_at":scan.ended_at,"duration_ms":scan.duration_ms,
                     "entry_count":summary.entry_count,"error_count":scan.issue_count,"excluded_count":scan.excluded_count,
@@ -257,6 +257,11 @@ impl Store {
                     "totals":{"logical_bytes":totals["logical_bytes"],"allocated_bytes":totals["allocated_bytes"],"accounted_allocated_bytes":totals["accounted_allocated_bytes"],"private_bytes":null,
                       "observed_lower_bound":{"logical_bytes":totals["observed_logical_bytes"],"allocated_bytes":totals["observed_allocated_bytes"],"accounted_allocated_bytes":totals["observed_accounted_allocated_bytes"]}},
                     "issues":scan.issues.iter().take(8).map(|i|json!({"entry_id":i.entry_id.to_string(),"code":i.code,"operation":i.operation,"detail":i.detail})).collect::<Vec<_>>()});
+                if options.capture_clones {
+                    manifest["apfs_data_clone"] = super::apfs::metadata(&db, &stop, root_valid && scan.context["volume_before"]["filesystem"] == "apfs")?;
+                    manifest["totals"]["apfs_data_clone_bytes"] = totals["apfs_data_clone_bytes"].clone();
+                    manifest["totals"]["observed_lower_bound"]["apfs_data_clone_bytes"] = totals["observed_apfs_data_clone_bytes"].clone();
+                }
                 drop(db);
                 fs::remove_dir_all(stage.path.join("raw"))?;
                 fs::remove_dir_all(stage.path.join("work"))?;
@@ -326,7 +331,7 @@ fn scanner_file_budget()->io::Result<()> {
     Ok(())
 }
 
-fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool, capture_clones: bool) -> io::Result<Value> {
+fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool, capture_clones: bool, apfs: bool) -> io::Result<Value> {
     db.exec(&format!(
         "CREATE VIEW raw AS SELECT * REPLACE(enumeration_complete AND {root_valid} AS enumeration_complete) FROM read_parquet({})",
         path_literal(&stage.join("raw/*.parquet"))?
@@ -334,23 +339,30 @@ fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool, capture_
     // Only hardlinked regular files enter this disk-backed lookup table.
     db.exec_cancel("CREATE TABLE links AS SELECT device_id,inode,arg_min(entry_id,path_bytes) AS owner,count(*)::UBIGINT AS observed FROM raw WHERE kind='file' AND link_count>1 GROUP BY device_id,inode",stop)?;
     db.exec("CREATE VIEW charged AS SELECT r.*,COALESCE(l.observed,1)::UBIGINT AS observed_link_count,CASE WHEN l.owner IS NOT NULL AND l.owner<>r.entry_id THEN l.owner END AS charged_to,CASE WHEN l.owner IS NOT NULL AND l.owner<>r.entry_id THEN 0 ELSE r.own_allocated END::UBIGINT AS own_accounted FROM raw r LEFT JOIN links l ON r.kind='file' AND r.link_count>1 AND r.device_id=l.device_id AND r.inode=l.inode")?;
+    if capture_clones { super::apfs::prepare(db, stop, root_valid && apfs)?; }
+    let source = if capture_clones { "clone_charged" } else { "charged" };
+    let clone_prefix = if capture_clones { ",sum(own_apfs_data_clone_bytes) OVER w AS clone_sum" } else { "" };
+    let clone_endpoint = if capture_clones { ",p.clone_sum" } else { "" };
+    let clone_total = if capture_clones { ",sum(CASE WHEN is_end THEN clone_sum ELSE -clone_sum END)::UBIGINT AS clone_total" } else { "" };
+    let clone_sized = if capture_clones { ",CASE WHEN r.kind='directory' THEN d.clone_total ELSE r.own_apfs_data_clone_bytes END AS clone_total" } else { "" };
     // DFS IDs make each subtree a contiguous interval. Three prefix
     // sums and one coverage count replace an in-memory directory tree.
-    db.exec_cancel("CREATE TABLE prefix AS SELECT entry_id,sum(own_logical) OVER w AS logical_sum,sum(own_allocated) OVER w AS allocated_sum,sum(own_accounted) OVER w AS accounted_sum,sum(CASE WHEN enumeration_complete THEN 0 ELSE 1 END) OVER w AS unknown_sum FROM charged WINDOW w AS (ORDER BY entry_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",stop)?;
+    db.exec_cancel(&format!("CREATE TABLE prefix AS SELECT entry_id,sum(own_logical) OVER w AS logical_sum,sum(own_allocated) OVER w AS allocated_sum,sum(own_accounted) OVER w AS accounted_sum,sum(CASE WHEN enumeration_complete THEN 0 ELSE 1 END) OVER w AS unknown_sum{clone_prefix} FROM {source} WINDOW w AS (ORDER BY entry_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"),stop)?;
     // Only directories need subtree sums. Keep the large prefix
     // joins out of the wide, all-file Parquet output pipeline.
     db.exec_cancel("CREATE TABLE endpoints AS SELECT entry_id AS directory_id,subtree_end::BIGINT AS lookup_id,true AS is_end FROM raw WHERE kind='directory' UNION ALL SELECT entry_id,entry_id::BIGINT-1,false FROM raw WHERE kind='directory' AND entry_id>0",stop)?;
-    db.exec_cancel("CREATE TABLE endpoint_values AS SELECT e.directory_id,e.is_end,p.logical_sum,p.allocated_sum,p.accounted_sum,p.unknown_sum FROM endpoints e JOIN prefix p ON p.entry_id=e.lookup_id",stop)?;
-    db.exec_cancel("CREATE TABLE directory_totals AS SELECT directory_id AS entry_id,sum(CASE WHEN is_end THEN logical_sum ELSE -logical_sum END)::UBIGINT AS logical_total,sum(CASE WHEN is_end THEN allocated_sum ELSE -allocated_sum END)::UBIGINT AS allocated_total,sum(CASE WHEN is_end THEN accounted_sum ELSE -accounted_sum END)::UBIGINT AS accounted_total,sum(CASE WHEN is_end THEN unknown_sum ELSE -unknown_sum END)=0 AS complete FROM endpoint_values GROUP BY directory_id",stop)?;
-    db.exec("CREATE VIEW sized AS SELECT r.*,CASE WHEN r.kind='directory' THEN d.logical_total ELSE r.own_logical END AS logical_total,CASE WHEN r.kind='directory' THEN d.allocated_total ELSE r.own_allocated END AS allocated_total,CASE WHEN r.kind='directory' THEN d.accounted_total ELSE r.own_accounted END AS accounted_total,CASE WHEN r.kind='directory' THEN d.complete ELSE r.enumeration_complete END AS complete FROM charged r LEFT JOIN directory_totals d ON d.entry_id=r.entry_id")?;
-    let clone_fields=if capture_clones {",clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id"}else{""};
+    db.exec_cancel(&format!("CREATE TABLE endpoint_values AS SELECT e.directory_id,e.is_end,p.logical_sum,p.allocated_sum,p.accounted_sum,p.unknown_sum{clone_endpoint} FROM endpoints e JOIN prefix p ON p.entry_id=e.lookup_id"),stop)?;
+    db.exec_cancel(&format!("CREATE TABLE directory_totals AS SELECT directory_id AS entry_id,sum(CASE WHEN is_end THEN logical_sum ELSE -logical_sum END)::UBIGINT AS logical_total,sum(CASE WHEN is_end THEN allocated_sum ELSE -allocated_sum END)::UBIGINT AS allocated_total,sum(CASE WHEN is_end THEN accounted_sum ELSE -accounted_sum END)::UBIGINT AS accounted_total,sum(CASE WHEN is_end THEN unknown_sum ELSE -unknown_sum END)=0 AS complete{clone_total} FROM endpoint_values GROUP BY directory_id"),stop)?;
+    db.exec(&format!("CREATE VIEW sized AS SELECT r.*,CASE WHEN r.kind='directory' THEN d.logical_total ELSE r.own_logical END AS logical_total,CASE WHEN r.kind='directory' THEN d.allocated_total ELSE r.own_allocated END AS allocated_total,CASE WHEN r.kind='directory' THEN d.accounted_total ELSE r.own_accounted END AS accounted_total,CASE WHEN r.kind='directory' THEN d.complete ELSE r.enumeration_complete END AS complete{clone_sized} FROM {source} r LEFT JOIN directory_totals d ON d.entry_id=r.entry_id"))?;
+    let clone_fields=if capture_clones {",clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id,own_apfs_data_clone_bytes,apfs_data_clone_owner,apfs_data_clone_reason,CASE WHEN complete THEN clone_total END::UBIGINT AS apfs_data_clone_bytes,clone_total::UBIGINT AS observed_apfs_data_clone_bytes"}else{""};
     db.exec(&format!("CREATE VIEW final AS SELECT entry_id,parent_id,name_display,path_display,name_bytes,path_bytes,path_key,kind,CASE WHEN complete THEN logical_total END AS logical_bytes,CASE WHEN complete THEN allocated_total END AS allocated_bytes,CASE WHEN complete THEN accounted_total END AS accounted_allocated_bytes,own_allocated AS own_allocated_bytes,logical_total AS observed_logical_bytes,allocated_total AS observed_allocated_bytes,accounted_total AS observed_accounted_allocated_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,complete AS coverage_complete,enumeration_complete,category,NULL::UBIGINT AS private_bytes{clone_fields} FROM sized"))?;
     db.exec_cancel(&format!("COPY (SELECT * FROM final) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192,FILE_SIZE_BYTES '32MB',PER_THREAD_OUTPUT true,FILENAME_PATTERN 'part-{{i}}')",path_literal(&stage.join("entries"))?),stop)?;
     // Root state plus directory coverage transitions, including the
     // end boundary that restores the parent's enumeration status.
     db.exec("CREATE VIEW directories AS SELECT entry_id,parent_id,path_key,enumeration_complete FROM raw WHERE kind='directory'")?;
     db.exec_cancel(&format!("COPY (SELECT path_key,enumeration_complete AS complete FROM raw WHERE entry_id=0 UNION ALL SELECT e.path_key,e.enumeration_complete FROM directories e JOIN directories p ON p.entry_id=e.parent_id WHERE e.enumeration_complete<>p.enumeration_complete UNION ALL SELECT unhex(left(hex(e.path_key),length(hex(e.path_key))-2)||'01'),p.enumeration_complete FROM directories e JOIN directories p ON p.entry_id=e.parent_id WHERE e.enumeration_complete<>p.enumeration_complete ORDER BY path_key) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192)",path_literal(&stage.join("coverage.parquet"))?),stop)?;
-    let totals=db.query("SELECT logical_bytes,allocated_bytes,accounted_allocated_bytes,observed_logical_bytes,observed_allocated_bytes,observed_accounted_allocated_bytes FROM final WHERE entry_id=0",Some(stop))?.row(0)?;
+    let extra=if capture_clones {",apfs_data_clone_bytes,observed_apfs_data_clone_bytes"}else{""};
+    let totals=db.query(&format!("SELECT logical_bytes,allocated_bytes,accounted_allocated_bytes,observed_logical_bytes,observed_allocated_bytes,observed_accounted_allocated_bytes{extra} FROM final WHERE entry_id=0"),Some(stop))?.row(0)?;
     Ok(totals)
 }
 
@@ -445,12 +457,43 @@ mod large_tests {
         flush(&db,&path,&mut batch,0,false).unwrap();
         let raw=path_literal(&path.join("raw/*.parquet")).unwrap();
         let mut fields=db.query(&format!("DESCRIBE SELECT * FROM read_parquet({raw})"),None).unwrap();
-        for i in 0..fields.len(){assert!(!fields.row(i).unwrap()["column_name"].as_str().unwrap().starts_with("clone_"));}
-        let totals=finalize(&db,&path,&AtomicBool::new(false),true,false).unwrap();assert_eq!(totals["logical_bytes"],"5");
+        for i in 0..fields.len(){let row=fields.row(i).unwrap();let name=row["column_name"].as_str().unwrap();assert!(!name.contains("clone"));}
+        let totals=finalize(&db,&path,&AtomicBool::new(false),true,false,true).unwrap();assert_eq!(totals["logical_bytes"],"5");
         let final_path=path_literal(&path.join("entries/*.parquet")).unwrap();
         let mut fields=db.query(&format!("DESCRIBE SELECT * FROM read_parquet({final_path})"),None).unwrap();
-        for i in 0..fields.len(){assert!(!fields.row(i).unwrap()["column_name"].as_str().unwrap().starts_with("clone_"));}
+        for i in 0..fields.len(){let row=fields.row(i).unwrap();let name=row["column_name"].as_str().unwrap();assert!(!name.contains("clone"));}
         drop(db);drop(stage);
+    }
+
+    #[test]
+    fn persisted_clone_subtree_owner_outside_scope_partial_and_invalid_volume() {
+        for (tag,complete,valid,apfs) in [("complete",true,true,true),("partial",false,true,true),("invalid",true,false,true),("unknown-fs",true,true,false)] {
+            let path=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-clone-subtree-{}-{tag}",std::process::id()));
+            fs::create_dir(&path).unwrap();let stage=Stage{path:path.clone(),published:false};
+            for dir in ["raw","entries"] {fs::create_dir(path.join(dir)).unwrap();}
+            let db=Db::new().unwrap();db.exec(&format!("CREATE TABLE batch ({})",raw_schema(true))).unwrap();
+            for (id,parent,end,name,key,kind,alloc,inode,links) in [
+                (0,"NULL",4,"","","directory",4096,0,1),
+                (1,"0",1,"a-owner","6100","file",1048576,1,2),
+                (2,"0",4,"b-scope","6200","directory",4096,2,1),
+                (3,"2",3,"b-scope/clone","62006300","file",1114112,3,1),
+                (4,"2",4,"b-scope/link","62006c00","file",1048576,1,2)] {
+                let enumeration=if id==2 {complete}else{true};
+                db.exec(&format!("INSERT INTO batch VALUES({id},{parent},{end},'{name}','/synthetic/{name}',encode('{name}'),encode('/synthetic/{name}'),unhex('{key}'),'{kind}',1048576,{alloc},1,{inode},{links},0,{enumeration},'unclassified','observed',7,65,1048576,1)")).unwrap();
+            }
+            db.exec(&format!("COPY batch TO {} (FORMAT PARQUET)",path_literal(&path.join("raw/p.parquet")).unwrap())).unwrap();
+            let totals=finalize(&db,&path,&AtomicBool::new(false),valid,true,apfs).unwrap();
+            let scope=db.query("SELECT * FROM final WHERE entry_id=2",None).unwrap().row(0).unwrap();
+            let dedup=valid && apfs;
+            assert_eq!(scope["observed_apfs_data_clone_bytes"],if dedup {"69632"}else{"1118208"});
+            if complete && valid {assert_eq!(scope["apfs_data_clone_bytes"],scope["observed_apfs_data_clone_bytes"]);}else{assert!(scope["apfs_data_clone_bytes"].is_null());}
+            let clone=db.query("SELECT * FROM final WHERE entry_id=3",None).unwrap().row(0).unwrap();
+            assert_eq!(clone["own_apfs_data_clone_bytes"],if dedup {"65536"}else{"1114112"});
+            if dedup {assert_eq!(clone["apfs_data_clone_owner"],"1");}
+            assert_eq!(totals["observed_apfs_data_clone_bytes"],if dedup {"1122304"}else{"2170880"});
+            let m=super::super::apfs::metadata(&db,&AtomicBool::new(false),dedup).unwrap();assert_eq!(m["comparison_ready"],dedup);
+            drop(db);drop(stage);
+        }
     }
 
     #[test]
@@ -463,7 +506,7 @@ mod large_tests {
             db.exec(&format!("INSERT INTO batch VALUES ({id},{parent},{end},'{name}','/synthetic/{name}',unhex(''),unhex(''),unhex('{key}'),'{kind}',7,4096,1,{id},1,0,true,'unclassified','not_requested',NULL,NULL,NULL,NULL)")).unwrap();
         }
         db.exec(&format!("COPY batch TO {} (FORMAT PARQUET)",path_literal(&path.join("raw/part.parquet")).unwrap())).unwrap();
-        let totals=finalize(&db,&path,&AtomicBool::new(false),false,true).unwrap();assert!(totals["logical_bytes"].is_null());assert_eq!(totals["observed_logical_bytes"],"21");
+        let totals=finalize(&db,&path,&AtomicBool::new(false),false,true,true).unwrap();assert!(totals["logical_bytes"].is_null());assert_eq!(totals["observed_logical_bytes"],"21");
         let rows=db.query("SELECT coverage_complete,logical_bytes,enumeration_complete FROM final WHERE entry_id=1",None).unwrap().row(0).unwrap();assert_eq!(rows["coverage_complete"],false);assert!(rows["logical_bytes"].is_null());assert_eq!(rows["enumeration_complete"],false);
         let coverage=db.query(&format!("SELECT count(*) AS n FROM read_parquet({}) WHERE complete",path_literal(&path.join("coverage.parquet")).unwrap()),None).unwrap().row(0).unwrap();assert_eq!(coverage["n"],"0");
         drop(db);fs::remove_dir_all(path).unwrap();
@@ -516,7 +559,7 @@ mod large_tests {
         );
         db.exec(&format!("COPY ({raw}) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192,FILE_SIZE_BYTES '32MB',PER_THREAD_OUTPUT true)",path_literal(&stage.path.join("raw")).unwrap())).unwrap();
         println!("ten million raw rows ready");
-        let totals = finalize(&db, &stage.path, &AtomicBool::new(false), true, true).unwrap();
+        let totals = finalize(&db, &stage.path, &AtomicBool::new(false), true, true, true).unwrap();
         assert_eq!(totals["logical_bytes"], "9090908");
         let count = db
             .query(

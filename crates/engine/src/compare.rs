@@ -48,7 +48,7 @@ impl Row {
         match metric {
             Metric::Logical => self.logical,
             Metric::Allocated => self.allocated,
-            Metric::Private => None,
+            Metric::Private | Metric::ApfsDataClone => None,
         }
     }
 }
@@ -236,7 +236,10 @@ pub(crate) fn compare(
     if q.limit == 0 || q.limit > 500 {
         return Err(invalid("comparison limit must be 1..500"));
     }
-    if q.metric == Metric::Private {
+    if q.metric==Metric::ApfsDataClone {
+        return Err(incompatible("apfs-data-clone unavailable on the in-memory backend; use captured streaming Parquet"));
+    }
+    if q.metric==Metric::Private {
         return Err(incompatible("private metric is not validated"));
     }
     for field in ["root_bytes_hex", "policy"] {

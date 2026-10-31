@@ -178,8 +178,8 @@ pub fn capabilities() -> Value {
     json!({"schema_version": SCHEMA_VERSION, "engine_version": ENGINE_VERSION,
         "platform": "macos", "backend": "darwin_descriptor_relative",
         "implementation_stage": "engine_prototype", "read_only_targets": true,
-        "supported_metrics": ["logical", "allocated"], "private_bytes": null,
-        "clone_metadata": "not_yet_implemented", "atomic_filesystem_snapshot": false,
+        "supported_metrics": ["logical", "allocated", "apfs-data-clone"], "private_bytes": null,
+        "clone_metadata": "opt_in_streaming_parquet", "apfs_data_clone_algorithm": "apfs-data-clone-1", "apfs_data_clone_capture_version": 1, "apfs_data_clone_label": "Begrænset DATA-klonkorrigeret allokering", "apfs_data_clone_backend": "captured_streaming_parquet_only", "atomic_filesystem_snapshot": false,
         "network": false, "cleanup": false, "workers": 1,
         "warnings": ["SHARED_APFS_BLOCKS_NOT_DEDUPLICATED", "V1_ACCEPTANCE_INCOMPLETE"]})
 }

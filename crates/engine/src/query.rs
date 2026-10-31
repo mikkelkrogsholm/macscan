@@ -10,6 +10,7 @@ pub enum Metric {
     Logical,
     Allocated,
     Private,
+    ApfsDataClone,
 }
 impl Metric {
     pub fn parse(value: &str) -> io::Result<Self> {
@@ -17,6 +18,7 @@ impl Metric {
             "logical" => Ok(Self::Logical),
             "allocated" => Ok(Self::Allocated),
             "private" => Ok(Self::Private),
+            "apfs-data-clone" => Ok(Self::ApfsDataClone),
             _ => Err(invalid("unknown metric")),
         }
     }
@@ -25,6 +27,7 @@ impl Metric {
             Self::Logical => "logical",
             Self::Allocated => "allocated",
             Self::Private => "private",
+            Self::ApfsDataClone => "apfs-data-clone",
         }
     }
     pub fn value(self, e: &Entry) -> Option<u64> {
@@ -34,7 +37,7 @@ impl Metric {
         match self {
             Self::Logical => Some(e.logical),
             Self::Allocated => Some(e.accounted),
-            Self::Private => None,
+            Self::Private | Self::ApfsDataClone => None,
         }
     }
 }
@@ -94,7 +97,10 @@ impl Scan {
         if q.entry as usize >= self.entries.len() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "entry not found"));
         }
-        if q.metric == Metric::Private {
+        if q.metric==Metric::ApfsDataClone {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,"apfs-data-clone unavailable on the in-memory backend; use captured streaming Parquet"));
+        }
+        if q.metric==Metric::Private {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "private metric is not validated on this backend",
