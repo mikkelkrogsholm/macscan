@@ -27,7 +27,8 @@ pub const OUTPUT_BUDGET: usize = 8 * 1024;
 const FORMAT: &str = "parquet-1";
 // Real simulator paths exhausted the 128 MiB writer with 32k-row batches.
 const CHUNK: usize = 8_192;
-const ENTRY_SCHEMA:&str="entry_id UBIGINT,parent_id UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,logical_bytes UBIGINT,allocated_bytes UBIGINT,accounted_allocated_bytes UBIGINT,own_allocated_bytes UBIGINT,observed_logical_bytes UBIGINT,observed_allocated_bytes UBIGINT,observed_accounted_allocated_bytes UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,observed_link_count UBIGINT,charged_to UBIGINT,mtime_unix_seconds BIGINT,coverage_complete BOOLEAN,enumeration_complete BOOLEAN,category VARCHAR,private_bytes UBIGINT,clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
+const ENTRY_SCHEMA:&str="entry_id UBIGINT,parent_id UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,logical_bytes UBIGINT,allocated_bytes UBIGINT,accounted_allocated_bytes UBIGINT,own_allocated_bytes UBIGINT,observed_logical_bytes UBIGINT,observed_allocated_bytes UBIGINT,observed_accounted_allocated_bytes UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,observed_link_count UBIGINT,charged_to UBIGINT,mtime_unix_seconds BIGINT,coverage_complete BOOLEAN,enumeration_complete BOOLEAN,category VARCHAR,private_bytes UBIGINT";
+const ENTRY_CLONE_SCHEMA:&str="clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
 
 pub struct Store {
     root: PathBuf,
@@ -99,6 +100,7 @@ impl Store {
         cancel: &AtomicBool,
     ) -> io::Result<()> {
         let global_valid=scan.coverage_globally_valid();
+        let capture_clones=scan.context["clone_capture"]["requested"]==true || scan.entries.iter().any(|e|e.clone_metadata!=macscan_engine::CloneMetadata::default());
         // Serialize this store's publications so simultaneous saves cannot each
         // claim the same metadata budget. File close releases the advisory lock.
         use std::os::fd::AsRawFd;
@@ -149,7 +151,7 @@ impl Store {
         }
         for (part, entries) in scan.entries.chunks(CHUNK).enumerate() {
             cancelled(cancel)?;
-            db.exec(&format!("CREATE TABLE batch ({ENTRY_SCHEMA})"))?;
+            db.exec(&format!("CREATE TABLE batch ({ENTRY_SCHEMA}{})",if capture_clones {format!(",{ENTRY_CLONE_SCHEMA}")}else{String::new()}))?;
             let mut app = db.appender("batch")?;
             for (offset, e) in entries.iter().enumerate() {
                 if offset % 256 == 0 {
@@ -183,11 +185,13 @@ impl Store {
                 app.boolean(e.enumeration_complete && global_valid)?;
                 app.text(CATEGORIES[categories[id] as usize])?;
                 app.number(None)?;
-                app.text(e.clone_metadata.status.name())?;
-                app.number(e.clone_metadata.clone_id)?;
-                app.number(e.clone_metadata.extended_flags)?;
-                app.number(e.clone_metadata.data_allocated)?;
-                app.number(e.clone_metadata.device)?;
+                if capture_clones {
+                    app.text(e.clone_metadata.status.name())?;
+                    app.number(e.clone_metadata.clone_id)?;
+                    app.number(e.clone_metadata.extended_flags)?;
+                    app.number(e.clone_metadata.data_allocated)?;
+                    app.number(e.clone_metadata.device)?;
+                }
                 app.end()?;
             }
             app.finish()?;
@@ -299,7 +303,10 @@ impl Store {
             fallback.push_str(",NULL::BIGINT AS mtime_unix_seconds");
         }
         for (name,ty) in [("clone_status","VARCHAR"),("clone_id","UBIGINT"),("clone_extended_flags","UBIGINT"),("clone_data_allocated_bytes","UBIGINT"),("clone_device_id","UBIGINT")] {
-            if !columns.contains(name) {fallback.push_str(&format!(",NULL::{ty} AS {name}"));}
+            if !columns.contains(name) {
+                if name=="clone_status" && manifest["context"]["clone_capture"]["requested"]==false {fallback.push_str(",'not_requested'::VARCHAR AS clone_status");}
+                else {fallback.push_str(&format!(",NULL::{ty} AS {name}"));}
+            }
         }
         let replacement=if invalid {" REPLACE(NULL::UBIGINT AS logical_bytes,NULL::UBIGINT AS allocated_bytes,NULL::UBIGINT AS accounted_allocated_bytes,false AS coverage_complete,false AS enumeration_complete)"}else{""};
         db.exec(&format!(

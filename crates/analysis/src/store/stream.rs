@@ -30,7 +30,9 @@ impl StreamingProfile {
 }
 fn elapsed(start: Option<Instant>) -> Duration { start.map(|s|s.elapsed()).unwrap_or_default() }
 
-const RAW_SCHEMA: &str = "entry_id UBIGINT,parent_id UBIGINT,subtree_end UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,own_logical UBIGINT,own_allocated UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,mtime_unix_seconds BIGINT,enumeration_complete BOOLEAN,category VARCHAR,clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
+const BASE_RAW_SCHEMA: &str = "entry_id UBIGINT,parent_id UBIGINT,subtree_end UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,own_logical UBIGINT,own_allocated UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,mtime_unix_seconds BIGINT,enumeration_complete BOOLEAN,category VARCHAR";
+const CLONE_COLUMNS: &str = "clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
+fn raw_schema(capture:bool)->String {if capture {format!("{BASE_RAW_SCHEMA},{CLONE_COLUMNS}")}else{BASE_RAW_SCHEMA.into()}}
 struct Finished<'a>(&'a AtomicBool);
 impl Drop for Finished<'_> {
     fn drop(&mut self) {
@@ -215,7 +217,7 @@ impl Store {
                     batch.push(node);
                     if batch.len() >= 4096 || bytes >= batch_budget {
                         let start = enabled.then(Instant::now);
-                        flush(&db, &stage.path, &mut batch, part)?;
+                        flush(&db, &stage.path, &mut batch, part, options.capture_clones)?;
                         timings.flush_during_walk += elapsed(start);
                         timings.flush_count += 1;
                         part += 1; bytes = 0;
@@ -235,7 +237,7 @@ impl Store {
                 timings.walk_inclusive = elapsed(walk_start);
                 if !batch.is_empty() {
                     let start = enabled.then(Instant::now);
-                    flush(&db, &stage.path, &mut batch, part)?;
+                    flush(&db, &stage.path, &mut batch, part, options.capture_clones)?;
                     timings.flush_tail = elapsed(start);
                     timings.flush_count += 1;
                 }
@@ -243,7 +245,7 @@ impl Store {
                 cancelled(&stop)?;
                 let root_valid = summary.scan.coverage_globally_valid();
                 let start = enabled.then(Instant::now);
-                let totals = finalize(&db, &stage.path, &stop, root_valid)?;
+                let totals = finalize(&db, &stage.path, &stop, root_valid, options.capture_clones)?;
                 timings.finalize = elapsed(start);
                 let scan = &summary.scan;
                 let manifest = json!({"storage_format":FORMAT,"schema_version":"2.0","engine_version":ENGINE_VERSION,
@@ -324,7 +326,7 @@ fn scanner_file_budget()->io::Result<()> {
     Ok(())
 }
 
-fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool) -> io::Result<Value> {
+fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool, capture_clones: bool) -> io::Result<Value> {
     db.exec(&format!(
         "CREATE VIEW raw AS SELECT * REPLACE(enumeration_complete AND {root_valid} AS enumeration_complete) FROM read_parquet({})",
         path_literal(&stage.join("raw/*.parquet"))?
@@ -341,7 +343,8 @@ fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool) -> io::R
     db.exec_cancel("CREATE TABLE endpoint_values AS SELECT e.directory_id,e.is_end,p.logical_sum,p.allocated_sum,p.accounted_sum,p.unknown_sum FROM endpoints e JOIN prefix p ON p.entry_id=e.lookup_id",stop)?;
     db.exec_cancel("CREATE TABLE directory_totals AS SELECT directory_id AS entry_id,sum(CASE WHEN is_end THEN logical_sum ELSE -logical_sum END)::UBIGINT AS logical_total,sum(CASE WHEN is_end THEN allocated_sum ELSE -allocated_sum END)::UBIGINT AS allocated_total,sum(CASE WHEN is_end THEN accounted_sum ELSE -accounted_sum END)::UBIGINT AS accounted_total,sum(CASE WHEN is_end THEN unknown_sum ELSE -unknown_sum END)=0 AS complete FROM endpoint_values GROUP BY directory_id",stop)?;
     db.exec("CREATE VIEW sized AS SELECT r.*,CASE WHEN r.kind='directory' THEN d.logical_total ELSE r.own_logical END AS logical_total,CASE WHEN r.kind='directory' THEN d.allocated_total ELSE r.own_allocated END AS allocated_total,CASE WHEN r.kind='directory' THEN d.accounted_total ELSE r.own_accounted END AS accounted_total,CASE WHEN r.kind='directory' THEN d.complete ELSE r.enumeration_complete END AS complete FROM charged r LEFT JOIN directory_totals d ON d.entry_id=r.entry_id")?;
-    db.exec("CREATE VIEW final AS SELECT entry_id,parent_id,name_display,path_display,name_bytes,path_bytes,path_key,kind,CASE WHEN complete THEN logical_total END AS logical_bytes,CASE WHEN complete THEN allocated_total END AS allocated_bytes,CASE WHEN complete THEN accounted_total END AS accounted_allocated_bytes,own_allocated AS own_allocated_bytes,logical_total AS observed_logical_bytes,allocated_total AS observed_allocated_bytes,accounted_total AS observed_accounted_allocated_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,complete AS coverage_complete,enumeration_complete,category,NULL::UBIGINT AS private_bytes,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id FROM sized")?;
+    let clone_fields=if capture_clones {",clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id"}else{""};
+    db.exec(&format!("CREATE VIEW final AS SELECT entry_id,parent_id,name_display,path_display,name_bytes,path_bytes,path_key,kind,CASE WHEN complete THEN logical_total END AS logical_bytes,CASE WHEN complete THEN allocated_total END AS allocated_bytes,CASE WHEN complete THEN accounted_total END AS accounted_allocated_bytes,own_allocated AS own_allocated_bytes,logical_total AS observed_logical_bytes,allocated_total AS observed_allocated_bytes,accounted_total AS observed_accounted_allocated_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,complete AS coverage_complete,enumeration_complete,category,NULL::UBIGINT AS private_bytes{clone_fields} FROM sized"))?;
     db.exec_cancel(&format!("COPY (SELECT * FROM final) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192,FILE_SIZE_BYTES '32MB',PER_THREAD_OUTPUT true,FILENAME_PATTERN 'part-{{i}}')",path_literal(&stage.join("entries"))?),stop)?;
     // Root state plus directory coverage transitions, including the
     // end boundary that restores the parent's enumeration status.
@@ -351,8 +354,8 @@ fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool) -> io::R
     Ok(totals)
 }
 
-fn flush(db: &Db, stage: &Path, batch: &mut Vec<StreamEntry>, part: usize) -> io::Result<()> {
-    db.exec(&format!("CREATE TEMP TABLE batch ({RAW_SCHEMA})"))?;
+fn flush(db: &Db, stage: &Path, batch: &mut Vec<StreamEntry>, part: usize, capture_clones:bool) -> io::Result<()> {
+    db.exec(&format!("CREATE TEMP TABLE batch ({})",raw_schema(capture_clones)))?;
     let mut app = db.appender("batch")?;
     for node in batch.iter() {
         let e = &node.entry;
@@ -397,11 +400,13 @@ fn flush(db: &Db, stage: &Path, batch: &mut Vec<StreamEntry>, part: usize) -> io
         app.signed(e.mtime)?;
         app.boolean(e.enumeration_complete)?;
         app.text(CATEGORIES[own_category as usize])?;
-        app.text(e.clone_metadata.status.name())?;
-        app.number(e.clone_metadata.clone_id)?;
-        app.number(e.clone_metadata.extended_flags)?;
-        app.number(e.clone_metadata.data_allocated)?;
-        app.number(e.clone_metadata.device)?;
+        if capture_clones {
+            app.text(e.clone_metadata.status.name())?;
+            app.number(e.clone_metadata.clone_id)?;
+            app.number(e.clone_metadata.extended_flags)?;
+            app.number(e.clone_metadata.data_allocated)?;
+            app.number(e.clone_metadata.device)?;
+        }
         app.end()?;
     }
     app.finish()?;
@@ -429,16 +434,36 @@ mod large_tests {
     use super::*;
 
     #[test]
+    fn capture_off_uses_base_physical_raw_and_final_schema() {
+        let path=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-base-schema-{}",std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let stage=Stage{path:path.clone(),published:false};
+        for name in ["data","raw","entries"] {fs::create_dir(path.join(name)).unwrap();}
+        fs::write(path.join("data/file"),b"owned").unwrap();
+        let db=Db::new().unwrap();let mut batch=Vec::new();
+        macscan_engine::walk_with_progress(&path.join("data"),&ScanOptions::full(),&AtomicBool::new(false),|node|{batch.push(node);Ok(())},|_|{}).unwrap();
+        flush(&db,&path,&mut batch,0,false).unwrap();
+        let raw=path_literal(&path.join("raw/*.parquet")).unwrap();
+        let mut fields=db.query(&format!("DESCRIBE SELECT * FROM read_parquet({raw})"),None).unwrap();
+        for i in 0..fields.len(){assert!(!fields.row(i).unwrap()["column_name"].as_str().unwrap().starts_with("clone_"));}
+        let totals=finalize(&db,&path,&AtomicBool::new(false),true,false).unwrap();assert_eq!(totals["logical_bytes"],"5");
+        let final_path=path_literal(&path.join("entries/*.parquet")).unwrap();
+        let mut fields=db.query(&format!("DESCRIBE SELECT * FROM read_parquet({final_path})"),None).unwrap();
+        for i in 0..fields.len(){assert!(!fields.row(i).unwrap()["column_name"].as_str().unwrap().starts_with("clone_"));}
+        drop(db);drop(stage);
+    }
+
+    #[test]
     fn globally_invalid_finalization_cannot_restore_complete_children() {
         let path=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-invalid-finalize-{}",std::process::id()));
         fs::create_dir(&path).unwrap();fs::create_dir(path.join("raw")).unwrap();fs::create_dir(path.join("entries")).unwrap();
         let db=Db::new().unwrap();
-        db.exec(&format!("CREATE TABLE batch ({RAW_SCHEMA})")).unwrap();
+        db.exec(&format!("CREATE TABLE batch ({})",raw_schema(true))).unwrap();
         for (id,parent,end,name,key,kind) in [(0,"NULL",2,"","","directory"),(1,"0",2,"child","6368696c6400","directory"),(2,"1",2,"file","6368696c640066696c6500","file")] {
             db.exec(&format!("INSERT INTO batch VALUES ({id},{parent},{end},'{name}','/synthetic/{name}',unhex(''),unhex(''),unhex('{key}'),'{kind}',7,4096,1,{id},1,0,true,'unclassified','not_requested',NULL,NULL,NULL,NULL)")).unwrap();
         }
         db.exec(&format!("COPY batch TO {} (FORMAT PARQUET)",path_literal(&path.join("raw/part.parquet")).unwrap())).unwrap();
-        let totals=finalize(&db,&path,&AtomicBool::new(false),false).unwrap();assert!(totals["logical_bytes"].is_null());assert_eq!(totals["observed_logical_bytes"],"21");
+        let totals=finalize(&db,&path,&AtomicBool::new(false),false,true).unwrap();assert!(totals["logical_bytes"].is_null());assert_eq!(totals["observed_logical_bytes"],"21");
         let rows=db.query("SELECT coverage_complete,logical_bytes,enumeration_complete FROM final WHERE entry_id=1",None).unwrap().row(0).unwrap();assert_eq!(rows["coverage_complete"],false);assert!(rows["logical_bytes"].is_null());assert_eq!(rows["enumeration_complete"],false);
         let coverage=db.query(&format!("SELECT count(*) AS n FROM read_parquet({}) WHERE complete",path_literal(&path.join("coverage.parquet")).unwrap()),None).unwrap().row(0).unwrap();assert_eq!(coverage["n"],"0");
         drop(db);fs::remove_dir_all(path).unwrap();
@@ -491,7 +516,7 @@ mod large_tests {
         );
         db.exec(&format!("COPY ({raw}) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192,FILE_SIZE_BYTES '32MB',PER_THREAD_OUTPUT true)",path_literal(&stage.path.join("raw")).unwrap())).unwrap();
         println!("ten million raw rows ready");
-        let totals = finalize(&db, &stage.path, &AtomicBool::new(false), true).unwrap();
+        let totals = finalize(&db, &stage.path, &AtomicBool::new(false), true, true).unwrap();
         assert_eq!(totals["logical_bytes"], "9090908");
         let count = db
             .query(

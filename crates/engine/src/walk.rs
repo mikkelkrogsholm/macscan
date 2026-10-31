@@ -220,7 +220,7 @@ pub fn walk_with_progress_guarded(
                 .join(",")
         ),
         context: json!({"os_identity":crate::volume::os_identity().ok(),"volume_before":before,
-            "clone_capture":{"version":crate::CLONE_CAPTURE_VERSION,"requested":options.capture_clones,"scope":"admitted_directory_bulk_regular_files","capability_status":"not_queried","regular_file_status_counts":{}},
+            "clone_capture":{"version":crate::CLONE_CAPTURE_VERSION,"requested":options.capture_clones,"scope":"admitted_directory_bulk_regular_files","capability_status":"not_queried","counts_collected":options.capture_clones,"regular_file_status_counts":{}},
             "coverage_diagnostics":crate::coverage::empty(),"volume_after":null,"started_unix_ns":nanos.to_string(),"ended_unix_ns":null}),
     };
     let mut node = StreamEntry {
@@ -243,8 +243,8 @@ pub fn walk_with_progress_guarded(
             true,
         );
     }
-    if metadata.is_file() {
-        if options.capture_clones {node.entry.clone_metadata=crate::CloneMetadata::unavailable(crate::CloneStatus::Missing);}
+    if options.capture_clones && metadata.is_file() {
+        node.entry.clone_metadata=crate::CloneMetadata::unavailable(crate::CloneStatus::Missing);
         scan.context["clone_capture"]["regular_file_status_counts"][node.entry.clone_metadata.status.name()]=json!(1);
     }
     let mut count = 1_usize;
@@ -325,7 +325,7 @@ pub fn walk_with_progress_guarded(
         if options.capture_clones && (!metadata.is_file() || metadata.device!=scan.entries[0].device || metadata.dataless() || cloud_path(&child.path) || options.exclusions.iter().any(|p|child.path.starts_with(p))) {
             child.entry.clone_metadata=crate::CloneMetadata::unavailable(crate::CloneStatus::Missing);
         }
-        if metadata.is_file() {
+        if options.capture_clones && metadata.is_file() {
             let status=child.entry.clone_metadata.status.name();
             let old=scan.context["clone_capture"]["regular_file_status_counts"][status].as_u64().unwrap_or(0);
             scan.context["clone_capture"]["regular_file_status_counts"][status]=json!(old+1);

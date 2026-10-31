@@ -30,15 +30,9 @@ fn old_parquet_optional_clone_and_mtime_columns_do_not_disable_classification() 
     fs::write(root.join("node_modules/file.js"), b"own fixture").unwrap();
     let store = Store::open(&tree.0.join("history"), true).unwrap();
     let cancel = AtomicBool::new(false);
-    let id = store
-        .scan_to_store(
-            &root,
-            &ScanOptions::full(),
-            FULL_HISTORY_BUDGET,
-            &cancel,
-            |_| {},
-        )
-        .unwrap();
+    let measured=scan(&root,&ScanOptions::default(),&cancel).unwrap();
+    store.save_with_cancel(&measured,FULL_HISTORY_BUDGET,&cancel).unwrap();
+    let id=measured.id;
     let baseline=store.query_sql(&id,None,"SELECT category,category_coverage,coverage_complete FROM entries WHERE name_display='file.js'",10,0,&cancel).unwrap();
     assert_eq!(
         baseline["records"][0],
@@ -54,7 +48,7 @@ fn old_parquet_optional_clone_and_mtime_columns_do_not_disable_classification() 
         .path();
     let old = entries.join("old.parquet");
     let db = Db::new().unwrap();
-    db.exec(&format!("COPY (SELECT * EXCLUDE(mtime_unix_seconds,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id) FROM read_parquet({})) TO {} (FORMAT PARQUET)",path_literal(&original).unwrap(),path_literal(&old).unwrap())).unwrap();
+    db.exec(&format!("COPY (SELECT * EXCLUDE(mtime_unix_seconds) FROM read_parquet({})) TO {} (FORMAT PARQUET)",path_literal(&original).unwrap(),path_literal(&old).unwrap())).unwrap();
     drop(db);
     fs::remove_file(&original).unwrap();
     let bytes = fs::read(&old).unwrap();

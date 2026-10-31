@@ -44,8 +44,8 @@ serially; the base prefetch request and parser remain shared with normal scans.
 
 ## Persisted field contract
 
-These nullable supplemental fields survive streaming raw batches, final Parquet,
-`entries_saved`, bounded SQL and `inspect`:
+When capture is requested, these nullable supplemental fields survive streaming
+raw batches, final Parquet, `entries_saved`, bounded SQL and `inspect`:
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -68,10 +68,18 @@ these are outside the regular-file capture counter universe.
 
 Manifest `context.clone_capture` is assembled before atomic publication:
 `version`, `requested`, `scope = admitted_directory_bulk_regular_files`,
-`capability_status = not_queried`, and `regular_file_status_counts`. Counts cover
+`capability_status = not_queried`, `counts_collected`, and
+`regular_file_status_counts`. With capture requested, counts cover
 emitted regular-file rows, including unavailable root/file and discarded child
-observations; directories are not missing clone coverage. No post-publication
-manifest mutation is needed. Old Parquet files attach with NULL supplemental
+observations; directories are not missing clone coverage. With capture off,
+`counts_collected = false` and the counter object is empty (uncollected, not a
+measured zero). No per-file supplemental JSON counting runs, and both physical
+raw and final Parquet retain the base schema without clone columns. At read time,
+explicit saved `requested = false` synthesizes `clone_status = not_requested`
+and NULL raw clone fields. A historical absent capture context keeps all absent
+clone columns NULL. Legacy default Parquet saves also omit unrequested columns;
+explicitly present supplemental observations remain preserved. No post-publication
+manifest mutation is needed. Historical snapshots with absent capture context attach with NULL supplemental
 columns and no rewriting. Missing clone/mtime columns do not disable saved
 classification context. Legacy JSONL accepts old 15-element rows and new rows
 with an optional supplemental object as element 16 (default saves retain the
@@ -119,3 +127,19 @@ unavailability, legacy/Parquet roundtrip and historical optional-column attach.
 Cancellation and exhausted budgets preserve snapshots and remove unpublished
 stages. Private command logs and the sanitized native matrix are retained under
 ignored `evidence/issue-8A/`. Run A leaves #8 open for later consumer work.
+
+The A2 correction removes unrequested per-file counters and physical clone
+columns from the capture-off production path. A controlled, same-window owned
+100,000-file benchmark retained an executable built from pre-capture revision
+`31a5535`, then ran it and the corrected executable sequentially with the same
+pinned toolchain, fixture shape, warmups and three measured repeats per mode.
+All twelve measured baseline/fallback runs compared 100,089 paths with zero
+mismatches and removed their owned trees. Baseline median total was 822.052 ms
+for the reference and 630.652 ms for the correction, within the 10% acceptance
+bound. The existing watcher join strongly quantized wall time (median 196.181 ms
+versus 8.878 ms); these totals do not establish a speedup. Median walk plus all
+flush work was 433.393 ms versus 429.981 ms (ratio 0.992), supporting near-original
+default-path cost without hiding work behind the watcher. These are warm,
+three-repeat synthetic observations, not a cold-cache or whole-device claim.
+The watcher and aggregation algorithms were unchanged. Reports and executable
+hashes are retained in ignored `evidence/issue-8A2/`.

@@ -84,6 +84,10 @@ fn capture_is_opt_in_and_primary_policy_and_publication_are_unchanged() {
     assert_eq!(context["version"], 1);
     assert_eq!(context["requested"], true);
     assert_eq!(context["capability_status"], "not_queried");
+    let off_context=store.manifest(&off).unwrap()["context"]["clone_capture"].clone();
+    assert_eq!(off_context["counts_collected"],false);
+    assert_eq!(off_context["regular_file_status_counts"],json!({}));
+    assert_eq!(context["counts_collected"],true);
     for row in rows(
         &store,
         &off,
