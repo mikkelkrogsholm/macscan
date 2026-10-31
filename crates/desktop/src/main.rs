@@ -1,4 +1,4 @@
-use macscan_analysis::{Store, FULL_HISTORY_BUDGET};
+use macscan_analysis::{InsightsQuery, Store, FULL_HISTORY_BUDGET};
 use macscan_engine::{
     CompareQuery, Metric, Query, QueryKind, ScanOptions,
 };
@@ -128,6 +128,30 @@ async fn view_scan(
         Ok(view)
     })
     .await
+}
+#[tauri::command]
+async fn insights(
+    scan_id: String,
+    entry: u32,
+    metric: String,
+    category: Option<String>,
+    cursor: Option<String>,
+    state: State<'_, Desktop>,
+) -> Reply {
+    let path = store_path(&state)?;
+    blocking(move || {
+        Store::open(&path, false).map_err(err)?.insights(
+            &scan_id,
+            &InsightsQuery {
+                entry,
+                metric: Metric::parse(&metric).map_err(err)?,
+                category,
+                cursor,
+                ..InsightsQuery::default()
+            },
+            &AtomicBool::new(false),
+        ).map_err(err)
+    }).await
 }
 #[tauri::command]
 async fn list_children(
@@ -383,6 +407,7 @@ fn main() {
             restore_history,
             view_scan,
             list_children,
+            insights,
             compare_scans,
             start_scan,
             start_machine,

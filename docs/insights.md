@@ -3,7 +3,27 @@
 `Store::insights(scan_id, &InsightsQuery, &AtomicBool)` is the shared analysis API.
 It reads only immutable saved metadata. It does not scan live paths, read file
 contents, execute guidance, delete, download, change permissions or schedule work.
-The native app can consume this API in issue #3 run B; this run adds no app UI.
+The native app consumes this API through a thin asynchronous Tauri command.
+
+## Native app
+
+Open a saved measurement and select **Indsigter** beside Indhold and Ændringer.
+Choose **Hele målingen** or **Aktuel mappe / projekt**; graph and breadcrumb
+navigation supplies the saved directory scope. The selected scope, saved end
+time, metric, coverage and all-file totals remain visible. Category buttons
+open contributing paths; **Alle kategorier** returns to rollups. **Næste side**
+replaces the current page, using the actual opaque cursor and keeping the DOM
+bounded to the returned page (default ten records, sometimes fewer). Metric,
+category and scope changes discard cursors; obsolete responses are ignored.
+
+A contributing path opens the existing file analysis at `drilldown_entry_id`,
+where explicit Finder and copy actions remain available. Contributions exclude
+separately classified nested areas, so raw directory totals can differ. Evidence
+paths may be ancestors of the chosen scope; drilldown stays within that scope.
+All UI explanations and API finding guidance are Danish. No guidance executes.
+Unknown legacy context has an explicit status. The whole-Mac overview disables
+Indsigter and directs the user to choose a scanned volume; OS totals are never
+combined into category rollups.
 
 ```sh
 macscan insights --scan ID --metric allocated
