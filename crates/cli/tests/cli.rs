@@ -358,3 +358,23 @@ fn relative_provider_root_is_excluded_before_directory_enumeration() {
     assert_eq!(result["coverage"]["entries_seen"], 1);
     assert!(result["totals"]["logical_bytes"].is_null());
 }
+
+#[test]
+fn contextual_classification_reaches_schema_navigation_and_sql() {
+    let f=Fixture::new();let root=f.0.join("root");fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("Cargo.toml"),b"synthetic, not parsed").unwrap();fs::write(root.join("target/object"),b"x").unwrap();
+    let store=f.0.join("history");let store_arg=store.to_str().unwrap();
+    let scanned=json(&f.cmd().arg("scan").arg(&root).args(["--save","--store",store_arg]).output().unwrap());
+    let id=scanned["scan_id"].as_str().unwrap();
+    let answer=json(&f.cmd().args(["children","--scan",id,"--store",store_arg]).output().unwrap());
+    let target=answer["records"].as_array().unwrap().iter().find(|r|r["name_display"]=="target").unwrap();
+    assert_eq!(target["category_rule_id"],"rust_target");assert_eq!(target["category_rule_version"],"context-1");
+    let entry=target["entry_id"].as_str().unwrap();
+    let inspect=json(&f.cmd().args(["inspect","--scan",id,"--entry",entry,"--store",store_arg]).output().unwrap());
+    let sql=format!("SELECT category,category_rule_id,category_rule_version,category_reason,category_coverage,category_evidence_source FROM entries_classified([{entry}])");
+    let query=json(&f.cmd().args(["query","--scan",id,"--store",store_arg,"--sql",&sql]).output().unwrap());
+    for field in ["category","category_rule_id","category_rule_version","category_reason","category_coverage","category_evidence_source"] {
+        assert_eq!(target[field],inspect["records"][0][field]);assert_eq!(target[field],query["records"][0][field]);
+    }
+    let schema=json(&f.cmd().arg("schema").output().unwrap());assert_eq!(schema["category_contract"]["version"],"context-1");
+}

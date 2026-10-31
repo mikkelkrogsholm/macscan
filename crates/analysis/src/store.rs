@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+mod categories;
 pub const FULL_HISTORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 
 pub const DEFAULT_LIMIT: usize = 10;
@@ -256,15 +257,29 @@ impl Store {
         let location = self.location(id)?;
         let entries = location.join("entries/*.parquet");
         let coverage = location.join("coverage.parquet");
+        let source = path_literal(&entries)?;
+        let mut schema = db.query(&format!("DESCRIBE SELECT * FROM read_parquet({source})"), None)?;
+        let mut columns = std::collections::HashSet::new();
+        for i in 0..schema.len() {
+            columns.insert(schema.row(i)?["column_name"].as_str().unwrap_or("").to_owned());
+        }
+        let mut fallback = String::new();
+        let mut context_available = true;
+        for (name, ty) in [("name_bytes", "BLOB"), ("path_key", "BLOB"), ("enumeration_complete", "BOOLEAN")] {
+            if !columns.contains(name) {
+                fallback.push_str(&format!(",NULL::{ty} AS {name}"));
+                context_available = false;
+            }
+        }
         db.exec(&format!(
-            "CREATE VIEW {table} AS SELECT *,{} AS scan_id FROM read_parquet({})",
-            literal(id),
-            path_literal(&entries)?
+            "CREATE VIEW {table}_saved AS SELECT *{fallback},{} AS scan_id FROM read_parquet({source})",
+            literal(id)
         ))?;
         db.exec(&format!(
             "CREATE VIEW {table}_coverage AS SELECT * FROM read_parquet({})",
             path_literal(&coverage)?
         ))?;
+        categories::attach(db, table, context_available)?;
         Ok(manifest)
     }
     fn restrict(&self, db: &Db) -> io::Result<()> {
@@ -339,7 +354,7 @@ impl Store {
         let offset = cursor_offset(q.cursor.as_deref(), &binding)?;
         let metric = metric_column(q.metric);
         let observed = observed_column(q.metric);
-        let selected=db.query(&format!("SELECT entry_id,logical_bytes,allocated_bytes,accounted_allocated_bytes,observed_logical_bytes,observed_accounted_allocated_bytes,coverage_complete,hex(path_key) AS key FROM entries WHERE entry_id={}",q.entry),None)?.row(0)?;
+        let selected=db.query(&format!("SELECT entry_id,logical_bytes,allocated_bytes,accounted_allocated_bytes,observed_logical_bytes,observed_accounted_allocated_bytes,coverage_complete,hex(path_key) AS key FROM entries_saved WHERE entry_id={}",q.entry),None)?.row(0)?;
         if selected["entry_id"].is_null() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "entry not found"));
         }
@@ -357,7 +372,7 @@ impl Store {
             return fit(answer);
         }
         let sql = if q.kind == QueryKind::Inspect {
-            format!("SELECT entry_id,parent_id,name_display,path_display,hex(path_bytes) AS path_bytes_hex,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,private_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,coverage_complete,enumeration_complete,category FROM entries WHERE entry_id={}",q.entry)
+            format!("SELECT entry_id,parent_id,name_display,path_display,hex(path_bytes) AS path_bytes_hex,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,private_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,coverage_complete,enumeration_complete,{} FROM entries_classified([{}])",categories::FIELDS,q.entry)
         } else {
             let mut filter = if q.kind == QueryKind::Children {
                 format!("parent_id={}", q.entry)
@@ -396,7 +411,7 @@ impl Store {
             } else {
                 ""
             };
-            format!("SELECT entry_id,name_display,kind,{metric} AS bytes,CASE WHEN NOT coverage_complete THEN {observed} END AS lower_bound_bytes,coverage_complete,category,mtime_unix_seconds{path} FROM entries WHERE {filter} ORDER BY COALESCE({metric},{observed}) DESC,entry_id")
+            format!("SELECT entry_id,name_display,kind,{metric} AS bytes,CASE WHEN NOT coverage_complete THEN {observed} END AS lower_bound_bytes,coverage_complete,{},mtime_unix_seconds{path} FROM entries_classified((SELECT list(entry_id) FROM (SELECT entry_id FROM entries_saved WHERE {filter} ORDER BY COALESCE({metric},{observed}) DESC,entry_id LIMIT {} OFFSET {offset}))) ORDER BY COALESCE({metric},{observed}) DESC,entry_id",categories::FIELDS, q.limit.saturating_add(1))
         };
         run_query(
             &db,
@@ -406,10 +421,14 @@ impl Store {
             } else {
                 q.limit
             },
-            offset,
+            0,
             cancel,
             &mut answer,
         )?;
+        answer["offset"] = json!(offset);
+        if let Some(next) = answer["next_offset"].as_u64() {
+            answer["next_offset"] = json!(offset.saturating_add(next as usize));
+        }
         if let Some(next) = answer["next_offset"].as_u64() {
             answer["next_cursor"] = json!(format!("{binding}:{next}"));
         }
@@ -431,10 +450,10 @@ impl Store {
         self.restrict(&db)?;
         let column = metric_column(metric);
         let observed = observed_column(metric);
-        let fields = format!("entry_id,parent_id,name_display,path_display,kind,{column} AS bytes,{observed} AS observed_bytes,logical_bytes,allocated_bytes,accounted_allocated_bytes,coverage_complete,link_count,category");
+        let fields = format!("entry_id,parent_id,name_display,path_display,kind,{column} AS bytes,{observed} AS observed_bytes,logical_bytes,allocated_bytes,accounted_allocated_bytes,coverage_complete,link_count,{}",categories::FIELDS);
         let selected = db
             .query(
-                &format!("SELECT {fields} FROM entries WHERE entry_id={entry}"),
+                &format!("SELECT {fields} FROM entries_classified([{entry}])"),
                 Some(cancel),
             )?
             .row(0)?;
@@ -447,13 +466,13 @@ impl Store {
         while let Some(parent)=ancestors.last().unwrap()["parent_id"].as_str() {
             let parent=parent.parse::<u32>().map_err(|_|invalid("invalid parent ID"))?;
             if !seen.insert(parent){return Err(invalid("cyclic parent trail"));}
-            let row=db.query(&format!("SELECT {trail_fields} FROM entries WHERE entry_id={parent}"),Some(cancel))?.row(0)?;
+            let row=db.query(&format!("SELECT {trail_fields} FROM entries_saved WHERE entry_id={parent}"),Some(cancel))?.row(0)?;
             ancestors.push(row);
         }
         ancestors.reverse();
         let count = db
             .query(
-                &format!("SELECT count(*) AS count FROM entries WHERE parent_id={entry}"),
+                &format!("SELECT count(*) AS count FROM entries_saved WHERE parent_id={entry}"),
                 Some(cancel),
             )?
             .row(0)?;
@@ -464,7 +483,7 @@ impl Store {
                 break;
             }
             let remaining = 320 - nodes.len();
-            let mut rows = db.query(&format!("SELECT {fields} FROM (SELECT *,row_number() OVER (PARTITION BY parent_id ORDER BY COALESCE({column},{observed}) DESC,entry_id) AS rank FROM entries WHERE parent_id IN ({})) WHERE rank<=12 ORDER BY rank,parent_id,entry_id LIMIT {remaining}", parents.join(",")),Some(cancel))?;
+            let mut rows = db.query(&format!("WITH selected_ids AS MATERIALIZED (SELECT entry_id,rank FROM (SELECT entry_id,parent_id,row_number() OVER (PARTITION BY parent_id ORDER BY COALESCE({column},{observed}) DESC,entry_id) AS rank FROM entries_saved WHERE parent_id IN ({})) WHERE rank<=12 ORDER BY rank,parent_id,entry_id LIMIT {remaining}) SELECT {fields} FROM entries_classified((SELECT list(entry_id) FROM selected_ids)) JOIN selected_ids USING(entry_id) ORDER BY rank,parent_id,entry_id", parents.join(",")),Some(cancel))?;
             parents.clear();
             for i in 0..rows.len() {
                 let mut row = rows.row(i)?;
@@ -484,7 +503,7 @@ impl Store {
         if !issue_ids.is_empty() {
             let mut paths = db.query(
                 &format!(
-                    "SELECT entry_id,path_display FROM entries WHERE entry_id IN ({})",
+                    "SELECT entry_id,path_display FROM entries_saved WHERE entry_id IN ({})",
                     issue_ids.join(",")
                 ),
                 Some(cancel),
@@ -632,7 +651,7 @@ fn envelope(m: &Value, command: &str, metric: Metric) -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"query_engine":"DuckDB v2.0.0","scan_id":m["scan_id"],"command":command,"status":m["status"],"metric":metric.name(),
         "scope":{"root":m["scope"]["root_display"]},"started_at":m["started_at"],"coverage":{"complete":m["status"]=="complete","entries_seen":m["entry_count"],"error_count":m["error_count"],"excluded_count":m["excluded_count"]},
         "totals":m["totals"],"records":[],"truncated":false,"next_cursor":null,
-        "warnings":["allocated_is_hardlink_accounted_not_unique_APFS_or_reclaimable","null_means_unknown; lower_bounds_are_not_complete_totals","categories_are_name_based_hints_not_deletion_approval"]})
+        "warnings":["allocated_is_hardlink_accounted_not_unique_APFS_or_reclaimable","null_means_unknown; lower_bounds_are_not_complete_totals","categories_are_contextual_metadata_hints_not_deletion_approval"]})
 }
 fn compact_totals(v: &Value) -> Value {
     json!({"logical_bytes":v["logical_bytes"],"allocated_bytes":v["allocated_bytes"],"accounted_allocated_bytes":v["accounted_allocated_bytes"],"private_bytes":null,"observed_lower_bound":v["observed_lower_bound"]})
@@ -697,7 +716,7 @@ fn changes_view(before_complete: bool, after_complete: bool) -> String {
       SELECT COALESCE(b.path_key,a.path_key) AS path_key,b.entry_id AS before_entry_id,a.entry_id AS after_entry_id,
       COALESCE(a.path_display,b.path_display) AS path_display,COALESCE(a.kind,b.kind) AS kind,b.kind AS kind_before,a.kind AS kind_after,
       b.logical_bytes AS lb,a.logical_bytes AS la,b.accounted_allocated_bytes AS ab,a.accounted_allocated_bytes AS aa
-      FROM before_entries b FULL OUTER JOIN entries a ON b.path_key=a.path_key
+      FROM before_entries_saved b FULL OUTER JOIN entries_saved a ON b.path_key=a.path_key
     ), relevant AS (
       SELECT * FROM pairs WHERE before_entry_id IS NULL OR after_entry_id IS NULL
       OR lb IS NULL OR la IS NULL OR ab IS NULL OR aa IS NULL

@@ -286,6 +286,7 @@ fn sparse_hardlinks_and_inherited_categories_remain_exact() {
     let f = Fixture::new();
     let workspace = Fixture::new();
     let store = Store::open(&workspace.0.join("store"), true).unwrap();
+    fs::write(f.0.join("Cargo.toml"), b"synthetic").unwrap();
     fs::create_dir(f.0.join("target")).unwrap();
     fs::write(f.0.join("target/z"), vec![1_u8; 16384]).unwrap();
     fs::hard_link(f.0.join("target/z"), f.0.join("target/a")).unwrap();
@@ -297,7 +298,7 @@ fn sparse_hardlinks_and_inherited_categories_remain_exact() {
     store
         .save_with_cancel(&data, STORE_BUDGET, &AtomicBool::new(false))
         .unwrap();
-    let answer=store.query_sql(&data.id,None,"SELECT name_display,logical_bytes,allocated_bytes,accounted_allocated_bytes,category FROM entries WHERE kind='file' ORDER BY name_display",10,0,&AtomicBool::new(false)).unwrap();
+    let answer=store.query_sql(&data.id,None,"SELECT name_display,logical_bytes,allocated_bytes,accounted_allocated_bytes,category FROM entries WHERE kind='file' AND name_display<>'Cargo.toml' ORDER BY name_display",10,0,&AtomicBool::new(false)).unwrap();
     let rows = answer["records"].as_array().unwrap();
     let a = &rows[0];
     let sparse = &rows[1];
@@ -328,4 +329,72 @@ fn sparse_hardlinks_and_inherited_categories_remain_exact() {
         huge["records"][0]["exact"],
         "170141183460469231731687303715884105727"
     );
+}
+
+#[test]
+fn contextual_rules_use_only_saved_raw_metadata_and_share_projections() {
+    use std::os::unix::fs::symlink;
+    let f=Fixture::new();let workspace=Fixture::new();
+    for p in ["rust/target", "unmarked/target", "linked/target", "wrong-kind/target", "node/node_modules/pkg", "build/project/target", "cache/.cache/project/plain"] {
+        fs::create_dir_all(f.0.join(p)).unwrap();
+    }
+    for p in ["rust/Cargo.toml","node/package.json","node/node_modules/pkg/package.json","build/project/Cargo.toml","cache/.cache/project/package.json"] {fs::write(f.0.join(p),b"not parsed").unwrap();}
+    symlink("missing",f.0.join("linked/Cargo.toml")).unwrap();
+    fs::create_dir(f.0.join("wrong-kind/Cargo.toml")).unwrap();
+    fs::write(f.0.join("unmarked/Cargo.toml-invalid"),b"x").unwrap();
+    for p in ["rust/target/object","unmarked/target/object","linked/target/object","node/node_modules/pkg/index.js","build/project/target/object","cache/.cache/project/plain/file"] {fs::write(f.0.join(p),b"x").unwrap();}
+    let mut data=f.scan();
+    // macOS rejects invalid UTF-8 filenames; inject the saved raw metadata fixture.
+    data.entries.iter_mut().find(|e|e.name==b"Cargo.toml-invalid").unwrap().name=b"Cargo.toml\xff".to_vec();
+    let partial=data.entries.iter().position(|e|e.name==b"linked").unwrap();
+    data.entries[partial].complete=false;data.entries[partial].enumeration_complete=false;
+    let store=Store::open(&workspace.0.join("store"),true).unwrap();
+    store.save_with_cancel(&data,STORE_BUDGET,&AtomicBool::new(false)).unwrap();
+    let snapshot=store.path().join(&data.id).join("entries/part-00000.parquet");let original=fs::read(&snapshot).unwrap();
+    // Live changes cannot prove markers or remove saved evidence.
+    fs::remove_file(f.0.join("rust/Cargo.toml")).unwrap();fs::write(f.0.join("unmarked/Cargo.toml"),b"live only").unwrap();
+    let lookup=|suffix:&str| {
+        let sql=format!("SELECT entry_id,category,category_rule_id,category_rule_version,category_reason,category_coverage,category_evidence_source,saved_category FROM entries WHERE ends_with(path_display,'/{suffix}')");
+        store.query_sql(&data.id,None,&sql,10,0,&AtomicBool::new(false)).unwrap()["records"][0].clone()
+    };
+    assert_eq!(lookup("rust/target/object")["category_rule_id"],"rust_target");
+    assert_eq!(lookup("unmarked/target/object")["category"],"unclassified");
+    assert_eq!(lookup("linked/target")["category_coverage"],"partial");
+    assert_eq!(lookup("linked/target")["category_rule_id"],"unverified_name");
+    assert_eq!(lookup("wrong-kind/target")["category"],"unclassified");
+    assert_eq!(lookup("node/node_modules/pkg/index.js")["category_rule_id"],"node_dependencies");
+    assert_eq!(lookup("build/project/target/object")["category_rule_id"],"rust_target");
+    assert_eq!(lookup("cache/.cache/project/plain/file")["category"],"unclassified");
+    let row=lookup("rust/target");let id=row["entry_id"].as_str().unwrap().parse().unwrap();
+    let report=store.report(&data.id,&Query{kind:QueryKind::Inspect,entry:id,..Query::default()},&AtomicBool::new(false)).unwrap();
+    let view=store.sunburst(&data.id,id,Metric::Logical,&AtomicBool::new(false)).unwrap();
+    for field in ["category","category_rule_id","category_rule_version","category_reason","category_coverage","category_evidence_source"] {
+        assert_eq!(row[field],report["records"][0][field]);assert_eq!(row[field],view["selected"][field]);
+    }
+    let root=store.report(&data.id,&Query{kind:QueryKind::Inspect,..Query::default()},&AtomicBool::new(false)).unwrap();
+    assert_eq!(root["records"][0]["category_coverage"],"context_unavailable");
+    assert_eq!(fs::read(snapshot).unwrap(),original);
+}
+
+#[test]
+fn contextual_navigation_stays_bounded_on_broad_deep_metadata() {
+    let f=Fixture::new();let workspace=Fixture::new();
+    for n in 0..80 {
+        let root=f.0.join(format!("project-{n}"));fs::create_dir_all(root.join("target/a/b/c/d/e")).unwrap();
+        fs::write(root.join("Cargo.toml"),b"synthetic").unwrap();
+        for i in 0..40 {fs::write(root.join(format!("target/a/b/c/d/e/file-{i}")),b"x").unwrap();}
+    }
+    let store=Store::open(&workspace.0.join("store"),true).unwrap();let data=f.scan();
+    store.save_with_cancel(&data,STORE_BUDGET,&AtomicBool::new(false)).unwrap();
+    let result=store.query_sql(&data.id,None,"SELECT category,count(*) AS n FROM entries WHERE kind='file' GROUP BY category ORDER BY category",10,0,&AtomicBool::new(false)).unwrap();
+    assert_eq!(result["records"][0]["category"],"build_output");assert_eq!(result["records"][0]["n"],"3200");
+    let view=store.sunburst(&data.id,0,Metric::Logical,&AtomicBool::new(false)).unwrap();
+    assert!(view["nodes"].as_array().unwrap().len()<=320);
+    let mut query=Query::default();let mut seen=std::collections::HashSet::new();
+    loop {
+        let page=store.report(&data.id,&query,&AtomicBool::new(false)).unwrap();assert!(serde_json::to_vec(&page).unwrap().len()<=OUTPUT_BUDGET);
+        for row in page["records"].as_array().unwrap(){assert!(seen.insert(row["entry_id"].as_str().unwrap().to_owned()));}
+        let Some(cursor)=page["next_cursor"].as_str() else {break};query.cursor=Some(cursor.to_owned());
+    }
+    assert_eq!(seen.len(),80);
 }

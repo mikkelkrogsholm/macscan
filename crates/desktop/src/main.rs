@@ -153,8 +153,10 @@ async fn list_children(
         let offset=match cursor {None=>0,Some(c)=>c.strip_prefix(&binding).ok_or("Ugyldig søgeside")?.parse::<usize>().map_err(err)?};
         let (col,observed)=if parsed==Metric::Logical {("logical_bytes","observed_logical_bytes")}else{("accounted_allocated_bytes","observed_accounted_allocated_bytes")};
         let value=search.replace('\'',"''");
-        let sql=format!("SELECT entry_id,name_display,kind,{col} AS bytes,CASE WHEN NOT coverage_complete THEN {observed} END AS lower_bound_bytes,coverage_complete,category FROM entries WHERE parent_id={entry} AND contains(lower(name_display),lower('{value}')) ORDER BY COALESCE({col},{observed}) DESC,entry_id");
-        let mut answer=store.query_sql(&scan_id,None,&sql,32,offset,&AtomicBool::new(false)).map_err(err)?;
+        let sql=format!("SELECT entry_id,name_display,kind,{col} AS bytes,CASE WHEN NOT coverage_complete THEN {observed} END AS lower_bound_bytes,coverage_complete,category,category_rule_id,category_rule_version,category_reason,category_coverage,category_evidence_source FROM entries_classified((SELECT list(entry_id) FROM (SELECT entry_id FROM entries_saved WHERE parent_id={entry} AND contains(lower(name_display),lower('{value}')) ORDER BY COALESCE({col},{observed}) DESC,entry_id LIMIT 33 OFFSET {offset}))) ORDER BY COALESCE({col},{observed}) DESC,entry_id");
+        let mut answer=store.query_sql(&scan_id,None,&sql,32,0,&AtomicBool::new(false)).map_err(err)?;
+        answer["offset"]=json!(offset);
+        if let Some(next)=answer["next_offset"].as_u64(){answer["next_offset"]=json!(offset.saturating_add(next as usize));}
         answer["next_cursor"]=answer["next_offset"].as_u64().map(|n|json!(format!("{binding}{n}"))).unwrap_or(Value::Null);
         Ok(answer)
     }).await

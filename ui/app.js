@@ -1,3 +1,4 @@
+import {categoryPresentation} from './categories.mjs';
 import {arcPath,sectors,weight,formatBytes,fraction} from './sunburst.mjs';
 import {createEntryMenu} from './context-menu.mjs';
 import {machineView,phaseLabel} from './machine.mjs';
@@ -34,7 +35,7 @@ $('#app').innerHTML=`
    <div class="list-head"><span id="list-label">Navn</span><span id="size-heading">Størrelse ↓</span></div><div id="rows" class="rows" tabindex="-1" role="list" aria-label="Filer og mapper"></div><button id="more" class="more hidden">Vis flere poster</button><div id="list-message" class="list-message">Her kommer din mappeoversigt.</div>
   </div>
  </section>
- <section id="inspector" class="inspector"><div class="inspector-symbol">${''}</div><div class="inspector-main"><strong id="inspect-name">Ingen måling valgt</strong><div id="inspect-path">Vælg en mappe eller en eksisterende måling i venstre side.</div></div><div class="inspector-numbers"><span id="inspect-logical"></span><span id="inspect-allocated"></span></div><div class="inspector-actions"><button id="copy" class="plain" disabled>Kopiér sti</button><button id="reveal" class="plain" disabled>Vis i Finder ↗</button></div></section>
+ <section id="inspector" class="inspector"><div class="inspector-symbol">${''}</div><div class="inspector-main"><strong id="inspect-name">Ingen måling valgt</strong><div id="inspect-category"></div><div id="inspect-path">Vælg en mappe eller en eksisterende måling i venstre side.</div></div><div class="inspector-numbers"><span id="inspect-logical"></span><span id="inspect-allocated"></span></div><div class="inspector-actions"><button id="copy" class="plain" disabled>Kopiér sti</button><button id="reveal" class="plain" disabled>Vis i Finder ↗</button></div></section>
  <footer><span id="provenance">Rust · Parquet · DuckDB</span><span id="measure-note">Allokeret er ikke nødvendigvis frigørbar APFS-plads.</span></footer>
 </main><div id="toast" class="toast hidden" role="status"></div><dialog id="coverage-dialog" aria-labelledby="coverage-title"><h2 id="coverage-title">Områder, der ikke kunne måles</h2><p>Macscan kan have andre macOS-rettigheder end Codex. Vælg en mindre mappe, eller giv selv appen den nødvendige adgang i macOS.</p><p id="coverage-count"></p><ul id="coverage-issues"></ul><form method="dialog"><button class="primary">Luk</button></form></dialog>`;
 $('.inspector-symbol').append(icon('folder'));
@@ -136,6 +137,7 @@ function renderRows(){
  for(const r of state.rows){const id=changed?r.after_entry_id:r.entry_id,b=el('button','file-row');b.dataset.entry=id??'';
   const swatch=el('span','file-symbol');swatch.style.color=changed?(BigInt(r.delta_bytes??0)>0n?'#f2a382':'#65d5bb'):colorFor(r);swatch.append(icon(r.kind==='directory'?'folder':'file'));
   const content=el('span','file-label'),name=changed?r.path_display.split('/').filter(Boolean).at(-1):r.name_display;content.append(el('span','file-name',name));
+  if(!state.overview&&!changed){const c=categoryPresentation(r),hint=el('span','file-subtitle',c.label+' · '+c.coverage);hint.title=c.reason+' '+c.detail;content.append(hint);}
   if(state.overview)content.append(el('span','file-subtitle',r.kind==='capacity'?'Ikke klassificeret som junk':phaseLabel(r)));
   if(changed){content.append(el('span','file-subtitle',r.delta_bytes===null?'Ukendt dækning':formatBytes(r.before_bytes)+' → '+formatBytes(r.after_bytes)));if(id===null)b.disabled=true;}
   const value=changed?r.delta_bytes:r.bytes??r.lower_bound_bytes;const bytes=el('span','file-bytes',(changed&&value!==null&&BigInt(value)>0n?'+':'')+formatBytes(value));
@@ -153,6 +155,7 @@ function renderRows(){
 function renderInspector(){
  const n=state.selected;if(!n)return;$('#inspect-name').textContent=n.name_display||rootName(n.path_display);$('#inspect-path').textContent=n.path_display||'';$('#inspect-path').title=n.path_display||'';
  $('#inspect-logical').textContent='Logisk '+formatBytes(n.logical_bytes);$('#inspect-allocated').textContent='Allokeret '+formatBytes(n.accounted_allocated_bytes??n.bytes);
+ const c=categoryPresentation(n);$('#inspect-category').textContent=state.overview?'':`${c.label} · ${c.reason} ${c.coverage}`;$('#inspect-category').title=c.detail;
  if(state.overview){$('#inspect-logical').textContent='APFS-kapacitet '+formatBytes(state.machine.capacity_bytes);$('#inspect-allocated').textContent='Ledigt '+formatBytes(state.machine.free_bytes);}
  $('#copy').disabled=state.overview;$('#reveal').disabled=state.overview;
 }

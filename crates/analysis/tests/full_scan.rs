@@ -41,6 +41,7 @@ fn streaming_totals_hardlinks_raw_names_and_categories_match_reference() {
     use std::os::unix::fs::symlink;
     let root = Fixture::new();
     let workspace = Fixture::new();
+    fs::write(root.0.join("package.json"), b"synthetic").unwrap();
     fs::create_dir(root.0.join("node_modules")).unwrap();
     fs::write(root.0.join("node_modules/z"), b"12345").unwrap();
     fs::hard_link(root.0.join("node_modules/z"), root.0.join("a")).unwrap();
