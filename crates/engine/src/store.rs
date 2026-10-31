@@ -104,7 +104,7 @@ impl Store {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "save cancelled"));
             }
-            let row = json!([
+            let mut row = json!([
                 e.parent.map(|p| p.to_string()),
                 hex(&e.name),
                 e.kind.name(),
@@ -121,6 +121,9 @@ impl Store {
                 e.complete && scan.coverage_globally_valid(),
                 e.enumeration_complete && scan.coverage_globally_valid()
             ]);
+            if e.clone_metadata != crate::CloneMetadata::default() {
+                row.as_array_mut().unwrap().push(e.clone_metadata.json());
+            }
             entries_digest.update(write_record(&mut buffered, &row, &mut consumed, remaining)?);
             entries_digest.update(b"\n");
         }
@@ -253,7 +256,7 @@ impl Store {
         while let Some(row) = read_record(&mut input)? {
             let array = row
                 .as_array()
-                .filter(|a| a.len() == 15)
+                .filter(|a| a.len() == 15 || a.len() == 16)
                 .ok_or_else(|| invalid("invalid entry row"))?;
             if entries.len() >= expected {
                 return Err(invalid("unexpected extra entry"));
@@ -299,6 +302,7 @@ impl Store {
                 _ => return Err(invalid("invalid entry kind")),
             };
             entries.push(Entry {
+                clone_metadata: array.get(15).map(crate::CloneMetadata::from_json).transpose()?.unwrap_or_default(),
                 parent,
                 name,
                 kind,

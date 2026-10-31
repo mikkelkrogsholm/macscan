@@ -29,6 +29,7 @@ impl Drop for Temp {
 }
 fn entry(parent: Option<u32>, name: &[u8], directory: bool) -> Entry {
     Entry {
+        clone_metadata: macscan_engine::CloneMetadata::default(),
         parent,
         name: name.to_vec(),
         kind: if directory {

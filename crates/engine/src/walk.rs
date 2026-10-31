@@ -187,6 +187,8 @@ pub fn walk_with_progress_guarded(
             "selected root is not a supported local disk filesystem",
         ));
     }
+    let mut directory=directory;
+    if let Some(d)=&mut directory {d.capture_clones(options.capture_clones);}
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -218,6 +220,7 @@ pub fn walk_with_progress_guarded(
                 .join(",")
         ),
         context: json!({"os_identity":crate::volume::os_identity().ok(),"volume_before":before,
+            "clone_capture":{"version":crate::CLONE_CAPTURE_VERSION,"requested":options.capture_clones,"scope":"admitted_directory_bulk_regular_files","capability_status":"not_queried","regular_file_status_counts":{}},
             "coverage_diagnostics":crate::coverage::empty(),"volume_after":null,"started_unix_ns":nanos.to_string(),"ended_unix_ns":null}),
     };
     let mut node = StreamEntry {
@@ -239,6 +242,10 @@ pub fn walk_with_progress_guarded(
             if excluded_root {"cloud/provider or dataless root excluded"}else{"deliberate root path exclusion"}.into(),
             true,
         );
+    }
+    if metadata.is_file() {
+        if options.capture_clones {node.entry.clone_metadata=crate::CloneMetadata::unavailable(crate::CloneStatus::Missing);}
+        scan.context["clone_capture"]["regular_file_status_counts"][node.entry.clone_metadata.status.name()]=json!(1);
     }
     let mut count = 1_usize;
     let mut stack = Vec::new();
@@ -315,6 +322,14 @@ pub fn walk_with_progress_guarded(
             relative: frame.node.relative.join(OsStr::from_bytes(name.as_bytes())),
             entry: Entry::new(Some(frame.node.id), name.as_bytes().to_vec(), metadata),
         };
+        if options.capture_clones && (!metadata.is_file() || metadata.device!=scan.entries[0].device || metadata.dataless() || cloud_path(&child.path) || options.exclusions.iter().any(|p|child.path.starts_with(p))) {
+            child.entry.clone_metadata=crate::CloneMetadata::unavailable(crate::CloneStatus::Missing);
+        }
+        if metadata.is_file() {
+            let status=child.entry.clone_metadata.status.name();
+            let old=scan.context["clone_capture"]["regular_file_status_counts"][status].as_u64().unwrap_or(0);
+            scan.context["clone_capture"]["regular_file_status_counts"][status]=json!(old+1);
+        }
         if !metadata.is_dir() {
             branches.note(&child);
             emit(child)?;
@@ -355,7 +370,8 @@ pub fn walk_with_progress_guarded(
             );
         } else {
             match stack.last().unwrap().directory.child(&name, metadata) {
-                Ok(directory) => {
+                Ok(mut directory) => {
+                    directory.capture_clones(options.capture_clones);
                     stack.push(Frame {
                         node: child,
                         directory,
@@ -429,7 +445,7 @@ mod duration_tests {
         let calls=FAILURES.with(|c|{c.set(c.get()+1);c.get()});
         if calls>3{return Ok(None);}
         TEST_ELAPSED.with(|c|c.set(Some(Duration::from_secs(1))));
-        Ok(Some((CString::new(format!("synthetic-branch-{calls}")).unwrap(),Ok(Metadata{mode:libc::S_IFDIR,device:1,inode:1,links:1,logical:0,allocated:0,flags:0,mtime:0}))))
+        Ok(Some((CString::new(format!("synthetic-branch-{calls}")).unwrap(),Ok(Metadata{mode:libc::S_IFDIR,device:1,inode:1,links:1,logical:0,allocated:0,flags:0,mtime:0,clone_metadata:crate::CloneMetadata::default()}))))
     }
     fn fixture(label:&str)->PathBuf {
         let root=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-duration-{label}-{}",std::process::id()));

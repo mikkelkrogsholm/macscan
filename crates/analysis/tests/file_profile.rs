@@ -6,6 +6,7 @@ const C: AtomicBool = AtomicBool::new(false);
 const REF: i64 = 1_793_404_800; // 2026-10-31T00:00:00Z
 fn entry(parent: Option<u32>, name: &[u8], kind: EntryKind, bytes: u64, time: i64) -> Entry {
     Entry {
+        clone_metadata: macscan_engine::CloneMetadata::default(),
         parent,
         name: name.to_vec(),
         kind,

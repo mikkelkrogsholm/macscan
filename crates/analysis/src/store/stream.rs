@@ -30,7 +30,7 @@ impl StreamingProfile {
 }
 fn elapsed(start: Option<Instant>) -> Duration { start.map(|s|s.elapsed()).unwrap_or_default() }
 
-const RAW_SCHEMA: &str = "entry_id UBIGINT,parent_id UBIGINT,subtree_end UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,own_logical UBIGINT,own_allocated UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,mtime_unix_seconds BIGINT,enumeration_complete BOOLEAN,category VARCHAR";
+const RAW_SCHEMA: &str = "entry_id UBIGINT,parent_id UBIGINT,subtree_end UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,own_logical UBIGINT,own_allocated UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,mtime_unix_seconds BIGINT,enumeration_complete BOOLEAN,category VARCHAR,clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
 struct Finished<'a>(&'a AtomicBool);
 impl Drop for Finished<'_> {
     fn drop(&mut self) {
@@ -195,6 +195,7 @@ impl Store {
                 let mut bytes = 0_usize;
                 let mut part = 0;
                 let mut scan_options = ScanOptions {
+                    capture_clones: options.capture_clones,
                     max_entries: options.max_entries,
                     max_duration: options.max_duration,
                     max_depth: options.max_depth,
@@ -340,7 +341,7 @@ fn finalize(db: &Db, stage: &Path, stop: &AtomicBool, root_valid: bool) -> io::R
     db.exec_cancel("CREATE TABLE endpoint_values AS SELECT e.directory_id,e.is_end,p.logical_sum,p.allocated_sum,p.accounted_sum,p.unknown_sum FROM endpoints e JOIN prefix p ON p.entry_id=e.lookup_id",stop)?;
     db.exec_cancel("CREATE TABLE directory_totals AS SELECT directory_id AS entry_id,sum(CASE WHEN is_end THEN logical_sum ELSE -logical_sum END)::UBIGINT AS logical_total,sum(CASE WHEN is_end THEN allocated_sum ELSE -allocated_sum END)::UBIGINT AS allocated_total,sum(CASE WHEN is_end THEN accounted_sum ELSE -accounted_sum END)::UBIGINT AS accounted_total,sum(CASE WHEN is_end THEN unknown_sum ELSE -unknown_sum END)=0 AS complete FROM endpoint_values GROUP BY directory_id",stop)?;
     db.exec("CREATE VIEW sized AS SELECT r.*,CASE WHEN r.kind='directory' THEN d.logical_total ELSE r.own_logical END AS logical_total,CASE WHEN r.kind='directory' THEN d.allocated_total ELSE r.own_allocated END AS allocated_total,CASE WHEN r.kind='directory' THEN d.accounted_total ELSE r.own_accounted END AS accounted_total,CASE WHEN r.kind='directory' THEN d.complete ELSE r.enumeration_complete END AS complete FROM charged r LEFT JOIN directory_totals d ON d.entry_id=r.entry_id")?;
-    db.exec("CREATE VIEW final AS SELECT entry_id,parent_id,name_display,path_display,name_bytes,path_bytes,path_key,kind,CASE WHEN complete THEN logical_total END AS logical_bytes,CASE WHEN complete THEN allocated_total END AS allocated_bytes,CASE WHEN complete THEN accounted_total END AS accounted_allocated_bytes,own_allocated AS own_allocated_bytes,logical_total AS observed_logical_bytes,allocated_total AS observed_allocated_bytes,accounted_total AS observed_accounted_allocated_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,complete AS coverage_complete,enumeration_complete,category,NULL::UBIGINT AS private_bytes FROM sized")?;
+    db.exec("CREATE VIEW final AS SELECT entry_id,parent_id,name_display,path_display,name_bytes,path_bytes,path_key,kind,CASE WHEN complete THEN logical_total END AS logical_bytes,CASE WHEN complete THEN allocated_total END AS allocated_bytes,CASE WHEN complete THEN accounted_total END AS accounted_allocated_bytes,own_allocated AS own_allocated_bytes,logical_total AS observed_logical_bytes,allocated_total AS observed_allocated_bytes,accounted_total AS observed_accounted_allocated_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,complete AS coverage_complete,enumeration_complete,category,NULL::UBIGINT AS private_bytes,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id FROM sized")?;
     db.exec_cancel(&format!("COPY (SELECT * FROM final) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192,FILE_SIZE_BYTES '32MB',PER_THREAD_OUTPUT true,FILENAME_PATTERN 'part-{{i}}')",path_literal(&stage.join("entries"))?),stop)?;
     // Root state plus directory coverage transitions, including the
     // end boundary that restores the parent's enumeration status.
@@ -396,6 +397,11 @@ fn flush(db: &Db, stage: &Path, batch: &mut Vec<StreamEntry>, part: usize) -> io
         app.signed(e.mtime)?;
         app.boolean(e.enumeration_complete)?;
         app.text(CATEGORIES[own_category as usize])?;
+        app.text(e.clone_metadata.status.name())?;
+        app.number(e.clone_metadata.clone_id)?;
+        app.number(e.clone_metadata.extended_flags)?;
+        app.number(e.clone_metadata.data_allocated)?;
+        app.number(e.clone_metadata.device)?;
         app.end()?;
     }
     app.finish()?;
@@ -429,7 +435,7 @@ mod large_tests {
         let db=Db::new().unwrap();
         db.exec(&format!("CREATE TABLE batch ({RAW_SCHEMA})")).unwrap();
         for (id,parent,end,name,key,kind) in [(0,"NULL",2,"","","directory"),(1,"0",2,"child","6368696c6400","directory"),(2,"1",2,"file","6368696c640066696c6500","file")] {
-            db.exec(&format!("INSERT INTO batch VALUES ({id},{parent},{end},'{name}','/synthetic/{name}',unhex(''),unhex(''),unhex('{key}'),'{kind}',7,4096,1,{id},1,0,true,'unclassified')")).unwrap();
+            db.exec(&format!("INSERT INTO batch VALUES ({id},{parent},{end},'{name}','/synthetic/{name}',unhex(''),unhex(''),unhex('{key}'),'{kind}',7,4096,1,{id},1,0,true,'unclassified','not_requested',NULL,NULL,NULL,NULL)")).unwrap();
         }
         db.exec(&format!("COPY batch TO {} (FORMAT PARQUET)",path_literal(&path.join("raw/part.parquet")).unwrap())).unwrap();
         let totals=finalize(&db,&path,&AtomicBool::new(false),false).unwrap();assert!(totals["logical_bytes"].is_null());assert_eq!(totals["observed_logical_bytes"],"21");
@@ -480,7 +486,7 @@ mod large_tests {
             CASE WHEN is_dir THEN 0 ELSE 4096 END::UBIGINT AS own_allocated,
             1::UBIGINT AS device_id,(id+1)::UBIGINT AS inode,
             CASE WHEN NOT is_dir AND id%5=0 THEN 2 ELSE 1 END::UBIGINT AS link_count,
-            0::BIGINT AS mtime_unix_seconds,true AS enumeration_complete,'unclassified' AS category FROM names
+            0::BIGINT AS mtime_unix_seconds,true AS enumeration_complete,'unclassified' AS category,'not_requested' AS clone_status,NULL::UBIGINT AS clone_id,NULL::UBIGINT AS clone_extended_flags,NULL::UBIGINT AS clone_data_allocated_bytes,NULL::UBIGINT AS clone_device_id FROM names
         "#
         );
         db.exec(&format!("COPY ({raw}) TO {} (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 8192,FILE_SIZE_BYTES '32MB',PER_THREAD_OUTPUT true)",path_literal(&stage.path.join("raw")).unwrap())).unwrap();

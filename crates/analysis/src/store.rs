@@ -8,6 +8,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+#[cfg(test)]
+mod clone_tests;
 pub use stream::StreamingProfile;
 mod focused;
 mod coverage;
@@ -25,7 +27,7 @@ pub const OUTPUT_BUDGET: usize = 8 * 1024;
 const FORMAT: &str = "parquet-1";
 // Real simulator paths exhausted the 128 MiB writer with 32k-row batches.
 const CHUNK: usize = 8_192;
-const ENTRY_SCHEMA:&str="entry_id UBIGINT,parent_id UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,logical_bytes UBIGINT,allocated_bytes UBIGINT,accounted_allocated_bytes UBIGINT,own_allocated_bytes UBIGINT,observed_logical_bytes UBIGINT,observed_allocated_bytes UBIGINT,observed_accounted_allocated_bytes UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,observed_link_count UBIGINT,charged_to UBIGINT,mtime_unix_seconds BIGINT,coverage_complete BOOLEAN,enumeration_complete BOOLEAN,category VARCHAR,private_bytes UBIGINT";
+const ENTRY_SCHEMA:&str="entry_id UBIGINT,parent_id UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,logical_bytes UBIGINT,allocated_bytes UBIGINT,accounted_allocated_bytes UBIGINT,own_allocated_bytes UBIGINT,observed_logical_bytes UBIGINT,observed_allocated_bytes UBIGINT,observed_accounted_allocated_bytes UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,observed_link_count UBIGINT,charged_to UBIGINT,mtime_unix_seconds BIGINT,coverage_complete BOOLEAN,enumeration_complete BOOLEAN,category VARCHAR,private_bytes UBIGINT,clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
 
 pub struct Store {
     root: PathBuf,
@@ -181,6 +183,11 @@ impl Store {
                 app.boolean(e.enumeration_complete && global_valid)?;
                 app.text(CATEGORIES[categories[id] as usize])?;
                 app.number(None)?;
+                app.text(e.clone_metadata.status.name())?;
+                app.number(e.clone_metadata.clone_id)?;
+                app.number(e.clone_metadata.extended_flags)?;
+                app.number(e.clone_metadata.data_allocated)?;
+                app.number(e.clone_metadata.device)?;
                 app.end()?;
             }
             app.finish()?;
@@ -291,6 +298,9 @@ impl Store {
         if !columns.contains("mtime_unix_seconds") {
             fallback.push_str(",NULL::BIGINT AS mtime_unix_seconds");
         }
+        for (name,ty) in [("clone_status","VARCHAR"),("clone_id","UBIGINT"),("clone_extended_flags","UBIGINT"),("clone_data_allocated_bytes","UBIGINT"),("clone_device_id","UBIGINT")] {
+            if !columns.contains(name) {fallback.push_str(&format!(",NULL::{ty} AS {name}"));}
+        }
         let replacement=if invalid {" REPLACE(NULL::UBIGINT AS logical_bytes,NULL::UBIGINT AS allocated_bytes,NULL::UBIGINT AS accounted_allocated_bytes,false AS coverage_complete,false AS enumeration_complete)"}else{""};
         db.exec(&format!(
             "CREATE VIEW {table}_saved AS SELECT *{replacement},{} AS scan_id FROM (SELECT *{fallback} FROM read_parquet({source}))",
@@ -398,7 +408,7 @@ impl Store {
             return fit(answer);
         }
         let sql = if q.kind == QueryKind::Inspect {
-            format!("SELECT entry_id,parent_id,name_display,path_display,hex(path_bytes) AS path_bytes_hex,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,private_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,coverage_complete,enumeration_complete,{} FROM entries_classified([{}])",categories::FIELDS,q.entry)
+            format!("SELECT entry_id,parent_id,name_display,path_display,hex(path_bytes) AS path_bytes_hex,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,private_bytes,device_id,inode,link_count,observed_link_count,charged_to,mtime_unix_seconds,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,clone_device_id,coverage_complete,enumeration_complete,{} FROM entries_classified([{}])",categories::FIELDS,q.entry)
         } else {
             let mut filter = if q.kind == QueryKind::Children {
                 format!("parent_id={}", q.entry)

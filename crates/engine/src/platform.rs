@@ -18,6 +18,7 @@ pub(crate) struct Metadata {
     pub allocated: u64,
     pub flags: u32,
     pub mtime: i64,
+    pub clone_metadata: crate::CloneMetadata,
 }
 
 impl Metadata {
@@ -34,6 +35,7 @@ impl Metadata {
                 .ok_or_else(|| io::Error::other("allocated size overflow"))?,
             flags: s.st_flags(),
             mtime: s.mtime(),
+            clone_metadata: crate::CloneMetadata::default(),
         })
     }
     fn from_stat(s: &libc::stat) -> io::Result<Self> {
@@ -52,6 +54,7 @@ impl Metadata {
             allocated,
             flags: s.st_flags,
             mtime: s.st_mtime,
+            clone_metadata: crate::CloneMetadata::default(),
         })
     }
 
@@ -75,9 +78,12 @@ thread_local! {pub(crate) static CALLS: std::cell::Cell<(usize,usize)> = const {
 type MetadataEventHook=fn()->io::Result<Option<(CString,io::Result<Metadata>)>>;
 #[cfg(test)]
 thread_local! {pub(crate) static METADATA_EVENT_HOOK:std::cell::Cell<Option<MetadataEventHook>>=const {std::cell::Cell::new(None)};}
-pub(crate) struct Directory(*mut libc::DIR, Option<crate::bulk::Bulk>);
+// Last field remembers extended-request rejection for all readdir fallback rows.
+pub(crate) struct Directory(*mut libc::DIR, Option<crate::bulk::Bulk>, bool);
 
 impl Directory {
+    pub fn capture_clones(&mut self, enabled:bool) {if let Some(bulk)=&mut self.1 {bulk.capture_clones=enabled;}}
+
     pub fn root(path: &Path) -> io::Result<Self> {
         #[cfg(test)] CALLS.with(|c|{let(a,b)=c.get();c.set((a+1,b));});
         let path = CString::new(path.as_os_str().as_bytes())
@@ -103,7 +109,7 @@ impl Directory {
             }
             return Err(error);
         }
-        Ok(Self(dir, Some(crate::bulk::Bulk::new())))
+        Ok(Self(dir, Some(crate::bulk::Bulk::new()), false))
     }
 
     pub(crate) fn fd(&self) -> libc::c_int {
@@ -194,16 +200,44 @@ impl Directory {
         #[cfg(test)] CALLS.with(|c|{let(a,b)=c.get();c.set((a,b+1));});
         #[cfg(test)] if let Some(hook)=METADATA_EVENT_HOOK.with(|c|c.get()){return hook();}
         if let Some(bulk)=&mut self.1 {
+            let capture=bulk.capture_clones;
             match bulk.next(unsafe {libc::dirfd(self.0)}) {
-                Ok(Some((name,metadata)))=>return Ok(Some((name.clone(),match metadata {Some(m)=>Ok(m),None=>self.child_metadata(&name)}))),
+                Ok(Some((name,metadata,supplemental)))=> {
+                    let metadata=match metadata {
+                        Some(m)=>Ok(m),
+                        None=>self.child_metadata(&name).map(|mut m| {
+                            if capture {
+                                // Fallback stat is a different observation. Retain returned
+                                // raw fields but never certify them against fallback sizes.
+                                let mut observation=supplemental;
+                                if matches!(observation.status,crate::CloneStatus::NotRequested|crate::CloneStatus::Observed) {
+                                    observation.status=crate::CloneStatus::Missing;
+                                }
+                                m.clone_metadata=observation;
+                            }
+                            m
+                        }),
+                    };
+                    return Ok(Some((name,metadata)));
+                }
                 Ok(None)=>return Ok(None),
-                Err(e) if !bulk.used && [Some(libc::EINVAL),Some(libc::ENOTSUP),Some(libc::ENOSYS)].contains(&e.raw_os_error())=>{
-                    unsafe {libc::rewinddir(self.0)}; self.1=None;
-                },
+                Err(e) if !bulk.used && [Some(libc::EINVAL),Some(libc::ENOTSUP),Some(libc::ENOSYS)].contains(&e.raw_os_error())=> {
+                    // Only an initial failed syscall can restart enumeration.
+                    // A consumed cursor or malformed returned batch never retries.
+                    unsafe {libc::rewinddir(self.0)};
+                    self.2=capture;
+                    self.1=None;
+                }
                 Err(e)=>return Err(e),
             }
         }
-        Ok(self.next_name()?.map(|n|{let m=self.child_metadata(&n);(n,m)}))
+        Ok(self.next_name()?.map(|name| {
+            let metadata=self.child_metadata(&name).map(|mut m| {
+                if self.2 {m.clone_metadata=crate::CloneMetadata::unavailable(crate::CloneStatus::Unsupported);}
+                m
+            });
+            (name,metadata)
+        }))
     }
 
 }

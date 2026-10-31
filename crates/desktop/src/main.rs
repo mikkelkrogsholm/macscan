@@ -473,6 +473,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let store = Store::open(&path, true).unwrap();
         let make_entry = |parent, name: &[u8], kind, size| Entry {
+            clone_metadata: macscan_engine::CloneMetadata::default(),
             parent, name: name.to_vec(), kind, logical:size, allocated:size, accounted:size,
             own_allocated:size, device:1, inode:1, links:1, observed_links:1, charged_to:None,
             mtime:0, complete:true, enumeration_complete:true,

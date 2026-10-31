@@ -65,6 +65,7 @@ pub struct Entry {
     pub observed_links: u32,
     pub charged_to: Option<u32>,
     pub mtime: i64,
+    pub clone_metadata: crate::CloneMetadata,
     pub complete: bool,
     pub enumeration_complete: bool,
 }
@@ -98,6 +99,7 @@ impl Entry {
             observed_links: 1,
             charged_to: None,
             mtime: metadata.mtime,
+            clone_metadata: metadata.clone_metadata,
             complete: true,
             enumeration_complete: true,
         }
@@ -119,6 +121,8 @@ impl ExclusionReason {
     fn code(self)->&'static str {match self {Self::ScannerOutput=>"OUTPUT_EXCLUDED",Self::VolumeBoundary=>"MOUNT_EXCLUDED",Self::FirmlinkBoundary=>"FIRMLINK_EXCLUDED"}}
 }
 pub struct ScanOptions {
+    /// Supplemental APFS bulk metadata; streaming only, default off.
+    pub capture_clones: bool,
     pub max_entries: usize,
     pub max_duration: Duration,
     pub max_depth: usize,
@@ -130,6 +134,7 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
+            capture_clones: false,
             max_entries: 1_000_000,
             max_duration: Duration::from_secs(300),
             max_depth: 64,
@@ -196,6 +201,7 @@ pub fn scan_with_progress(
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Progress),
 ) -> io::Result<Scan> {
+    if options.capture_clones {return Err(io::Error::new(io::ErrorKind::Unsupported,"clone metadata capture requires streaming traversal"));}
     let started = Instant::now();
     let started_at = platform::timestamp();
     let nanos = SystemTime::now()
@@ -683,7 +689,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod coverage_tests {
     use super::*;
     fn synthetic()->Scan {
-        let m=Metadata{mode:libc::S_IFDIR,device:1,inode:1,links:1,logical:0,allocated:0,flags:0,mtime:0};
+        let m=Metadata{mode:libc::S_IFDIR,device:1,inode:1,links:1,logical:0,allocated:0,flags:0,mtime:0,clone_metadata:crate::CloneMetadata::default()};
         Scan{id:"600-1".into(),root:"/synthetic".into(),entries:vec![Entry::new(None,vec![],m),Entry::new(Some(0),b"child".to_vec(),m)],issues:vec![],issue_count:0,excluded_count:0,status:ScanStatus::Complete,started_at:"2026-10-31T00:00:00Z".into(),ended_at:String::new(),duration_ms:0,policy:"synthetic".into(),context:json!({"coverage_diagnostics":crate::coverage::empty()})}
     }
     #[test]

@@ -7,6 +7,8 @@ compile_error!("The first Macscan backend requires macOS.");
 pub mod coverage;
 mod compare;
 mod bulk;
+mod clone_metadata;
+pub use clone_metadata::{CloneMetadata, CloneStatus, CLONE_CAPTURE_VERSION};
 mod foundation;
 mod platform;
 mod profile;

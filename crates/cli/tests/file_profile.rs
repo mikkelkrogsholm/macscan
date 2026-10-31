@@ -9,6 +9,7 @@ fn profile_cli_matches_shared_api_and_bounded_encodings() {
     fs::create_dir(&path).unwrap();
     let store = Store::open(&path, false).unwrap();
     let file = |parent, name, kind, size| Entry {
+        clone_metadata: macscan_engine::CloneMetadata::default(),
         parent,
         name,
         kind,
