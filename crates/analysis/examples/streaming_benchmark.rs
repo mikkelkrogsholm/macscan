@@ -190,8 +190,10 @@ fn profile(p: &StreamingProfile) -> Value {
         "flush_tail_ms":ms(p.flush_tail),"flush_count":p.flush_count,"finalize_ms":ms(p.finalize),
         "watcher_join_ms":ms(p.watcher_join),"publish_ms":ms(p.publish),"other_ms":ms(p.other),
         "accounted_ms":ms(p.accounted()),"bulk_enumeration_metadata":t(&p.walk.bulk_enumeration_metadata),
+        "prefetch_worker_overlapping":t(&p.walk.prefetch_worker),
+        "prefetch_records":p.walk.prefetch_records,"prefetch_nonempty_batches":p.walk.prefetch_nonempty_batches,
         "readdir":t(&p.walk.readdir),"fstatat":t(&p.walk.fstatat),"forced_fallbacks":p.walk.forced_fallbacks,
-        "walk_uninstrumented_residual_ms":ms(p.walk_only().saturating_sub(p.walk.bulk_enumeration_metadata.elapsed + p.walk.readdir.elapsed + p.walk.fstatat.elapsed))})
+        "walk_uninstrumented_residual_ms":if p.walk.prefetch_worker.calls == 0 {Some(ms(p.walk_only().saturating_sub(p.walk.bulk_enumeration_metadata.elapsed + p.walk.readdir.elapsed + p.walk.fstatat.elapsed)))} else {None}})
 }
 fn parity(store: &Store, before: &str, after: &str, expected: usize) -> io::Result<Value> {
     let old = store.manifest(before)?;
@@ -261,7 +263,9 @@ fn command(program: &str, args: &[&str]) -> String {
         .unwrap_or_else(|| "unavailable".into())
 }
 fn main() -> io::Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    let compare_prefetch = args.first().is_some_and(|a| a == "--compare-prefetch");
+    if compare_prefetch { args.remove(0); }
     let files = match args.as_slice() {
         [small] if small == "--run-small" => 1920,
         [large, count]
@@ -271,7 +275,7 @@ fn main() -> io::Result<()> {
         }
         _ => {
             return Err(io::Error::other(
-                "explicit opt-in required: --run-small OR --allow-large 100000|1000000",
+                "explicit opt-in required: [--compare-prefetch] --run-small OR --allow-large 100000|1000000",
             ))
         }
     };
@@ -292,18 +296,30 @@ fn main() -> io::Result<()> {
     let (fallback, _) =
         store.scan_to_store_profiled(&root, &options, FULL_HISTORY_BUDGET, &STOP, |_| {}, true)?;
     parity(&store, &baseline, &fallback, expected)?;
+    if compare_prefetch {
+        let (candidate, p) = store.scan_to_store_prefetch_profiled(&root, &options, FULL_HISTORY_BUDGET, &STOP, |_| {}, false)?;
+        if p.walk.prefetch_worker.calls == 0 || (files >= 100000 && p.walk.prefetch_records == 0) { return Err(io::Error::other("helper not meaningfully exercised")); }
+        parity(&store, &baseline, &candidate, expected)?;
+    }
     let mut runs = Vec::new();
-    for force in [false, true] {
-        for repeat in 0..3 {
+    for repeat in 0..3 {
+        // Reverse each round to avoid always giving one mode warmer caches.
+        let modes = if compare_prefetch {
+            if repeat % 2 == 0 {vec![0, 2, 1]} else {vec![1, 2, 0]}
+        } else if repeat % 2 == 0 {vec![0, 1]} else {vec![1, 0]};
+        for mode in modes {
+            let force = mode == 1;
+            let prefetch = mode == 2;
             interrupted()?;
             let rss_before = rss()?;
             let ((id, p), s) = sampled(store.path(), || {
-                store.scan_to_store_profiled(
+                let scan = if prefetch { Store::scan_to_store_prefetch_profiled } else { Store::scan_to_store_profiled };
+                scan(&store,
                     &root,
                     &options,
                     FULL_HISTORY_BUDGET,
                     &STOP,
-                    |_| {},
+                    |_: &macscan_engine::Progress| {},
                     force,
                 )
             })?;
@@ -321,9 +337,12 @@ fn main() -> io::Result<()> {
             {
                 return Err(io::Error::other("expected metadata path was not exercised"));
             }
+            if prefetch && files >= 100000 && p.walk.prefetch_records == 0 {
+                return Err(io::Error::other("candidate did not prefetch file metadata"));
+            }
             let validation = Instant::now();
             let equal = parity(&store, &baseline, &id, expected)?;
-            runs.push(json!({"mode":if force {"forced_stat_fallback"} else {"baseline"},"repeat":repeat,
+            runs.push(json!({"mode":if force {"forced_stat_fallback"} else if prefetch {"prefetch_candidate"} else {"baseline"},"repeat":repeat,
                 "entries":expected,"entries_per_second":expected as f64 / p.total.as_secs_f64(),"timing":profile(&p),
                 "validation_ms":validation.elapsed().as_secs_f64()*1000.0,"parity":equal,
                 "process_peak_rss_before_bytes":rss_before,"process_peak_rss_after_bytes":rss_after,
@@ -333,14 +352,16 @@ fn main() -> io::Result<()> {
         }
     }
     let manifest = store.manifest(&baseline)?;
-    let report = json!({"benchmark":"production_streaming_v1","files_created":files,"hardlink_aliases":32,
+    let mut report = json!({"benchmark":"production_streaming_v1","files_created":files,"hardlink_aliases":32,
         "broad_directories":32,"nested_depth":24,"fixture_creation_ms":creation_ms,"measured_repeats_per_mode":3,
-        "conditions":"post-creation; one warmup per mode; shared process and OS caches; no cold-cache claim",
+        "conditions":"post-creation; one warmup per mode; alternating mode order each repeat; shared process and OS caches; no cold-cache claim",
+        "prefetch_comparison":compare_prefetch,
         "resource_method":"RUSAGE_SELF Darwin ru_maxrss bytes is lifetime process high-water incl fixture, warmups and prior validations; observer samples current PID FDs and owned .partial logical file lengths every 25ms plus observation time; work is a subset of stage; sampled maxima only, races counted, no allocated-byte claim",
         "environment":{"hardware":command("/usr/sbin/sysctl", &["-n","hw.model"]),"cpu":command("/usr/sbin/sysctl", &["-n","machdep.cpu.brand_string"]),"memory_bytes":command("/usr/sbin/sysctl", &["-n","hw.memsize"]),"os":command("/usr/bin/sw_vers", &[]),"kernel":command("/usr/bin/uname", &["-rsm"]),"rustc":command(&std::env::var("RUSTC").unwrap_or_else(|_|"rustc".into()), &["--version"]),"filesystem":manifest["context"]["volume_before"]["filesystem"],"deployment_target":std::env::var("MACOSX_DEPLOYMENT_TARGET").ok(),"duckdb":Store::version()},
         "totals":manifest["totals"],"runs":runs});
     drop(store);
     drop(owned);
+    report["process_peak_rss_after_validation_and_cleanup_bytes"] = json!(rss()?);
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -383,4 +404,43 @@ mod tests {
             .to_string_lossy()
             .ends_with(".partial")));
     }
+    #[test]
+    fn candidate_prefetches_real_file_batches_and_preserves_stop_budget_publication() {
+        // Wide leaf dirs require multiple real 64 KiB batches; nested parent
+        // directories must not monopolize the single slot with pending EOF.
+        let (owned, root, expected) = fixture(128).unwrap();
+        for n in 0..1500 { fs::write(root.join(format!("d00/wide{n:05}")), b"x").unwrap(); }
+        let expected = expected + 1500;
+        let store = Store::open(&owned.0.join("store"), true).unwrap();
+        let options = ScanOptions { max_memory_bytes:256*1024, ..ScanOptions::full() };
+        let cancel = AtomicBool::new(false);
+        let normal = store.scan_to_store(&root, &options, FULL_HISTORY_BUDGET, &cancel, |_| {}).unwrap();
+        let (candidate, p) = store.scan_to_store_prefetch_profiled(&root, &options, FULL_HISTORY_BUDGET, &cancel, |_| {}, false).unwrap();
+        assert!(p.walk.prefetch_records > 0);
+        assert!(p.walk.prefetch_nonempty_batches > 0);
+        assert_eq!(p.accounted(), p.total);
+        parity(&store, &normal, &candidate, expected).unwrap();
+        let (fallback, p) = store.scan_to_store_prefetch_profiled(&root, &options, FULL_HISTORY_BUDGET, &cancel, |_| {}, true).unwrap();
+        assert_eq!(p.walk.prefetch_worker.calls,0);
+        assert_eq!(p.walk.bulk_enumeration_metadata.calls,0);
+        assert!(p.walk.forced_fallbacks>0);
+        parity(&store, &normal, &fallback, expected).unwrap();
+        let published = || store.path().read_dir().unwrap().filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir()).count();
+        let before = published();
+        let budget_store = Store::open(&owned.0.join("budget-store"), true).unwrap();
+        let error = budget_store.scan_to_store_prefetch_profiled(&root, &options, 1, &cancel, |_| {}, false).unwrap_err();
+        assert_eq!(budget_store.path().read_dir().unwrap().filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir()).count(),0);
+        assert_eq!(error.kind(),io::ErrorKind::StorageFull);
+        assert_eq!(published(),before);
+        // Request stop after traversal has started. Emit/flush path keeps polling
+        // the existing watcher/atomic path; no snapshot may be published.
+        let error = store.scan_to_store_prefetch_profiled(&root, &options, FULL_HISTORY_BUDGET, &cancel, |_| { cancel.store(true,Ordering::Relaxed); }, false).unwrap_err();
+        assert_eq!(error.kind(),io::ErrorKind::Interrupted);
+        assert_eq!(published(),before);
+        assert!(!store.path().read_dir().unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".partial")));
+        // A subsequent scan proves the store lock and helper were released.
+        cancel.store(false,Ordering::Relaxed);
+        store.scan_to_store_prefetch_profiled(&root, &options, FULL_HISTORY_BUDGET, &cancel, |_| {}, false).unwrap();
+    }
+
 }

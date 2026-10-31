@@ -1,6 +1,6 @@
 //! Bounded batches -> Parquet -> disk-backed aggregation -> immutable snapshot.
 use super::*;
-use macscan_engine::{walk_with_progress_guarded, walk_with_progress_profiled_guarded, Progress, ScanOptions, StreamEntry};
+use macscan_engine::{walk_with_progress_guarded, walk_with_progress_profiled_guarded, walk_with_progress_prefetch_profiled_guarded, Progress, ScanOptions, StreamEntry};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
@@ -55,7 +55,7 @@ impl Store {
         cancel: &AtomicBool, origin: Option<Value>,
         progress: impl FnMut(&Progress),
     ) -> io::Result<String> {
-        self.scan_to_store_impl(root, options, budget, cancel, origin, progress, None, false)
+        self.scan_to_store_impl(root, options, budget, cancel, origin, progress, None, false, false)
     }
 
     /// Profile the complete production pipeline, including publication and watcher join.
@@ -64,10 +64,25 @@ impl Store {
         &self, root: &Path, options: &ScanOptions, budget: u64,
         cancel: &AtomicBool, progress: impl FnMut(&Progress), force_fallback: bool,
     ) -> io::Result<(String, StreamingProfile)> {
+        self.scan_to_store_measured(root, options, budget, cancel, progress, force_fallback, false)
+    }
+
+    /// Explicit developer-only next-batch prefetch experiment.
+    pub fn scan_to_store_prefetch_profiled(
+        &self, root: &Path, options: &ScanOptions, budget: u64,
+        cancel: &AtomicBool, progress: impl FnMut(&Progress), force_fallback: bool,
+    ) -> io::Result<(String, StreamingProfile)> {
+        self.scan_to_store_measured(root, options, budget, cancel, progress, force_fallback, true)
+    }
+
+    fn scan_to_store_measured(
+        &self, root: &Path, options: &ScanOptions, budget: u64,
+        cancel: &AtomicBool, progress: impl FnMut(&Progress), force_fallback: bool, prefetch: bool,
+    ) -> io::Result<(String, StreamingProfile)> {
         let started = Instant::now();
         let mut profile = StreamingProfile::default();
         let id = self.scan_to_store_impl(root, options, budget, cancel, None, progress,
-            Some(&mut profile), force_fallback)?;
+            Some(&mut profile), force_fallback, prefetch)?;
         // Measure after the shared implementation returns, including lock/stage drops.
         profile.total = started.elapsed();
         profile.other = profile.total.saturating_sub(profile.walk_inclusive + profile.flush_tail
@@ -78,7 +93,7 @@ impl Store {
     fn scan_to_store_impl(
         &self, root: &Path, options: &ScanOptions, budget: u64,
         cancel: &AtomicBool, origin: Option<Value>, mut progress: impl FnMut(&Progress),
-        profile: Option<&mut StreamingProfile>, force_fallback: bool,
+        profile: Option<&mut StreamingProfile>, force_fallback: bool, prefetch: bool,
     ) -> io::Result<String> {
         let enabled = profile.is_some();
         let mut timings = StreamingProfile::default();
@@ -207,8 +222,9 @@ impl Store {
                     Ok(())
                 };
                 let mut summary = if enabled {
-                    let (result, walk) = walk_with_progress_profiled_guarded(root, &scan_options,
-                        &stop, origin.is_some(), force_fallback, &mut emit, |p| progress(p));
+                    let measure = if prefetch { walk_with_progress_prefetch_profiled_guarded } else { walk_with_progress_profiled_guarded };
+                    let (result, walk) = measure(root, &scan_options,
+                        &stop, origin.is_some(), force_fallback, &mut emit, |p: &Progress| progress(p));
                     timings.walk = walk;
                     result?
                 } else {

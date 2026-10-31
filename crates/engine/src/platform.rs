@@ -210,6 +210,8 @@ impl Directory {
 
 impl Drop for Directory {
     fn drop(&mut self) {
+        // Drain helper before closing or ever reusing the directory descriptor.
+        drop(self.1.take());
         // SAFETY: unique DIR owner, exactly one close.
         unsafe {
             libc::closedir(self.0);

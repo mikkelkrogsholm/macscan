@@ -15,10 +15,16 @@ pub struct WalkProfile {
     pub readdir: SyscallTiming,
     pub fstatat: SyscallTiming,
     pub forced_fallbacks: u64,
+    /// Overlapping helper syscall wall time: never add to exclusive walk phases.
+    pub prefetch_worker: SyscallTiming,
+    pub prefetch_records: u64,
+    pub prefetch_nonempty_batches: u64,
 }
 struct Active {
     profile: WalkProfile,
     force_fallback: bool,
+    prefetch: bool,
+    worker: Option<crate::prefetch::Worker>,
 }
 thread_local! { static ACTIVE: RefCell<Option<Active>> = const {RefCell::new(None)}; }
 #[derive(Clone, Copy)]
@@ -75,6 +81,9 @@ pub(crate) fn force_fallback() -> bool {
     })
 }
 pub(crate) fn measure<T>(force_fallback: bool, operation: impl FnOnce() -> T) -> (T, WalkProfile) {
+    measure_prefetch(force_fallback, false, operation)
+}
+pub(crate) fn measure_prefetch<T>(force_fallback: bool, prefetch: bool, operation: impl FnOnce() -> T) -> (T, WalkProfile) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -86,6 +95,8 @@ pub(crate) fn measure<T>(force_fallback: bool, operation: impl FnOnce() -> T) ->
         *a.borrow_mut() = Some(Active {
             profile: WalkProfile::default(),
             force_fallback,
+            prefetch,
+            worker: None,
         });
     });
     let _reset = Reset;
@@ -128,4 +139,24 @@ mod tests {
         let (_, p) = measure(true, || assert!(force_fallback()));
         assert_eq!(p.forced_fallbacks, 1);
     }
+}
+
+// Only an explicit profiled experiment can allocate/spawn this helper.
+pub(crate) fn prefetch(fd: i32, buffer: &mut Vec<u8>) -> Option<crate::prefetch::Pending> {
+    ACTIVE.with(|a| {
+        let mut active = a.borrow_mut();
+        let active = active.as_mut().filter(|a| a.prefetch && !a.force_fallback)?;
+        if active.worker.is_none() { active.worker = crate::prefetch::Worker::new().ok(); }
+        active.worker.as_ref()?.submit(fd, buffer)
+    })
+}
+pub(crate) fn worker_finished(elapsed: Duration, records: usize) {
+    ACTIVE.with(|a| {
+        if let Some(active) = a.borrow_mut().as_mut() {
+            active.profile.prefetch_worker.calls += 1;
+            active.profile.prefetch_worker.elapsed += elapsed;
+            active.profile.prefetch_records += records as u64;
+            active.profile.prefetch_nonempty_batches += u64::from(records > 0);
+        }
+    });
 }

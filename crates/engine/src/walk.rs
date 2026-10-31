@@ -100,6 +100,16 @@ pub fn walk_with_progress_profiled_guarded(
         requested, options, cancel, require_saved_destination, emit, progress))
 }
 
+/// Developer-only candidate: one bounded next-batch metadata helper.
+pub fn walk_with_progress_prefetch_profiled_guarded(
+    requested: &Path, options: &ScanOptions, cancel: &AtomicBool,
+    require_saved_destination: bool, force_fallback: bool,
+    emit: impl FnMut(StreamEntry) -> io::Result<()>, progress: impl FnMut(&Progress),
+) -> (io::Result<WalkSummary>, crate::WalkProfile) {
+    crate::profile::measure_prefetch(force_fallback, true, || walk_with_progress_guarded(
+        requested, options, cancel, require_saved_destination, emit, progress))
+}
+
 /// Focused remeasurement must keep the canonical saved destination. Validation
 /// lives after the existing provider/dataless gate, before any root enumeration.
 pub fn walk_with_progress_guarded(
@@ -466,4 +476,32 @@ mod duration_tests {
         assert_eq!(result.entry_count,1);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn experimental_prefetch_is_joined_on_emit_error_stop_and_unwind() {
+        let root=fixture("prefetch-lifecycle");
+        std::fs::create_dir(root.join("leaf")).unwrap();
+        for n in 0..20 {std::fs::write(root.join(format!("leaf/f{n}")),b"x").unwrap();}
+        for mode in 0..3 {
+            let cancel=AtomicBool::new(false);
+            let run=|| walk_with_progress_prefetch_profiled_guarded(&root,&ScanOptions::full(),&cancel,false,false,|node|{
+                if node.entry.kind==crate::EntryKind::File {
+                    if mode==0 {return Err(io::Error::other("emit failure"));}
+                    if mode==1 {cancel.store(true,Ordering::Relaxed);}
+                    if mode==2 {panic!("emit unwind");}
+                }
+                Ok(())
+            },|_|{});
+            if mode==2 {assert!(std::panic::catch_unwind(run).is_err());}
+            else {
+                let (result,p)=run();
+                assert!(result.is_err());
+                assert!(p.prefetch_worker.calls>0); // pending work was drained
+            }
+            // TLS, worker and descriptors from the previous operation are gone.
+            let (result,p)=walk_with_progress_profiled_guarded(&root,&ScanOptions::full(),&AtomicBool::new(false),false,false,|_|Ok(()),|_|{});
+            result.unwrap(); assert_eq!(p.prefetch_worker.calls,0);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

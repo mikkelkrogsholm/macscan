@@ -10,18 +10,22 @@ pub(crate) struct Bulk {
     buffer: Vec<u8>,
     rows: VecDeque<(CString, Option<Metadata>)>,
     pub used: bool,
+    pending: Option<crate::prefetch::Pending>,
 }
 impl Bulk {
-    pub fn new() -> Self { Self { buffer: vec![0; 64*1024], rows: VecDeque::new(), used:false } }
+    pub fn new() -> Self { Self { buffer: vec![0; 64*1024], rows: VecDeque::new(), used:false, pending:None } }
     pub fn next(&mut self, fd:i32) -> io::Result<Option<(CString,Option<Metadata>)>> {
         if let Some(row)=self.rows.pop_front() {return Ok(Some(row));}
         if !self.used && crate::profile::force_fallback() {
             return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
         }
-        let mut attrs=libc::attrlist {bitmapcount:5,reserved:0,commonattr:COMMON,volattr:0,dirattr:0,fileattr:FILE,forkattr:0};
-        // SAFETY: live directory fd, initialized public attrlist, bounded writable buffer.
-        let n=crate::profile::timed(crate::profile::Call::Bulk, || unsafe {libc::getattrlistbulk(fd,(&mut attrs as *mut libc::attrlist).cast(),self.buffer.as_mut_ptr().cast(),self.buffer.len(),0)});
-        if n<0 {return Err(io::Error::last_os_error());}
+        let n = if let Some(pending) = self.pending.take() {
+            let (buffer, result) = pending.finish();
+            self.buffer = buffer;
+            result?
+        } else {
+            crate::profile::timed(crate::profile::Call::Bulk, || read_batch(fd, &mut self.buffer))?
+        };
         self.used=true;
         let mut offset=0;
         for _ in 0..n {
@@ -31,7 +35,26 @@ impl Bulk {
             self.rows.push_back(parse(record)?);
             offset+=length;
         }
+        // Do not reserve the global slot across a directory descent. Batches
+        // containing nonregular/missing metadata stay serial; all-file batches
+        // can overlap row processing/Parquet callbacks with their next batch.
+        if n > 0 && self.rows.iter().all(|(_, metadata)| metadata.is_some()) {
+            self.pending = crate::profile::prefetch(fd, &mut self.buffer);
+        }
         Ok(self.rows.pop_front())
+    }
+}
+// Both coordinator and experimental helper use this exact public Darwin call.
+pub(crate) fn read_batch(fd: i32, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut attrs=libc::attrlist {bitmapcount:5,reserved:0,commonattr:COMMON,volattr:0,dirattr:0,fileattr:FILE,forkattr:0};
+    // SAFETY: caller owns a live directory fd and a bounded writable buffer.
+    let n=unsafe {libc::getattrlistbulk(fd,(&mut attrs as *mut libc::attrlist).cast(),buffer.as_mut_ptr().cast(),buffer.len(),0)};
+    if n<0 {Err(io::Error::last_os_error())} else {Ok(n as usize)}
+}
+impl Drop for Bulk {
+    fn drop(&mut self) {
+        // A stopped/erroring walk must wait for the uninterruptible syscall.
+        if let Some(pending) = self.pending.take() { let _ = pending.finish(); }
     }
 }
 fn invalid()->io::Error {io::Error::other("invalid bulk metadata record")}
@@ -67,6 +90,27 @@ fn parse(b:&[u8])->io::Result<(CString,Option<Metadata>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn later_worker_error_keeps_bulk_used_and_releases_slot() {
+        use std::os::fd::AsRawFd;
+        let worker = crate::prefetch::Worker::new().unwrap();
+        let path = std::env::temp_dir().join(format!("macscan-prefetch-error-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        let mut bulk = Bulk::new();
+        bulk.used = true;
+        bulk.pending = worker.submit(file.as_raw_fd(), &mut bulk.buffer);
+        assert!(bulk.pending.is_some());
+        assert!(bulk.next(file.as_raw_fd()).is_err());
+        // Platform fallback is explicitly only !used; later errors remain errors.
+        assert!(bulk.used);
+        assert!(bulk.pending.is_none());
+        assert_eq!(bulk.buffer.len(),64*1024);
+        let pending = worker.submit(file.as_raw_fd(), &mut bulk.buffer).unwrap();
+        assert!(pending.finish().1.is_err());
+        drop(worker);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test] fn malformed_records_are_rejected(){
         assert!(parse(&[]).is_err());
         let mut b=vec![0u8;40];b[4..8].copy_from_slice(&libc::ATTR_CMN_NAME.to_ne_bytes());

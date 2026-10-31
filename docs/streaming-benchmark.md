@@ -128,3 +128,83 @@ The JSON report includes hardware, OS/kernel, filesystem, Rust version, DuckDB
 version and deployment target. All runs share process and post-creation OS
 caches; there is no cold-cache claim. Retain exact commands/build logs beside
 reports when using results to choose a subsequent investigation.
+
+## Bounded next-batch prefetch experiment
+
+`--compare-prefetch --run-small` or the separately authorized
+`--compare-prefetch --allow-large 100000` adds a candidate mode. Each mode gets
+one warmup and three measured repeats over the same owned fixture. Repeat mode
+order alternates (serial/candidate/fallback, then fallback/candidate/serial).
+The unprofiled warmup remains the saved SQL parity reference. The example
+requires nonempty worker metadata batches on the 100k fixture; worker calls
+that only observe EOF do not establish meaningful prefetch.
+
+This developer route uses the same bulk syscall, returned-attribute parser,
+per-entry stat fallback, guarded walk, streaming store and finalization. It
+creates a helper lazily only inside the explicit prefetch profiling API.
+Normal scan options, APIs, policy fingerprints and threading remain serial.
+There is no UI or CLI product activation.
+
+One helper owns at most one outstanding job/result globally. A job transfers
+an existing 64 KiB raw buffer and one owned `F_DUPFD_CLOEXEC` descriptor; the
+helper never receives a `DIR` pointer. The duplicate shares the bulk directory
+offset, and the coordinator does not enumerate that directory again until it
+receives the result. Descriptor-relative metadata/open operations do not change
+that offset. The helper closes its descriptor before sending the result.
+Parsing and all entry emission remain on the coordinator, preserving preorder,
+contiguous subtrees and hardlink ownership. No child is preopened for prefetch.
+
+Batches containing nonregular entries or missing metadata stay serial. This
+prevents a parent batch containing directories from reserving the global slot
+with a speculative EOF while its large descendants are processed. If a retained
+parent result nevertheless exists, descendants use ordinary synchronous bulk
+calls until it is consumed. The occupied slot remains reserved even after the
+worker finishes, so neither queued results nor raw buffers accumulate with
+fanout/depth. There is one transferred raw buffer, no second decoded queue,
+and at most one extra descriptor (below the two-buffer/two-descriptor limit).
+The existing per-directory buffer/decoded rows are unchanged bounds.
+
+The first bulk call is synchronous, preserving unsupported-first-call
+rewind/readdir behavior without outstanding helper work. Later helper failures
+remain enumeration/coverage errors. Bulk/directory drop drains outstanding
+work before closing the directory, and the profiling scope joins its helper
+on completion, error, stop or unwind. A synchronous kernel call cannot be
+forcibly preempted; cancellation can wait for that call to return.
+
+`prefetch_worker_overlapping` reports actual helper syscall calls and elapsed
+wall time separately from coordinator syscall timings. `prefetch_records` and
+`prefetch_nonempty_batches` distinguish useful metadata from EOF. Helper time
+can overlap row processing and Parquet flush callbacks: never add it to the
+exclusive top-level sum or subtract it from walk-only time. Candidate
+`walk_uninstrumented_residual_ms` is null when helper calls occur; serial
+residual semantics remain unchanged. Total wall, exclusive accounting,
+validation timing and sampled/lifetime resource definitions are unchanged.
+
+The focused example tests exercise actual nonempty worker batches, complete
+saved SQL parity, forced fallback, stop/publication and a post-traversal budget
+failure. Engine tests cover the occupied-result slot, owned-descriptor syscall
+errors, later-bulk error behavior, emit error, cancellation and panic drainage.
+No performance threshold is inferred from these functional tests.
+
+A warm APFS/M3 Max/macOS 26.6.2 run (minimum OS 14 compile only) produced:
+
+| Owned fixture | Serial median ms | Prefetch median ms | Fallback median ms | Prefetch wall reduction |
+|---|---:|---:|---:|---:|
+| 2,009 paths | 208.150 | 206.541 | 206.316 | 0.77% |
+| 100,089 paths | 629.224 | 627.916 | 834.439 | 0.21% |
+
+All nine measured runs per fixture had zero saved SQL mismatches. Each large
+candidate run prefetched 79,871 records in 128 nonempty batches. Walk-only wall
+fell from 231–242 ms to 159–165 ms, while watcher join rose from 10–17 ms to
+81–90 ms; complete wall remained almost unchanged. The predeclared 20% large
+end-to-end reduction was not achieved. Small regression, exact parity and
+resource limits passed: complete large benchmark process lifetime RSS was
+318,832,640 bytes; sampled FD maximum 97; sampled stage maximum 12,724,021
+logical bytes. These are one warm-fixture experiment and the resource
+measurement limits above apply. There is no production activation or inference
+that isolated traversal gains satisfy the end-to-end threshold.
+
+MAIN's decision for this delivery is **NO GO to production parallelization
+(issue #10)** because the predeclared end-to-end threshold failed. The
+candidate remains developer-only. Cold-cache behavior, other hardware and
+other real workloads are unmeasured; their performance remains unknown.
