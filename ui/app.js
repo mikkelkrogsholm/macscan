@@ -1,3 +1,4 @@
+import {createCoverageDialog} from './coverage.mjs';
 import {createProfileState,renderProfile} from './file-profile.mjs';
 import {createGrowthState,exactBytes,signedDelta,knownBytes,growthTarget,growthCounts,elapsedLabel} from './growth.mjs';
 import {createInsightsState,insightLabel,insightBytes,contextLabel,insightTarget,insightGuidance} from './insights.mjs';
@@ -48,7 +49,14 @@ $('#app').innerHTML=`
  </section>
  <section id="inspector" class="inspector"><div class="inspector-symbol">${''}</div><div class="inspector-main"><strong id="inspect-name">Ingen måling valgt</strong><div id="inspect-category"></div><div id="inspect-path">Vælg en mappe eller en eksisterende måling i venstre side.</div></div><div class="inspector-numbers"><span id="inspect-logical"></span><span id="inspect-allocated"></span></div><div class="inspector-actions"><button id="copy" class="plain" disabled>Kopiér sti</button><button id="reveal" class="plain" disabled>Vis i Finder ↗</button></div></section>
  <footer><span id="provenance">Rust · Parquet · DuckDB</span><span id="measure-note">Allokeret er ikke nødvendigvis frigørbar APFS-plads.</span></footer>
-</main><div id="toast" class="toast hidden" role="status"></div><dialog id="coverage-dialog" aria-labelledby="coverage-title"><h2 id="coverage-title">Områder, der ikke kunne måles</h2><p>Macscan kan have andre macOS-rettigheder end Codex. Vælg en mindre mappe, eller giv selv appen den nødvendige adgang i macOS.</p><p id="coverage-count"></p><ul id="coverage-issues"></ul><form method="dialog"><button class="primary">Luk</button></form></dialog>`;
+</main><div id="toast" class="toast hidden" role="status"></div><dialog id="coverage-dialog" aria-labelledby="coverage-title"><header class="coverage-heading"><h2 id="coverage-title">Dækning fra gemte målinger</h2><form method="dialog"><button class="primary" autofocus>Luk</button></form></header><div id="coverage-body"></div></dialog>`;
+
+const coverageDialog=createCoverageDialog($('#coverage-dialog'),{
+ fetch:args=>invoke('coverage',args),
+ openEntry:target=>openScan(target.scanId,Boolean(state.machine),target.entry).catch(error),
+ privacy:()=>$('#privacy-help').click()
+});
+function coverageButton(action){const details=el('button','coverage-button','Se detaljer om dækning');details.addEventListener('click',action);$('#coverage').append(details);}
 $('.inspector-symbol').append(icon('folder'));
 function error(e){const s=String(e);$('#error').title=s;$('#error').textContent=s.includes('Out of Memory')?'Beregningen nåede hukommelsesgrænsen. Målingen kunne ikke færdiggøres; dine data er ikke ændret.':s;$('#error').classList.remove('hidden');}
 function clearError(){$('#error').classList.add('hidden');}
@@ -84,6 +92,7 @@ function renderVolumes(){
 }
 async function refresh(){const r=await invoke('bootstrap');state.scans=r.scans;state.volumes=r.volumes.records;state.store=r.store;renderHistory();renderVolumes();$('#history-location').title=state.store;return r;}
 async function openScan(id,keepMachine=false,entry='0'){
+ coverageDialog.close();
  profile.reset({active:false,scope:'current',age:'',size:'',typeKey:null,typeLabel:null,types:false,sortCount:false});
  if(state.scans.find(s=>s.scan_id===id)?.kind==='machine')return showMachine(await invoke('machine_session',{sessionId:id}));
  if(!keepMachine)state.machine=null;state.overview=false;$('#search').disabled=false;$('#changes-tab').disabled=false;
@@ -92,6 +101,7 @@ async function openScan(id,keepMachine=false,entry='0'){
  state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate(entry);renderHistory();
 }
 function showMachine(session){
+ coverageDialog.close();
  profile.reset({active:false});
  insights.reset({scope:'all',category:null});growth.reset();$('#insights-tab').disabled=true;
  ++state.request;++state.listRequest;clearError();state.machine=session;state.overview=true;state.scan=session.session_id;state.mode='files';state.colors.clear();
@@ -100,6 +110,7 @@ function showMachine(session){
  $('#rescan').textContent='Scan hele Mac’en';$('#child-count').textContent=view.child_count;$('#search').value='';$('#search').disabled=true;$('#changes-tab').disabled=true;
  for(const m of ['allocated','logical'])$('#'+m).disabled=true;
  $('#coverage').classList.remove('hidden');$('#coverage').textContent=session.coverage_note+(view.accountingOverlap?' Volumenallokering overstiger containerforbruget; grafen er normaliseret, ikke en frigørbar sum.':'');
+ coverageButton(()=>coverageDialog.openMachine(session));
  renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderHistory();
  $('#center-size').textContent=formatBytes(session.used_bytes);$('#center-note').textContent='Diskforbrug fra macOS';$('#chart-context').textContent='APFS-volumener · ikke filsummer';
  $('#provenance').textContent=formatBytes(session.free_bytes)+' ledigt · eksterne drev og diskimages tælles ikke oveni';
@@ -112,13 +123,9 @@ async function navigate(entry){
   state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=view.children.next_cursor;$('#search').value='';
   $('#view-title').textContent=view.selected.name_display||rootName(view.scope.root_display);$('#scan-stamp').textContent='Målt '+date(view.started_at)+' · '+new Intl.NumberFormat('da-DK').format(view.entry_count)+' poster · ikke live';
   $('#rescan').textContent='Scan igen';$('#child-count').textContent=view.child_count;renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderCompareOptions();
-  const partial=view.status!=='complete';$('#coverage').classList.toggle('hidden',!partial);
-  $('#coverage').textContent=partial?'Delvist scan. Grafen viser kun det observerede minimum — manglende adgang og udeladte områder er ikke nul bytes.':'';
-  if(partial){const details=el('button','coverage-button','Se detaljer om dækning');details.addEventListener('click',()=>{
-    $('#coverage-count').textContent=view.error_count+' registrerede afvigelser. Viser op til otte eksempler.';
-    const list=$('#coverage-issues');list.replaceChildren();for(const issue of view.issues??[])list.append(el('li','',(issue.path_display??'Post '+issue.entry_id)+' — '+issue.detail));
-    if(!list.children.length)list.append(el('li','','Se scanbegrænsningen ovenfor; manglende adgang eller udeladte områder er ikke målt som nul.'));
-    $('#coverage-dialog').showModal();});$('#coverage').append(details);}
+  const partial=view.status!=='complete';$('#coverage').classList.remove('hidden');
+  $('#coverage').textContent=partial?'Delvis måling. Grafen viser det observerede minimum; ukendte områder er ikke nul bytes.':'Gemt måling · se registrerede hændelser og evidens om dækning.';
+  const coverageScan=state.scan;coverageButton(()=>coverageDialog.open(coverageScan,view.scope.root_display));
   if(state.mode==='files'&&profile.active)loadProfile();
   if(state.mode==='insights')loadInsights();
   if(state.mode==='changes')loadGrowth();
@@ -343,7 +350,7 @@ $('#privacy-help').addEventListener('click',async()=>{
  try{await invoke('open_privacy');}catch(e){error(e);}
  toast('Tilføj denne Macscan.app i Fuld diskadgang. Efter en lokal genbygning kan du skulle fjerne og tilføje den igen. Genstart appen bagefter.');
 });
-document.addEventListener('keydown',e=>{if(e.metaKey&&e.key==='o'){e.preventDefault();folderScan();}if((e.altKey&&e.key==='ArrowLeft'||e.key==='Backspace')&&!['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)&&state.view?.selected.parent_id!==null&&state.view){e.preventDefault();navigate(state.view.selected.parent_id);}});
+document.addEventListener('keydown',e=>{if($('#coverage-dialog').open)return;if(e.metaKey&&e.key==='o'){e.preventDefault();folderScan();}if((e.altKey&&e.key==='ArrowLeft'||e.key==='Backspace')&&!['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)&&state.view?.selected.parent_id!==null&&state.view){e.preventDefault();navigate(state.view.selected.parent_id);}});
 renderChart();
 try{const r=await refresh();if(r.explicit_store)localStorage.setItem('macscan.history',r.store);if(!r.explicit_store&&localStorage.getItem('macscan.history')){try{const h=await invoke('restore_history',{path:localStorage.getItem('macscan.history')});state.scans=h.scans;state.store=h.store;$('#history-location').title=h.store;renderHistory();}catch{localStorage.removeItem('macscan.history');}}
  const initial=state.scans[0];if(initial)await openScan(initial.scan_id);

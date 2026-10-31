@@ -118,3 +118,69 @@ limit. An expired budget prevents discovery from opening/enumerating the root.
 Synchronous OS calls or progress callbacks already in flight are not preempted;
 the scanner checks the deadline before the next read. Unlimited scans retain
 the existing initial breadth discovery.
+
+## Desktop dialog and run B acceptance
+
+Every saved measurement exposes **Se detaljer om dækning**, including complete
+zero-event and legacy measurements. The dialog always labels the whole saved
+root and saved start/end time; selecting a project in the graph does not change
+its counters. The async native `coverage` command delegates to `Store::coverage`
+with a fixed limit of 10. It has no SQL, classification or sample recounting.
+Nine global reason totals remain exact decimal strings. Legacy reason totals
+are shown as unknown, independently of known saved event totals and partial
+coverage. Saved stopped/unknown states and proven read-time volume invalidation
+have separate wording. A zero-event report asserts only that no events were
+registered in that saved measurement.
+
+The reason selector changes examples only. Next-page navigation replaces the
+previous bounded page. Retention-cap truncation is described separately from
+more retained examples on a later page. Closing/changing the report invalidates
+pending success and error responses. Paths and details use text nodes and wrap;
+shortened/unavailable paths are explicit. Example navigation uses only the
+returned saved scan and entry ID, including the saved parent for a failed child,
+then opens Indhold. It never executes a displayed path. Access guidance can
+open the existing explicit Fuld diskadgang button; no permissions or retries are
+automatic. The native modal supports Escape, focus restoration, bounded Tab
+navigation and a persistent close control.
+
+Whole-Mac coverage shows the session's saved volume states, root and session
+interval without resampling inventory or summing reason counts. At most ten
+saved volume rows render per replacement page. Completed rows can open the
+same per-measurement report, with a back button to the saved volume list.
+Unknown/execution/mount states are not zero events. No historical metadata is
+rewritten.
+
+`ui/coverage.test.mjs` exercises exact/null values, saved state wording, bounded
+page replacement and stale-answer rejection. The optional
+`ui/coverage.browser.mjs` uses installed Playwright and a separate headless
+Chrome with nonempty ordinary children. It covers complete/partial/legacy,
+reason/page/reset, stopped/unknown state, unavailable/shortened child paths,
+parent drilldown, delayed scan navigation, error/retry, invalidation, stale
+close responses, machine report/back/breadcrumb, 13-volume paging, and keyboard
+focus, checking for page errors and the app error banner. Existing profile and
+growth browser checks cover shared navigation regressions.
+
+The ignored `evidence/issue-6B/native-history` copies only run A's three synthetic
+saved measurements and adds a directly constructed `661-1.machine.json`.
+`evidence/issue-6B/fixtures.json` records the complete synthetic session. Its
+saved interval is 2026-10-31 12:15:00–12:15:01 UTC. The done rows reference
+`660-1` (complete) and `660-2` (partial), each with three saved entries; the
+session has six entries. Other rows are error, unmounted, cancelled,
+not_scanned and pending, with no invented scan IDs, event counters or entry
+counts. Synthetic OS capacity is 1,000,000,000,000 bytes, used 800,000,000,000,
+free 200,000,000,000; each synthetic volume has 10,000,000,000 bytes of saved
+OS usage. This is separate capacity accounting, not a sum of file snapshots.
+The opt-in desktop test `write_native_machine_coverage_fixture` requires fresh
+`MACSCAN_COVERAGE_FIXTURE_OUT` and `MACSCAN_COVERAGE_SOURCE` pointing to run A's
+synthetic history. It never calls inventory, `machine::plan` or any scanner.
+It also verifies native transport parity with Store for all three measurements
+and the access-denied filter. Normal desktop tests verify legacy transport
+parity and reject an invalid reason.
+
+For native acceptance, launch the local built app with `--store` pointing to
+that run B history. Open the whole-Mac history row, then its coverage dialog;
+inspect both completed volume reports and return to the saved list. Open the
+individual 660-1/2/3 history rows for zero-event, capped partial and legacy
+reports. Only synthetic saved metadata is needed; the `/synthetic/` source paths
+need not exist. Do not rescan or open privacy settings during this acceptance.
+Browser evidence cannot substitute for this separate native acceptance.

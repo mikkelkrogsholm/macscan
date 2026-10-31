@@ -153,6 +153,15 @@ async fn insights(
         ).map_err(err)
     }).await
 }
+// The native dialog shares the immutable, bounded Store report with the CLI.
+fn coverage_at(path: &std::path::Path, scan_id: &str, reason: Option<&str>, cursor: Option<&str>) -> Reply {
+    Store::open(path, false).map_err(err)?.coverage(scan_id, reason, cursor, 10, &AtomicBool::new(false)).map_err(err)
+}
+#[tauri::command]
+async fn coverage(scan_id: String, reason: Option<String>, cursor: Option<String>, state: State<'_, Desktop>) -> Reply {
+    let path = store_path(&state)?;
+    blocking(move || coverage_at(&path, &scan_id, reason.as_deref(), cursor.as_deref())).await
+}
 // Keep native growth requests on the same saved-data contract as the CLI.
 fn growth_at(path: &std::path::Path, before: &str, after: &str, query: &GrowthQuery) -> Reply {
     Store::open(path, false).map_err(err)?.growth(before, after, query, &AtomicBool::new(false)).map_err(err)
@@ -435,6 +444,11 @@ mod tests {
             };
             store.save_with_cancel(&scan, STORE_BUDGET, &AtomicBool::new(false)).unwrap();
         }
+        let native_coverage = coverage_at(&path, "600-2", None, None).unwrap();
+        assert_eq!(native_coverage, store.coverage("600-2", None, None, 10, &AtomicBool::new(false)).unwrap());
+        assert_eq!(native_coverage["quality"], "legacy_samples_only");
+        assert!(native_coverage["reason_counts"].is_null());
+        assert!(coverage_at(&path, "600-2", Some("invented"), None).is_err());
         for types in [false, true] {
             for sort_count in [false, true] {
                 if sort_count && !types { continue; }
@@ -515,6 +529,7 @@ fn main() {
             list_children,
             insights,
             growth,
+            coverage,
             file_profile,
             compare_scans,
             start_scan,
