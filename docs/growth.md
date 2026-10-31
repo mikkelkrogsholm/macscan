@@ -131,3 +131,49 @@ cross-product. Resource errors include the concrete recovery `--entry ID` for a
 smaller saved directory; failed/partial top results are never presented as a
 complete ranking. These limits are not whole-process RSS guarantees. No age,
 diagnostics, APFS uniqueness or forecasting is inferred.
+
+## Native Ændringer tab
+
+The async Tauri `growth` command forwards the saved BEFORE/AFTER pair, AFTER
+entry scope, metric, grouping, group, file view, filter and opaque cursor to
+`Store::growth` with a ten-row maximum. It performs no independent accounting.
+The existing Ændringer tab defaults to area contributions. Its scope selector
+chooses the whole measurement or the current saved AFTER graph entry as the
+explicit map/project. Category labels and review guidance share the insights UI
+presentation. Category attribution remains the API's `insights-1` contract.
+
+Both saved completion dates, the exact elapsed interval and metric remain visible.
+All-file scope totals are separate from the filtered changed-file contributions.
+Bytes and signed deltas use BigInt; null values stay unknown, with observed minima
+shown independently. Counts describe observed saved contributing paths. Partial
+scope coverage is distinct from context coverage; a complete selected child can
+still produce exact results inside a partial measurement.
+
+Open a group for its changed files, or choose **Se alle ændrede filer**. The
+six filters are all, grown, shrunk, added, removed and unknown. **Næste side**
+replaces the current bounded page. Metric, scope, graph entry, pair, grouping,
+filter and drilldown changes invalidate cursors and stale responses. Graph and
+metric changes preserve the tab, selected scope and still-eligible baseline.
+The baseline selector offers earlier same-root/policy candidates; the API also
+verifies saved raw root, OS, volume, chronological time and current-format context.
+An incompatible candidate returns an explicit error rather than a ranking.
+
+File analysis uses the returned `drilldown_scan_id` and `drilldown_entry_id` as a
+pair, including BEFORE-only removed files and AFTER anchors for type transitions.
+The row identifies the saved scan it opens. Existing file information, Finder and
+copy actions are available after opening file analysis. Resource errors explain
+how to choose a smaller graph directory, select current scope and retry.
+
+Validation: `node --test ui/*.test.mjs` covers exact values, null/lower-bound
+presentation, cursor invalidation, page replacement, stale responses and saved
+file targets. The desktop synthetic-history test compares native results against
+`Store::growth` for both groupings and views, with invalid pair/filter rejection.
+`ui/growth.browser.mjs` is an optional browser interaction smoke using a mocked
+Tauri transport and an existing Playwright installation. Run it with
+`PLAYWRIGHT_MODULE=file:///absolute/path/to/playwright/index.mjs node ui/growth.browser.mjs`
+(or ordinary `playwright` resolution). It launches a separate headless installed
+Chrome profile, makes no real scans, downloads nothing and adds no dependencies.
+`MACSCAN_BROWSER_CHANNEL` can select another already installed supported channel.
+Native acceptance should launch the local app against saved synthetic history,
+select Ændringer, choose logical/current-project, inspect group and all-file
+views, and open a removed file to verify the saved BEFORE measurement is selected.

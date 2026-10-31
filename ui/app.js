@@ -1,4 +1,5 @@
-import {createInsightsState,insightLabel,insightBytes,contextLabel,insightTarget} from './insights.mjs';
+import {createGrowthState,exactBytes,signedDelta,knownBytes,growthTarget,growthCounts,elapsedLabel} from './growth.mjs';
+import {createInsightsState,insightLabel,insightBytes,contextLabel,insightTarget,insightGuidance} from './insights.mjs';
 import {categoryPresentation} from './categories.mjs';
 import {arcPath,sectors,weight,formatBytes,fraction} from './sunburst.mjs';
 import {createEntryMenu} from './context-menu.mjs';
@@ -10,6 +11,7 @@ const icons={folder:'M3 7h6l2 2h10v11H3z M3 7V4h6l2 3',disk:'M4 3h16v18H4z M8 17
 function icon(name){const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('viewBox','0 0 24 24');s.setAttribute('aria-hidden','true');s.classList.add('icon');const p=document.createElementNS(s.namespaceURI,'path');p.setAttribute('d',icons[name]??icons.file);s.append(p);return s;}
 const state={view:null,scan:null,metric:'allocated',scans:[],volumes:[],store:'',rows:[],cursor:null,colors:new Map(),request:0,listRequest:0,selected:null,scanning:false,mode:'files',compareBefore:null,compareCursor:null,searchTimer:null};
 const insights=createInsightsState();
+const growth=createGrowthState();
 state.machine=null;state.overview=false;
 $('#app').innerHTML=`
 <aside class="sidebar">
@@ -36,6 +38,7 @@ $('#app').innerHTML=`
    <section id="insights-panel" class="insights-panel hidden" aria-label="Indsigter fra gemt måling"></section>
    <div id="file-controls" class="search-row"><label for="search">${''}<span>Søg i denne mappe</span></label><input id="search" type="search" placeholder="Fil- eller mappenavn…" autocomplete="off"></div>
    <div id="compare-controls" class="compare-controls hidden"><label for="before-scan">Sammenlign med</label><select id="before-scan"></select></div>
+   <section id="growth-panel" tabindex="-1" class="insights-panel hidden" aria-label="Vækst mellem gemte målinger"></section>
    <div class="list-head"><span id="list-label">Navn</span><span id="size-heading">Størrelse ↓</span></div><div id="rows" class="rows" tabindex="-1" role="list" aria-label="Filer og mapper"></div><button id="more" class="more hidden">Vis flere poster</button><div id="list-message" class="list-message">Her kommer din mappeoversigt.</div>
   </div>
  </section>
@@ -76,15 +79,15 @@ function renderVolumes(){
  }
 }
 async function refresh(){const r=await invoke('bootstrap');state.scans=r.scans;state.volumes=r.volumes.records;state.store=r.store;renderHistory();renderVolumes();$('#history-location').title=state.store;return r;}
-async function openScan(id,keepMachine=false){
+async function openScan(id,keepMachine=false,entry='0'){
  if(state.scans.find(s=>s.scan_id===id)?.kind==='machine')return showMachine(await invoke('machine_session',{sessionId:id}));
  if(!keepMachine)state.machine=null;state.overview=false;$('#search').disabled=false;$('#changes-tab').disabled=false;
  for(const m of ['allocated','logical'])$('#'+m).disabled=false;
- insights.reset({scope:'all',category:null});$('#insights-tab').disabled=false;
- state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate('0');renderHistory();
+ insights.reset({scope:'all',category:null});growth.reset({scope:'all',group:null,files:false});state.compareBefore=null;$('#insights-tab').disabled=false;
+ state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate(entry);renderHistory();
 }
 function showMachine(session){
- insights.reset({scope:'all',category:null});$('#insights-tab').disabled=true;
+ insights.reset({scope:'all',category:null});growth.reset();$('#insights-tab').disabled=true;
  ++state.request;++state.listRequest;clearError();state.machine=session;state.overview=true;state.scan=session.session_id;state.mode='files';state.colors.clear();
  const view=machineView(session);state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=null;state.compareCursor=null;
  $('#view-title').textContent='Hele Mac’en';$('#scan-stamp').textContent='Målt '+date(session.started_at)+' · '+new Intl.NumberFormat('da-DK').format(session.entry_count??0)+' poster · '+(session.status==='cancelled'?'stoppet':'gemt lokalt');
@@ -96,10 +99,10 @@ function showMachine(session){
  $('#provenance').textContent=formatBytes(session.free_bytes)+' ledigt · eksterne drev og diskimages tælles ikke oveni';
 }
 async function navigate(entry){
- insights.reset({category:null});
+ insights.reset({category:null});growth.reset({group:null,files:false});
  const token=++state.request;++state.listRequest;clearTimeout(state.searchTimer);clearError();$('.workspace').classList.add('loading');
  try{const view=await invoke('view_scan',{scanId:state.scan,entry:Number(entry),metric:state.metric});if(token!==state.request)return;
-  state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=view.children.next_cursor;state.mode=state.mode==='insights'?'insights':'files';state.compareCursor=null;$('#search').value='';
+  state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=view.children.next_cursor;state.compareCursor=null;$('#search').value='';
   $('#view-title').textContent=view.selected.name_display||rootName(view.scope.root_display);$('#scan-stamp').textContent='Målt '+date(view.started_at)+' · '+new Intl.NumberFormat('da-DK').format(view.entry_count)+' poster · ikke live';
   $('#rescan').textContent='Scan igen';$('#child-count').textContent=view.child_count;renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderCompareOptions();
   const partial=view.status!=='complete';$('#coverage').classList.toggle('hidden',!partial);
@@ -110,6 +113,7 @@ async function navigate(entry){
     if(!list.children.length)list.append(el('li','','Se scanbegrænsningen ovenfor; manglende adgang eller udeladte områder er ikke målt som nul.'));
     $('#coverage-dialog').showModal();});$('#coverage').append(details);}
   if(state.mode==='insights')loadInsights();
+  if(state.mode==='changes')loadGrowth();
   $('#provenance').textContent=(view.status==='complete'?'Komplet':'Delvis')+' måling · '+(state.metric==='logical'?'Logiske filstørrelser':'Hardlink-tilskrevet allokering');
  }catch(e){if(token===state.request)error(e);}finally{if(token===state.request)$('.workspace').classList.remove('loading');}
 }
@@ -172,7 +176,8 @@ function renderMode(){
  for(const mode of ['files','changes','insights'])$('#'+mode+'-tab').setAttribute('aria-pressed',String(state.mode===mode));
  $('#file-controls').classList.toggle('hidden',changes||active);$('#compare-controls').classList.toggle('hidden',!changes);
  $('#insights-panel').classList.toggle('hidden',!active);
- for(const selector of ['.list-head','#rows','#more','#list-message'])$(selector).classList.toggle('hidden',active||selector==='#more'&&!(changes?state.compareCursor:state.cursor)||selector==='#list-message'&&state.rows.length>0);
+ $('#growth-panel').classList.toggle('hidden',!changes);
+ for(const selector of ['.list-head','#rows','#more','#list-message'])$(selector).classList.toggle('hidden',active||changes||selector==='#more'&&!(changes?state.compareCursor:state.cursor)||selector==='#list-message'&&state.rows.length>0);
  $('#insights-hint').classList.toggle('hidden',!!state.view&&!state.overview);
  $('#insights-hint').textContent=state.overview?'Indsigter gælder én gemt filscanning. Vælg en scannet volumen i grafen eller listen.':'Vælg en gemt måling for at se indsigter.';
 }
@@ -202,23 +207,81 @@ function renderInsights(){
   const item=el('article','insight-row');item.setAttribute('role','listitem');
   const button=el('button','insight-open',data.mode==='categories'?insightLabel(row.category):row.path_display);button.title=data.mode==='categories'?'Se bidragende stier':'Åbn filanalyse';
   button.addEventListener('click',()=>{const target=insightTarget(data.mode,row);if(target.category){insights.reset({category:target.category});loadInsights();}else{insights.reset();state.mode='files';navigate(target.entry);}});
-  item.append(button,el('p','insight-size',insightBytes(row)+' · '+row.file_path_count+' filstier'),el('p','',row.explanation),el('p','',row.guidance),el('p','muted',contextLabel(row.context_coverage)));
+  item.append(button,el('p','insight-size',insightBytes(row)+' · '+row.file_path_count+' filstier'),el('p','',row.explanation),el('p','',insightGuidance(row.category,row.guidance)),el('p','muted',contextLabel(row.context_coverage)));
   const details=el('details'),summary=el('summary','','Om klassifikationen');details.append(summary,el('p','',row.rule_id+' · '+row.rule_version+' · '+row.evidence));item.append(details);list.append(item);
  }
  if(!data.records.length)panel.append(el('p','insights-notice','Ingen observerede almindelige filer i dette udvalg. Ved delvis dækning beviser dette ikke, at området er tomt.'));
  if(insights.cursor){const more=el('button','more','Næste side');more.addEventListener('click',()=>{loadInsights(true);panel.scrollTop=0;});panel.append(more);}
  const details=el('details'),summary=el('summary','','Om optælling og fortolkning');details.append(summary,el('p','',data.count_note),el('p','',data.attribution_note));panel.append(details);
 }
-function renderCompareOptions(){const select=$('#before-scan');select.replaceChildren();const policy=state.scans.find(s=>s.scan_id===state.scan)?.policy;const eligible=state.scans.filter(s=>s.scan_id!==state.scan&&s.root===state.view.scope.root_display&&s.policy===policy&&s.started_at<state.view.started_at);
- if(!eligible.length){select.append(new Option('Ingen sammenlignelig tidligere måling',''));state.compareBefore=null;return;}
- for(const s of eligible)select.append(new Option(date(s.started_at)+(s.status==='partial'?' · delvis':''),s.scan_id));state.compareBefore=select.value;
+function renderCompareOptions(){
+ const select=$('#before-scan');select.replaceChildren();const policy=state.scans.find(s=>s.scan_id===state.scan)?.policy;
+ const eligible=state.scans.filter(s=>s.kind!=='machine'&&s.scan_id!==state.scan&&s.root===state.view.scope.root_display&&s.policy===policy&&s.started_at<state.view.started_at);
+ if(!eligible.length){select.append(new Option('Ingen tidligere kandidat til sammenligning',''));state.compareBefore=null;return;}
+ for(const s of eligible)select.append(new Option(date(s.started_at)+(s.status==='partial'?' · delvis':'')+' · '+s.scan_id,s.scan_id));
+ state.compareBefore=eligible.some(s=>s.scan_id===state.compareBefore)?state.compareBefore:eligible[0].scan_id;select.value=state.compareBefore;
+ select.title='Tidligere målinger med samme rod og politik. API’en kontrollerer også OS, volumen og gemt format.';
 }
-async function loadRows(append=false){if(state.overview||state.mode==='insights')return;const token=++state.listRequest;clearError();try{
- let r;if(state.mode==='changes'){if(!state.compareBefore){state.rows=[];state.compareCursor=null;renderRows();$('#list-message').textContent='Scan mappen igen for at få to sammenlignelige målinger. Ældre prototype-målinger kan stadig åbnes.';return;}
-  r=await invoke('compare_scans',{before:state.compareBefore,after:state.scan,metric:state.metric,cursor:append?state.compareCursor:null});if(token!==state.listRequest)return;state.compareCursor=r.next_cursor;
- }else{r=await invoke('list_children',{scanId:state.scan,entry:Number(state.view.selected.entry_id),metric:state.metric,cursor:append?state.cursor:null,search:$('#search').value});if(token!==state.listRequest)return;state.cursor=r.next_cursor;}
- state.rows=append?[...state.rows,...r.records]:r.records;renderRows();
- }catch(e){if(token!==state.listRequest)return;state.rows=[];state.cursor=null;state.compareCursor=null;renderRows();$('#list-message').textContent='Visningen kunne ikke beregnes. Vælg en anden måling eller mappe.';error(e);}}
+async function loadRows(append=false){
+ if(state.overview||state.mode==='insights')return;
+ if(state.mode==='changes')return loadGrowth(append);
+ const token=++state.listRequest;clearError();try{
+ const r=await invoke('list_children',{scanId:state.scan,entry:Number(state.view.selected.entry_id),metric:state.metric,cursor:append?state.cursor:null,search:$('#search').value});
+ if(token!==state.listRequest)return;state.cursor=r.next_cursor;state.rows=append?[...state.rows,...r.records]:r.records;renderRows();
+ }catch(e){if(token!==state.listRequest)return;state.rows=[];state.cursor=null;renderRows();error(e);}
+}
+async function loadGrowth(next=false){
+ if(state.overview||!state.view||state.mode!=='changes')return;
+ ++state.listRequest;clearTimeout(state.searchTimer);
+ if(!state.compareBefore){growth.reset();renderGrowth();return;}
+ const pending=growth.load(args=>invoke('growth',args),{before:state.compareBefore,after:state.scan,entry:Number(growth.scope==='all'?'0':state.view.selected.entry_id),metric:state.metric},next);
+ renderGrowth();if(await pending&&state.mode==='changes')renderGrowth();
+}
+function renderGrowth(){
+ const panel=$('#growth-panel'),focused=panel.contains(document.activeElement),activeId=focused?document.activeElement.id:null;panel.replaceChildren();panel.setAttribute('aria-busy',String(growth.busy));
+ const selectControl=(id,label,options,value,onchange)=>{
+  const l=el('label','',label);l.htmlFor=id;const select=el('select');select.id=id;
+  for(const [text,key] of options)select.append(new Option(text,key));select.value=value;select.addEventListener('change',()=>onchange(select.value));panel.append(l,select);
+ };
+ selectControl('growth-scope','Område for ændringer',[['Hele målingen','all'],['Aktuel mappe / projekt: '+(state.view.selected.name_display||rootName(state.view.scope.root_display)),'current']],growth.scope,value=>{growth.reset({scope:value,group:null,files:false});loadGrowth();});
+ selectControl('growth-grouping','Fordel bidrag efter',[['Område','area'],['Kategori','category']],growth.grouping,value=>{growth.reset({grouping:value,group:null,files:false});loadGrowth();});
+ selectControl('growth-change','Filændringer',[['Alle ændringer','all'],['Vokset','grown'],['Krympet','shrunk'],['Nye','added'],['Fjernede','removed'],['Ukendte','unknown']],growth.change,value=>{growth.reset({change:value});loadGrowth();});
+ if(focused)(activeId?document.getElementById(activeId):panel)?.focus({preventScroll:true});
+ if(growth.files){const back=el('button','more','← Tilbage til grupper');back.addEventListener('click',()=>{growth.reset({files:false,group:null});loadGrowth();});panel.append(back);}
+ else{const all=el('button','more','Se alle ændrede filer');all.addEventListener('click',()=>{growth.reset({files:true,group:null});loadGrowth();});panel.append(all);}
+ const status=el('p','insights-status');status.setAttribute('role','status');panel.append(status);
+ if(!state.compareBefore){status.textContent='Vælg to gemte målinger af samme rod. Ingen tidligere kandidat er tilgængelig.';return;}
+ if(growth.busy){status.textContent='Beregner ændringsbidrag fra de gemte målinger…';return;}
+ if(growth.error){status.textContent='Ændringer kunne ikke beregnes. Parret kan være inkompatibelt eller mangle gemt kontekst. Ved hukommelsesgrænsen: vælg en mindre mappe i grafen, vælg Aktuel mappe / projekt og prøv igen.';panel.append(el('p','insights-notice',growth.error));const retry=el('button','more','Prøv igen');retry.addEventListener('click',()=>loadGrowth());panel.append(retry);return;}
+ const data=growth.data;if(!data)return;
+ const savedDate=value=>value?new Date(value).toLocaleString('da-DK',{dateStyle:'medium',timeStyle:'long'}):'Ukendt afslutningstid';
+ status.textContent='Før: '+savedDate(data.interval.before_measured_at)+' · Efter: '+savedDate(data.interval.after_measured_at)+' · '+(data.metric==='logical'?'Logisk':'Allokeret');
+ panel.append(el('p','insights-scope','Interval: '+elapsedLabel(data.interval.elapsed_ns)),el('p','insights-scope','Område: '+data.scope.after.path_display));
+ panel.append(el('p',data.coverage.complete?'insights-status':'insights-notice',data.coverage.complete?'Komplet dækning af det valgte område i begge målinger.':'Delvis dækning. Ukendte sider og ændringer er ikke nul eller en sikker nedgang. Komplette undermapper kan stadig undersøges.'));
+ const before=data.totals.before,after=data.totals.after;
+ panel.append(el('p','insights-total','Alle almindelige filer i området (uafhængigt af filter):'),el('p','','Før: '+knownBytes(before.bytes,before.observed_lower_bound_bytes)+' · '+before.file_path_count+' observerede filstier'),el('p','','Efter: '+knownBytes(after.bytes,after.observed_lower_bound_bytes)+' · '+after.file_path_count+' observerede filstier'));
+ const contribution=(row,target)=>{
+  target.append(el('p','insight-size','Ændringsbidrag: '+signedDelta(row.delta_bytes)),el('p','','Bidragende ændrede filer før: '+knownBytes(row.changed_file_before_bytes,row.observed_changed_file_before_bytes)),el('p','','Bidragende ændrede filer efter: '+knownBytes(row.changed_file_after_bytes,row.observed_changed_file_after_bytes)),el('p','muted','Observerede bidragende filstier: '+growthCounts(row)));
+ };
+ panel.append(el('h2','','Valgte ændringsbidrag · '+(growth.files?'filer':growth.grouping==='area'?'områder':'kategorier')));contribution(data.contributions,panel);
+ if(growth.group)panel.append(el('p','insights-scope','Valgt gruppe: '+(data.grouping==='category'?insightLabel(growth.group):growth.groupLabel??growth.group)));
+ const list=el('div','insight-rows');list.setAttribute('role','list');panel.append(list);
+ for(const row of data.records){
+  const item=el('article','insight-row');item.setAttribute('role','listitem');const files=data.mode==='files';
+  const button=el('button','insight-open',files||data.grouping==='area'?row.path_display:insightLabel(row.category));button.title=files?'Åbn filanalyse fra den gemte måling':'Se gruppens ændrede filer';
+  button.addEventListener('click',()=>{
+   if(!files){growth.reset({files:true,group:row.group_key,groupLabel:data.grouping==='category'?insightLabel(row.category):row.path_display});loadGrowth();return;}
+   const target=growthTarget(row);if(!target)return;
+   if(target.scanId===state.scan){growth.reset();state.mode='files';navigate(target.entry);}else openScan(target.scanId,false,target.entry);
+  });item.append(button);
+  if(files){item.append(el('p','insight-size',signedDelta(row.delta_bytes)),el('p','','Før: '+knownBytes(row.before_bytes,row.observed_before_bytes)+' · Efter: '+knownBytes(row.after_bytes,row.observed_after_bytes)),el('p','muted',({grown:'Vokset',shrunk:'Krympet',added:'Ny filsti',removed:'Fjernet filsti',unknown:'Ukendt ændring'})[row.change]));button.disabled=!growthTarget(row);item.append(el('p','muted','Filanalyse fra '+(row.drilldown_scan_id===data.before_scan_id?'førmålingen':'eftermålingen')+' · '+row.drilldown_scan_id));}
+  else contribution(row,item);
+  item.append(el('p','muted',contextLabel(row.context_coverage)));if(data.grouping==='category')item.append(el('p','',insightGuidance(row.category??row.group_key)));list.append(item);
+ }
+ if(!data.records.length)panel.append(el('p','insights-notice','Ingen observerede ændrede almindelige filer i dette udvalg. Delvis dækning beviser ikke, at der ingen ændringer er.'));
+ if(growth.cursor){const more=el('button','more','Næste side');more.addEventListener('click',()=>{loadGrowth(true);panel.scrollTop=0;});panel.append(more);}
+ const details=el('details'),summary=el('summary','','Om optælling og tilskrivning');details.append(summary,el('p','',data.accounting_note),el('p','',data.attribution_note),el('p','',data.growth_version+' · '+data.rule_version+' · gemte metadata, ikke live'));panel.append(details);
+}
 function setScanning(active){state.scanning=active;$('#progress').classList.toggle('hidden',!active);if(!active)$('#branch-progress').classList.add('hidden');
  for(const id of ['rescan','choose-folder','choose-history','history-location','whole-mac'])$('#'+id).disabled=active;
  $('#stop').disabled=false;$('#stop').textContent='Stop';renderHistory();renderVolumes();}
@@ -242,9 +305,9 @@ $('#choose-folder').addEventListener('click',folderScan);$('#rescan').addEventLi
 $('#stop').addEventListener('click',async()=>{await invoke('stop_scan');$('#stop').textContent='Stopper…';$('#stop').disabled=true;});
 $('#chart-center').addEventListener('click',()=>{if(state.view?.selected.parent_id!==null)navigate(state.view.selected.parent_id);});
 for(const metric of ['allocated','logical'])$('#'+metric).addEventListener('click',()=>{state.metric=metric;for(const m of ['allocated','logical'])$('#'+m).setAttribute('aria-pressed',String(m===metric));if(state.view)navigate(state.view.selected.entry_id);});
-$('#files-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();state.mode='files';renderMode();loadRows();});$('#changes-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();state.mode='changes';renderMode();loadRows();});
-$('#insights-tab').addEventListener('click',()=>{if(!state.view||state.overview)return;insights.reset({category:null});state.mode='insights';renderMode();loadInsights();});
-$('#before-scan').addEventListener('change',()=>{state.compareBefore=$('#before-scan').value;loadRows();});$('#more').addEventListener('click',()=>loadRows(true));
+$('#files-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();state.mode='files';renderMode();loadRows();});$('#changes-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();state.mode='changes';renderMode();loadGrowth();});
+$('#insights-tab').addEventListener('click',()=>{if(!state.view||state.overview)return;insights.reset({category:null});growth.reset();state.mode='insights';renderMode();loadInsights();});
+$('#before-scan').addEventListener('change',()=>{state.compareBefore=$('#before-scan').value;growth.reset({group:null,files:false});loadGrowth();});$('#more').addEventListener('click',()=>loadRows(true));
 $('#search').addEventListener('input',()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>loadRows(),200);});
 for(const [id,action]of [['copy','copy'],['reveal','reveal']])$('#'+id).addEventListener('click',()=>runFileAction(action,{scanId:state.scan,entry:Number(state.selected.entry_id)}).catch(error));
 async function chooseHistory(){try{const r=await invoke('choose_history');if(!r)return;localStorage.setItem('macscan.history',r.store);state.scans=r.scans;state.store=r.store;$('#history-location').title=r.store;renderHistory();const first=r.scans[0];if(first)openScan(first.scan_id);else toast('Denne mappe indeholder ingen målinger.');}catch(e){error(e);}}

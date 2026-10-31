@@ -22,3 +22,6 @@ export function createInsightsState(){
   }
  };
 }
+
+// Shared category guidance for saved insight and growth consumers.
+export const insightGuidance=(category,guidance)=>guidance??({build_output:'Gennemgå buildoutput med Cargo.',dependencies:'Gennemgå afhængigheder med projektets pakkehåndtering.',package_cache:'Gennemgå cacheforbruget med den relevante pakkehåndtering.'})[category]??'Gennemgå de gemte stier og deres formål manuelt.';

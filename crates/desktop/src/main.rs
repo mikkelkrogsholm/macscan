@@ -1,4 +1,4 @@
-use macscan_analysis::{InsightsQuery, Store, FULL_HISTORY_BUDGET};
+use macscan_analysis::{GrowthGrouping, GrowthQuery, InsightsQuery, Store, FULL_HISTORY_BUDGET};
 use macscan_engine::{
     CompareQuery, Metric, Query, QueryKind, ScanOptions,
 };
@@ -151,6 +151,29 @@ async fn insights(
             },
             &AtomicBool::new(false),
         ).map_err(err)
+    }).await
+}
+// Keep native growth requests on the same saved-data contract as the CLI.
+fn growth_at(path: &std::path::Path, before: &str, after: &str, query: &GrowthQuery) -> Reply {
+    Store::open(path, false).map_err(err)?.growth(before, after, query, &AtomicBool::new(false)).map_err(err)
+}
+#[tauri::command]
+async fn growth(
+    before: String, after: String, entry: u32, metric: String,
+    grouping: String, files: bool, group: Option<String>, change: String,
+    cursor: Option<String>, state: State<'_, Desktop>,
+) -> Reply {
+    let path = store_path(&state)?;
+    blocking(move || {
+        let grouping = match grouping.as_str() {
+            "area" => GrowthGrouping::Area,
+            "category" => GrowthGrouping::Category,
+            _ => return Err("Ukendt gruppering".into()),
+        };
+        growth_at(&path, &before, &after, &GrowthQuery {
+            entry, metric: Metric::parse(&metric).map_err(err)?, grouping,
+            files, group, change, cursor, limit: 10,
+        })
     }).await
 }
 #[tauri::command]
@@ -364,6 +387,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_growth_matches_shared_store_for_synthetic_saved_history() {
+        use macscan_engine::{Entry, EntryKind, Scan, ScanStatus, STORE_BUDGET};
+        let path = std::env::temp_dir().join(format!("macscan-desktop-growth-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let store = Store::open(&path, true).unwrap();
+        let make_entry = |parent, name: &[u8], kind, size| Entry {
+            parent, name: name.to_vec(), kind, logical:size, allocated:size, accounted:size,
+            own_allocated:size, device:1, inode:1, links:1, observed_links:1, charged_to:None,
+            mtime:0, complete:true, enumeration_complete:true,
+        };
+        for n in 1..=2 {
+            let scan = Scan {
+                id:format!("600-{n}"), root:PathBuf::from("/synthetic-not-accessed"),
+                entries:vec![make_entry(None,b"",EntryKind::Directory,0),
+                    make_entry(Some(0),b"project",EntryKind::Directory,0),
+                    make_entry(Some(1),b"file",EntryKind::File,if n==1 {10} else {7})],
+                issues:vec![], issue_count:0, excluded_count:0, status:ScanStatus::Complete,
+                started_at:format!("2026-10-2{n}T10:00:00Z"), ended_at:format!("2026-10-2{n}T10:00:00Z"),
+                duration_ms:0, policy:"synthetic".into(),
+                context:json!({"os_identity":"synthetic","volume_before":{"volume_uuid":"synthetic"},"volume_after":{"volume_uuid":"synthetic"},"started_unix_ns":(1_792_490_400_000_000_000u128+86_400_000_000_000u128*n).to_string(),"ended_unix_ns":(1_792_490_400_000_000_000u128+86_400_000_000_000u128*n).to_string()}),
+            };
+            store.save_with_cancel(&scan, STORE_BUDGET, &AtomicBool::new(false)).unwrap();
+        }
+        for grouping in [GrowthGrouping::Area, GrowthGrouping::Category] {
+            for files in [false,true] {
+                let q = GrowthQuery {entry:1,metric:Metric::Logical,grouping,files,limit:10,..Default::default()};
+                let native = growth_at(&path,"600-1","600-2",&q).unwrap();
+                assert_eq!(native,store.growth("600-1","600-2",&q,&AtomicBool::new(false)).unwrap());
+                assert_eq!(native["contributions"]["delta_bytes"],"-3");
+                assert_eq!(native["totals"]["before"]["bytes"],"10");
+                assert_eq!(native["totals"]["after"]["bytes"],"7");
+            }
+        }
+        let q = GrowthQuery::default();
+        assert!(growth_at(&path,"600-2","600-1",&q).is_err());
+        let invalid = GrowthQuery {change:"invented".into(),..Default::default()};
+        assert!(growth_at(&path,"600-1","600-2",&invalid).is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn copied_information_preserves_exact_sizes_paths_and_measurement_context() {
         let result = json!({"scan_id":"scan-a","started_at":"2026-10-25T12:00:00Z","records":[{
             "path_display":"/example/a\n\"quoted\".mov","kind":"file",
@@ -408,6 +472,7 @@ fn main() {
             view_scan,
             list_children,
             insights,
+            growth,
             compare_scans,
             start_scan,
             start_machine,
