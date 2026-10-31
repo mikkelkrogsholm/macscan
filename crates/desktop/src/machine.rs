@@ -91,8 +91,8 @@ fn publish(store:&Path,s:&Value)->io::Result<()> {
     if p.exists(){return Err(io::Error::other("machine session already exists"));}
     fs::rename(temp,p)
 }
-fn options_for(root:&str)->io::Result<ScanOptions>{
-    let mut options=ScanOptions::full();
+fn options_for(root:&str,capture_clones:bool)->io::Result<ScanOptions>{
+    let mut options=ScanOptions{capture_clones,..ScanOptions::full()};
     if root=="/" {
         // stat/device boundaries alone do not reliably identify macOS firmlinks.
         // Data is scanned at its canonical volume root, exactly once.
@@ -111,7 +111,7 @@ fn system_exclusions(links:&str)->Vec<PathBuf>{
 fn system_exclusion_reasons(roots:&[PathBuf])->Vec<(PathBuf,macscan_engine::ExclusionReason)> {
     roots.iter().filter(|p|p.as_path()!=Path::new("/dev")).map(|p|(p.clone(),if ["/System/Volumes","/Volumes"].contains(&p.to_str().unwrap_or("")){macscan_engine::ExclusionReason::VolumeBoundary}else{macscan_engine::ExclusionReason::FirmlinkBoundary})).collect()
 }
-pub fn run(store:&Path,mut session:Value,cancel:&AtomicBool,mut progress:impl FnMut(Value))->io::Result<String>{
+pub fn run(store:&Path,mut session:Value,capture_clones:bool,cancel:&AtomicBool,mut progress:impl FnMut(Value))->io::Result<String>{
     let store=Store::open(store,true)?;let start=Instant::now();let session_id=id();
     session["session_id"]=json!(session_id);session["started_at"]=json!(utc());session["status"]=json!("running");
     let count=session["volumes"].as_array().unwrap().len();let mut completed=0usize;
@@ -119,7 +119,7 @@ pub fn run(store:&Path,mut session:Value,cancel:&AtomicBool,mut progress:impl Fn
         if cancel.load(Ordering::Relaxed){break;}
         let Some(root)=session["volumes"][i]["root"].as_str().map(str::to_owned) else{continue;};
         session["volumes"][i]["phase"]=json!("scanning");
-        let result=options_for(&root).and_then(|options|store.scan_to_store(Path::new(&root),&options,FULL_HISTORY_BUDGET,cancel,|p|{
+        let result=options_for(&root,capture_clones).and_then(|options|store.scan_to_store(Path::new(&root),&options,FULL_HISTORY_BUDGET,cancel,|p|{
             session["volumes"][i]["phase"]=json!(if p.finished{"saving"}else{"scanning"});
             session["volumes"][i]["entries"]=json!(p.entries_seen);session["volumes"][i]["branches"]=json!(p.branches);
             progress(json!({"phase":if p.finished{"saving"}else{"scanning"},"whole_mac":true,"root":root,"entries_seen":completed+p.entries_seen,"elapsed_ms":start.elapsed().as_millis(),"machine":session}));
@@ -160,7 +160,9 @@ fn utc()->String { // Existing engine timestamps have the same public UTC format
         for p in ["/System/Volumes","/Volumes"] {assert_eq!(options.exclusion_code(Path::new(p)),"MOUNT_EXCLUDED");}
         for p in ["/Applications","/Library","/usr/local"] {assert_eq!(options.exclusion_code(Path::new(p)),"FIRMLINK_EXCLUDED");}
         assert!(!exclusions.contains(&PathBuf::from("/")));assert!(!exclusions.contains(&PathBuf::from("/System/Library")));
-        assert!(options_for("/System/Volumes/Data").unwrap().exclusions.is_empty());
+        assert!(options_for("/System/Volumes/Data",false).unwrap().exclusions.is_empty());
+        assert!(!options_for("/System/Volumes/Data",false).unwrap().capture_clones);
+        assert!(options_for("/System/Volumes/Data",true).unwrap().capture_clones);
     }
     #[test]fn grouping_excludes_images_external_and_duplicate_firmlinks(){
         let a=json!({"Containers":[{"ContainerReference":"disk3","CapacityCeiling":1000,"CapacityFree":200,"PhysicalStores":[{"DeviceIdentifier":"disk0s2"}],"Volumes":[
@@ -180,7 +182,7 @@ fn utc()->String { // Existing engine timestamps have the same public UTC format
         let a=base.join("a");let b=base.join("b");fs::create_dir(&a).unwrap();fs::create_dir(&b).unwrap();fs::write(a.join("tiny"),b"abc").unwrap();fs::write(b.join("keep"),b"xyz").unwrap();
         let s=json!({"kind":"whole_mac_v1","volumes":[{"root":a,"phase":"pending"},{"root":b,"phase":"pending"}]});
         let cancel=AtomicBool::new(false);let history=base.join("history");
-        let session=run(&history,s,&cancel,|p|{if p["machine"]["volumes"][0]["phase"]=="done"{cancel.store(true,Ordering::Relaxed);}}).unwrap();
+        let session=run(&history,s,false,&cancel,|p|{if p["machine"]["volumes"][0]["phase"]=="done"{cancel.store(true,Ordering::Relaxed);}}).unwrap();
         let saved=load(&history,&session).unwrap();assert_eq!(saved["status"],"cancelled");assert!(saved["volumes"][0]["scan_id"].is_string());assert_eq!(saved["volumes"][1]["phase"],"cancelled");assert_eq!(saved["entry_count"],2);
         assert_eq!(fs::read(b.join("keep")).unwrap(),b"xyz");let store=Store::open(&history,false).unwrap();assert_eq!(store.ids().unwrap().len(),1);
         assert!(!fs::read_dir(&history).unwrap().flatten().any(|e|e.file_name().to_string_lossy().ends_with(".partial")));
@@ -189,7 +191,7 @@ fn utc()->String { // Existing engine timestamps have the same public UTC format
     #[test]fn failed_volume_does_not_erase_other_results(){
         let base=std::env::temp_dir().join(format!("macscan-machine-error-{}",id()));fs::create_dir(&base).unwrap();let a=base.join("ok");fs::create_dir(&a).unwrap();fs::write(a.join("file"),b"a").unwrap();
         let s=json!({"kind":"whole_mac_v1","volumes":[{"root":base.join("missing"),"phase":"pending"},{"root":a,"phase":"pending"},{"root":null,"phase":"unmounted"}]});
-        let history=base.join("history");let session=run(&history,s,&AtomicBool::new(false),|_|{}).unwrap();let saved=load(&history,&session).unwrap();
+        let history=base.join("history");let session=run(&history,s,false,&AtomicBool::new(false),|_|{}).unwrap();let saved=load(&history,&session).unwrap();
         assert_eq!(saved["status"],"partial");assert_eq!(saved["volumes"][0]["phase"],"error");assert!(saved["volumes"][1]["scan_id"].is_string());assert_eq!(saved["volumes"][2]["phase"],"unmounted");fs::remove_dir_all(base).unwrap();
     }
 }

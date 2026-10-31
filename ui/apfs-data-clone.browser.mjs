@@ -1,0 +1,74 @@
+// Synthetic command boundary only. Native filesystem evidence is an opt-in Rust fixture.
+import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
+import {readFile,mkdir} from 'node:fs/promises';
+const {chromium}=await import(process.env.PLAYWRIGHT_MODULE??'playwright');
+const root=new URL('./',import.meta.url),out=new URL('../evidence/issue-8C/',import.meta.url);await mkdir(out,{recursive:true});
+const server=createServer(async(req,res)=>{try{const name=new URL(req.url,'http://localhost').pathname.slice(1)||'index.html';if(!/^[\w.-]+$/.test(name))throw Error();res.setHeader('Content-Type',/\.(js|mjs)$/.test(name)?'text/javascript':name.endsWith('.css')?'text/css':'text/html');res.end(await readFile(new URL(name,root)));}catch{res.writeHead(404);res.end();}});
+await new Promise(r=>server.listen(0,'127.0.0.1',r));let browser;
+try{
+ browser=await chromium.launch({headless:true,channel:'chrome'});const page=await browser.newPage({viewport:{width:1380,height:1000}});page.setDefaultTimeout(10000);const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+ await page.addInitScript(()=>{
+  const apfs={algorithm_version:'apfs-data-clone-1',capture_version:1,status:'limited',comparison_ready:true};
+  const context=n=>({started_unix_ns:String(n),os_identity:'os',volume_before:{volume_uuid:'v'},volume_after:{volume_uuid:'v'},clone_capture:{requested:true,version:1}});
+  const scans=[{scan_id:'8-4',apfs_data_clone:apfs},{scan_id:'8-3',apfs_data_clone:apfs},{scan_id:'8-2',apfs_data_clone:{...apfs,status:'fallback',comparison_ready:false}},{scan_id:'8-1',apfs_data_clone:null},{scan_id:'8-0',apfs_data_clone:{...apfs,algorithm_version:'future'}}].map((s,i)=>({...s,root:'/owned/project',root_path_bytes_hex:'FF',policy:'p',status:'complete',started_at:'2026-10-31T10:00:00Z',context:context(10-i)}));
+  window.calls=[];window.missing=false;window.sourceMode='unknown';window.hold='';window.__TAURI__={menu:{Menu:{}},core:{invoke:async(name,args={})=>{
+   window.calls.push({name,args});
+   if(name==='bootstrap')return {scans,volumes:{records:[]},store:'/synthetic',explicit_store:true};
+   if(name==='view_scan'){
+    if(window.hold===args.scanId+':'+args.metric||window.hold===args.scanId+':'+args.metric+':'+args.entry)await new Promise(r=>window.release=r);
+    if(args.scanId==='source'&&window.missing)throw Error('source missing');
+    if(args.scanId==='source'&&args.metric==='apfs-data-clone'&&window.sourceMode!=='supported')throw Error('apfs-data-clone unavailable: rescan with capture');
+    const scan=scans.find(s=>s.scan_id===args.scanId)??{...scans[0],scan_id:'source',apfs_data_clone:window.sourceMode==='supported'?apfs:null};
+    const selected={entry_id:String(args.entry),name_display:args.scanId==='source'?'source-project':args.entry?'target':'project',path_display:'/owned/project'+(args.entry?'/target':''),parent_id:args.entry?'0':null,kind:'directory',own_apfs_data_clone_bytes:'0',apfs_data_clone_reason:'nonfile_retained',bytes:args.metric==='apfs-data-clone'?'20':'40',logical_bytes:'70',accounted_allocated_bytes:'40',coverage_complete:true};
+    const child={entry_id:'3',name_display:'source-file',path_display:'/owned/project/target/source-file',parent_id:String(args.entry),kind:'file',bytes:args.metric==='apfs-data-clone'?'0':'40',own_apfs_data_clone_bytes:'0',apfs_data_clone_owner:'9',apfs_data_clone_reason:'full_data_nonowner',logical_bytes:'70',accounted_allocated_bytes:'40',coverage_complete:true};
+    return {scan_id:scan.scan_id,selected:args.entry===3&&args.scanId!=='source'?{...child,parent_id:'0'}:selected,children:{records:[child],next_cursor:null},nodes:[selected,child],ancestors:[{entry_id:'0',name_display:'project'}],scope:{root_display:'/owned/project',root_path_bytes_hex:'FF',policy_fingerprint:'p'},measurement_context:scan.context,apfs_data_clone:scan.apfs_data_clone,origin:scan.scan_id==='8-4'?{source_scan_id:window.sourceMode==='known'?'8-1':'source',source_entry_id:'3',source_started_at:scan.started_at}:null,status:'complete',started_at:scan.started_at,entry_count:'5',child_count:'1'};
+   }
+   if(name==='list_children')return {records:[],next_cursor:null};
+   if(name==='insights')return {metric:args.metric,scope:{path_display:'/owned/project'},measured_at:'2026-10-31T10:00:00Z',coverage:{complete:true},totals:{bytes:'20',file_path_count:'1'},mode:'categories',records:[{category:'build_output',bytes:'20',file_path_count:'1',explanation:'Saved DATA charge',rule_id:'rust',rule_version:'1'}]};
+   if(name==='file_profile')return {metric:args.metric,scope:{path_display:'/owned/project'},measured_at:'2026-10-31T10:00:00Z',reference_unix_ns:'1000000000',totals:{bytes:'20',file_path_count:'1'},population:{file_path_count:'1'},mode:'files',coverage:{complete:true},records:[]};
+   if(name==='growth')return {metric:args.metric,scope:{after:{path_display:'/owned/project'}},interval:{},totals:{before:{bytes:'20',file_path_count:'1'},after:{bytes:'20',file_path_count:'1'}},contributions:{delta_bytes:'0'},coverage:{complete:true},records:[]};
+   if(name==='prepare_rescan')return {root_display:args.entry?'/owned/project/target':'/owned/project',source_started_at:'2026-10-31T10:00:00Z'};
+   if(name==='start_rescan'||name==='start_scan'||name==='start_machine')return {started:true};
+   if(name==='job_status')return {phase:'scanning',entries_seen:0};
+   if(name==='choose_root')return '/owned/new-project';
+   throw Error('Unexpected '+name);
+  }}};
+ });
+ const ready=()=>page.waitForFunction(()=>document.querySelector('#rows .file-row')&&!document.querySelector('.workspace').classList.contains('loading'));
+ const history=async n=>{await page.locator('#history-list .history-item').nth(n).click();await ready();};
+ const source=()=>page.getByRole('button',{name:'Åbn oprindelig måling/post',exact:true});
+ const apfs=page.locator('#apfs-data-clone');
+ await page.goto('http://127.0.0.1:'+server.address().port);await ready();assert.equal(await page.locator('#capture-clones').isChecked(),false);
+ await apfs.click();await ready();assert.equal(await apfs.getAttribute('aria-pressed'),'true');assert.match(await page.locator('#provenance').innerText(),/Begrænset DATA/);assert.match(await page.locator('#metric-note').innerText(),/Ejeren vælges globalt/);assert.equal(await page.locator('#rows .file-row').count(),1);assert.doesNotMatch(await page.locator('#inspect-category').innerText(),/Nul eget bidrag/);
+ assert.equal(await page.locator('#before-scan option').count(),1);assert.equal(await page.locator('#before-scan').inputValue(),'8-3');
+ await page.locator('#rows .file-row').click();assert.match(await page.locator('#inspect-category').innerText(),/Global ejerpost 9.*ikke dermed tom/);
+ await page.click('#find-files');await page.waitForFunction(()=>document.querySelector('#profile-panel').textContent.includes('Begrænset DATA'));await page.click('#profile-close');
+ await page.click('#insights-tab');await page.waitForFunction(()=>document.querySelector('#insights-panel').textContent.includes('Begrænset DATA'));
+ await page.click('#changes-tab');await page.waitForFunction(()=>document.querySelector('#growth-panel').textContent.includes('Begrænset DATA'));
+ await page.screenshot({path:new URL('apfs-growth.png',out).pathname});
+ // A stale file detail within this scan cannot replace the inspector after a metric change.
+ await page.click('#files-tab');await history(0);await page.evaluate(()=>window.hold='8-4:apfs-data-clone:3');await page.locator('#rows .file-row').click();await page.waitForFunction(()=>typeof window.release==='function');await page.click('#logical');await ready();await page.evaluate(()=>{window.hold='';window.release();delete window.release;});assert.equal(await page.locator('#inspect-name').innerText(),'project');assert.equal(await page.locator('#logical').getAttribute('aria-pressed'),'true');await apfs.click();await ready();
+ // Old/raw-only and unknown future versions coherently retain the primary view.
+ await history(3);assert.equal(await apfs.isDisabled(),true);assert.equal(await page.locator('#allocated').getAttribute('aria-pressed'),'true');assert.match(await page.locator('#metric-note').innerText(),/Genmål med APFS-klonmetadata/);
+ await history(4);assert.equal(await apfs.isDisabled(),true);
+ await history(2);await apfs.click();await ready();assert.match(await page.locator('#metric-note').innerText(),/fallback: primær.*bevaret/);assert.equal(await page.locator('#before-scan').inputValue(),'');await page.click('#changes-tab');assert.match(await page.locator('#growth-panel').innerText(),/Brug Allokeret eller Logisk/);
+ await history(0);await apfs.click();await ready();
+ // Source beyond the history window retries allocated only on explicit unavailable.
+ await source().click();await page.waitForFunction(()=>document.querySelector('#view-title').textContent==='source-project');assert.equal(await page.locator('#allocated').getAttribute('aria-pressed'),'true');
+ assert.deepEqual(await page.evaluate(()=>window.calls.filter(c=>c.name==='view_scan'&&c.args.scanId==='source').map(c=>c.args.metric)),['apfs-data-clone','allocated']);
+ await history(0);await apfs.click();await ready();await page.evaluate(()=>window.missing=true);const inspector=await page.locator('#inspect-path').innerText();await source().click();await page.waitForFunction(()=>document.querySelector('#source-origin').textContent.includes('ikke tilgængelig'));assert.equal(await apfs.getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#inspect-path').innerText(),inspector);
+ // Known uncaptured source goes directly to allocated; no unsupported request is sent.
+ await page.evaluate(()=>{window.missing=false;window.sourceMode='known';});await history(1);await history(0);await source().click();await ready();assert.equal(await page.locator('#allocated').getAttribute('aria-pressed'),'true');assert.equal(await page.evaluate(()=>window.calls.filter(c=>c.name==='view_scan'&&c.args.scanId==='8-1').at(-1).args.metric),'allocated');await page.evaluate(()=>window.sourceMode='unknown');await history(0);await apfs.click();await ready();
+ // Stale APFS read must not start its fallback or replace later navigation.
+ await history(1);await history(0);await page.evaluate(()=>{window.missing=false;window.hold='source:apfs-data-clone';});await source().click();await page.waitForFunction(()=>typeof window.release==='function');await history(1);await page.evaluate(()=>{window.hold='';window.release();delete window.release;});await ready();assert.equal(await apfs.getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#view-title').innerText(),'project');
+ // Stale allocated retry is guarded too.
+ await history(0);await page.evaluate(()=>window.hold='source:allocated');await source().click();await page.waitForFunction(()=>typeof window.release==='function');await history(1);await page.evaluate(()=>{window.hold='';window.release();delete window.release;});await ready();assert.equal(await apfs.getAttribute('aria-pressed'),'true');assert.equal(await page.locator('#view-title').innerText(),'project');
+ // Confirmation retains the exact selected saved area; capture resets every opening.
+ await history(0);await page.click('#rescan');await page.waitForSelector('#rescan-capture');assert.equal(await page.locator('#rescan-capture').isChecked(),false);await page.locator('#rescan-capture').check();await page.getByRole('button',{name:'Annuller',exact:true}).click();await page.click('#rescan');await page.waitForSelector('#rescan-capture');assert.equal(await page.locator('#rescan-capture').isChecked(),false);await page.getByRole('button',{name:'Annuller',exact:true}).click();
+ await page.locator('#capture-clones').check();await page.click('#choose-folder');await page.waitForFunction(()=>window.calls.some(c=>c.name==='start_scan'));assert.deepEqual(await page.evaluate(()=>window.calls.find(c=>c.name==='start_scan').args),{root:'/owned/new-project',captureClones:true});assert.equal(await page.locator('#capture-clones').isChecked(),false);assert.equal(await page.locator('#capture-clones').isDisabled(),true);assert.equal(await page.locator('#stop').isEnabled(),true);
+ await page.reload();await ready();await page.click('#rescan');await page.waitForSelector('#rescan-capture');await page.locator('#rescan-capture').check();await page.getByRole('button',{name:'Start genmåling',exact:true}).click();await page.waitForFunction(()=>window.calls.some(c=>c.name==='start_rescan'));assert.deepEqual(await page.evaluate(()=>window.calls.find(c=>c.name==='start_rescan').args),{scanId:'8-4',entry:0,captureClones:true});assert.equal(await page.locator('#stop').isEnabled(),true);
+ await page.reload();await ready();await page.click('#whole-mac');await page.waitForFunction(()=>window.calls.some(c=>c.name==='start_machine'));assert.deepEqual(await page.evaluate(()=>window.calls.find(c=>c.name==='start_machine').args),{captureClones:false});
+ await page.reload();await ready();await page.locator('#capture-clones').check();await page.click('#whole-mac');await page.waitForFunction(()=>window.calls.some(c=>c.name==='start_machine'));assert.deepEqual(await page.evaluate(()=>window.calls.find(c=>c.name==='start_machine').args),{captureClones:true});
+ assert.deepEqual(errors,[]);console.log('PASS APFS nonempty children, all consumer labels, primary/old/future/fallback availability, compatible baselines, zero attribution, unknown source fallback, missing/stale source navigation, capture opt-in/reset/lock');
+}catch(e){const page=browser?.contexts()[0]?.pages()[0];if(page)await page.screenshot({path:new URL('apfs-browser-failure.png',out).pathname});throw e;}finally{await browser?.close();await new Promise(r=>server.close(r));}

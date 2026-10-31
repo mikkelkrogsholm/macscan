@@ -1,3 +1,4 @@
+import {metricLabel} from './metrics.mjs';
 // Saved metadata only. Exact API integers stay decimal strings at the boundary.
 const U64_MAX=18446744073709551615n;
 export function integerFilter(value,multiplier=1n){
@@ -71,7 +72,7 @@ export function renderProfile(panel,profile,{selected,load,close,open}){
   panel.append(el('p','Ved manglende gemt referencetid: ryd aldersfilteret og prøv igen. Ved ressourcegrænsen: vælg en mindre gemt mappe i grafen og Aktuel mappe / projekt.','insights-notice'));
   button('profile-clear-age','Ryd aldersfilter og prøv igen',()=>update({age:''}));button('profile-retry','Prøv igen',()=>load());
  }else if(profile.data){const d=profile.data,t=d.totals,p=d.population;
-  status.textContent='Målt '+(d.measured_at??d.started_at??'ukendt')+' · ikke live · '+(d.metric==='logical'?'Logisk':'Allokeret');
+  status.textContent='Målt '+(d.measured_at??d.started_at??'ukendt')+' · ikke live · '+metricLabel(d.metric);
   panel.append(el('p','Område: '+d.scope.path_display,'insights-scope'),el('p','Gemt referencetid: '+referenceTime(d.reference_unix_ns,false)),el('p','Aldersgrænse: '+(d.age_threshold_unix_ns==null?'Alle aldre':referenceTime(d.age_threshold_unix_ns,false))));
   panel.append(el('p','Hele det filtrerede observerede udvalg (alle sider): '+profileBytes(t)+' · '+t.file_path_count+(d.coverage?.complete?' filstier':' observerede filstier (nedre grænse)'),'insights-total'));
   panel.append(el('p',d.coverage?.complete?'Komplet dækning af valgt område.':'Delvis dækning: ukendt total, observerede bytes og antal er nedre grænser. Komplette undermapper kan undersøges.','insights-notice'));

@@ -1,3 +1,4 @@
+import {APFS,metrics,metricLabel,apfsSupported,apfsUnavailable,unavailableNote,apfsNote,apfsContribution,apfsZeroNonowner} from './metrics.mjs';
 import {createFocusedRescan,rescanLabel,sameRootBaseline} from './focused-rescan.mjs';
 import {createCoverageDialog} from './coverage.mjs';
 import {createProfileState,renderProfile} from './file-profile.mjs';
@@ -25,7 +26,8 @@ $('#app').innerHTML=`
  <div class="sidebar-footer"><span class="local-dot"></span> Dine data bliver på din Mac<button id="history-location">Målemappe ↗</button><button id="privacy-help">Fuld diskadgang…</button></div>
 </aside>
 <main>
- <header class="toolbar"><div class="view-heading"><span class="eyebrow">DISK ANALYSE</span><h1 id="view-title">Find det, der fylder.</h1><div id="scan-stamp" class="muted">Lokal scanning. Ingen automatisk oprydning.</div></div><div class="toolbar-actions"><div class="metric-toggle" role="group" aria-label="Størrelsesbegreb"><button id="allocated" aria-pressed="true">Allokeret</button><button id="logical" aria-pressed="false">Logisk</button></div><button id="rescan" class="primary">Scan hele Mac’en</button></div></header>
+ <header class="toolbar"><div class="view-heading"><span class="eyebrow">DISK ANALYSE</span><h1 id="view-title">Find det, der fylder.</h1><div id="scan-stamp" class="muted">Lokal scanning. Ingen automatisk oprydning.</div></div><div class="toolbar-actions"><div class="metric-toggle" role="group" aria-label="Størrelsesbegreb"><button id="allocated" aria-pressed="true">Allokeret</button><button id="logical" aria-pressed="false">Logisk</button><button id="apfs-data-clone" aria-pressed="false" aria-label="Begrænset DATA-klonkorrigeret allokering" title="Begrænset DATA-klonkorrigeret allokering">APFS DATA</button></div><button id="rescan" class="primary">Scan hele Mac’en</button></div></header>
+ <label class="capture-option"><input id="capture-clones" type="checkbox"> APFS-klonmetadata til næste nye scanning <small>Tilvalg · eksisterende målinger ændres ikke</small></label><p id="metric-note" class="muted" role="status"></p>
  <div id="error" class="error hidden" role="alert"></div>
  <div id="progress" class="progress-panel hidden" role="status"><div class="spinner"></div><div><strong id="progress-title">Scanner…</strong><div id="progress-detail"></div></div><button id="stop" class="plain">Stop</button></div>
  <section id="branch-progress" class="branch-progress hidden" aria-label="Løbende scanresultater"><div id="volume-progress"></div><p>Foreløbige filtal er før hardlink-korrektion. Afventende områder er ikke målt som nul. Små filer tælles med.</p><div id="branch-rows"></div></section>
@@ -60,9 +62,9 @@ function renderOrigin(view){
  box.append(el('span','','Selvstændig genmåling · kilde: '+date(view.origin.source_started_at)+' · '));
  const exists=state.scans.some(s=>s.scan_id===view.origin.source_scan_id);
  const link=el('button','crumb','Åbn oprindelig måling/post');
- link.addEventListener('click',async()=>{const request=state.request;try{
-  const source=await invoke('view_scan',{scanId:view.origin.source_scan_id,entry:Number(view.origin.source_entry_id),metric:state.metric});
-  if(request!==state.request)return;
+ link.addEventListener('click',async()=>{const request=++state.request;try{
+  const source=await preloadScan(view.origin.source_scan_id,view.origin.source_entry_id,request);
+  if(request!==state.request||!source)return;
   await openScan(view.origin.source_scan_id,false,view.origin.source_entry_id,source);
  }catch(e){if(request!==state.request)return;box.textContent='Den oprindelige måling/post er ikke tilgængelig: '+String(e);}});
  box.append(link);if(!exists)box.append(el('span','',' (kilden er ikke i den seneste historik; åbnes fra gemt ID)'));
@@ -108,15 +110,36 @@ function renderVolumes(){
  }
 }
 async function refresh(){const r=await invoke('bootstrap');state.scans=r.scans;state.volumes=r.volumes.records;state.store=r.store;renderHistory();renderVolumes();$('#history-location').title=state.store;return r;}
+function setMetric(metric){state.metric=metric;for(const m of metrics)$('#'+m).setAttribute('aria-pressed',String(m===metric));}
+async function preloadScan(id,entry,token){
+ let metric=state.metric,note='';
+ const known=state.scans.find(s=>s.scan_id===id);
+ if(metric===APFS&&known&&!apfsSupported(known)){metric='allocated';note=unavailableNote;}
+ let view;
+ try{view=await invoke('view_scan',{scanId:id,entry:Number(entry),metric});}
+ catch(e){
+  if(token!==state.request)return null;
+  if(metric!==APFS||!apfsUnavailable(e))throw e;
+  metric='allocated';note=unavailableNote;
+  view=await invoke('view_scan',{scanId:id,entry:Number(entry),metric});
+ }
+ if(token!==state.request)return null;
+ return {view,metric,note};
+}
 async function openScan(id,keepMachine=false,entry='0',loaded=null){
+ const token=++state.request;
+ if(state.scans.find(s=>s.scan_id===id)?.kind==='machine'){
+  const session=await invoke('machine_session',{sessionId:id});if(token===state.request)showMachine(session);return;
+ }
+ const prepared=loaded??await preloadScan(id,entry,token);if(token!==state.request||!prepared)return;
+ setMetric(prepared.metric);state.metricNotice=prepared.note;
  focusedRescan.close();
  coverageDialog.close();
  profile.reset({active:false,scope:'current',age:'',size:'',typeKey:null,typeLabel:null,types:false,sortCount:false});
- if(state.scans.find(s=>s.scan_id===id)?.kind==='machine')return showMachine(await invoke('machine_session',{sessionId:id}));
  if(!keepMachine)state.machine=null;state.overview=false;$('#search').disabled=false;$('#changes-tab').disabled=false;
- for(const m of ['allocated','logical'])$('#'+m).disabled=false;
+ for(const m of metrics)$('#'+m).disabled=false;
  insights.reset({scope:'all',category:null});growth.reset({scope:'all',group:null,files:false});state.compareBefore=null;$('#insights-tab').disabled=false;
- state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate(entry,loaded);renderHistory();
+ state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate(entry,prepared.view);renderHistory();
 }
 function showMachine(session){
  focusedRescan.close();
@@ -125,10 +148,10 @@ function showMachine(session){
  insights.reset({scope:'all',category:null});growth.reset();$('#insights-tab').disabled=true;
  ++state.request;++state.listRequest;clearError();state.machine=session;state.overview=true;state.scan=session.session_id;state.mode='files';state.colors.clear();
  const view=machineView(session);state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=null;
- $('#source-origin')?.remove();
+ $('#source-origin')?.remove();$('#metric-note').textContent='Kapacitet og diskforbrug fra macOS · uafhængigt af filmetrik';$('#measure-note').textContent='Diskforbrug fra macOS er ikke en filsum eller frigørbar plads.';
  $('#view-title').textContent='Hele Mac’en';$('#scan-stamp').textContent='Målt '+date(session.started_at)+' · '+new Intl.NumberFormat('da-DK').format(session.entry_count??0)+' poster · '+(session.status==='cancelled'?'stoppet':'gemt lokalt');
  $('#rescan').textContent='Scan hele Mac’en';$('#child-count').textContent=view.child_count;$('#search').value='';$('#search').disabled=true;$('#changes-tab').disabled=true;
- for(const m of ['allocated','logical'])$('#'+m).disabled=true;
+ for(const m of metrics)$('#'+m).disabled=true;
  $('#coverage').classList.remove('hidden');$('#coverage').textContent=session.coverage_note+(view.accountingOverlap?' Volumenallokering overstiger containerforbruget; grafen er normaliseret, ikke en frigørbar sum.':'');
  coverageButton(()=>coverageDialog.openMachine(session));
  renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderHistory();
@@ -140,7 +163,10 @@ async function navigate(entry,loaded=null){
  insights.reset({category:null});growth.reset({group:null,files:false});
  const token=++state.request;++state.listRequest;clearTimeout(state.searchTimer);clearError();$('.workspace').classList.add('loading');
  try{const view=loaded??await invoke('view_scan',{scanId:state.scan,entry:Number(entry),metric:state.metric});if(token!==state.request)return;
-  state.view=view;state.selected=view.selected;state.rows=view.children.records;state.cursor=view.children.next_cursor;$('#search').value='';
+  state.view=view;state.selected=view.selected;
+  $('#'+APFS).disabled=!apfsSupported(view);$('#'+APFS).title=apfsSupported(view)?metricLabel(APFS):unavailableNote;
+  $('#metric-note').textContent=state.metricNotice||(state.metric===APFS?apfsNote(view.apfs_data_clone):!apfsSupported(view)?unavailableNote.replace('Allokeret vises. ',''):'');
+  $('#measure-note').textContent=state.metric===APFS?apfsNote(view.apfs_data_clone):'Allokeret er ikke nødvendigvis frigørbar APFS-plads.';state.rows=view.children.records;state.cursor=view.children.next_cursor;$('#search').value='';
   $('#view-title').textContent=view.selected.name_display||rootName(view.scope.root_display);$('#scan-stamp').textContent='Målt '+date(view.started_at)+' · '+new Intl.NumberFormat('da-DK').format(view.entry_count)+' poster · ikke live';
   $('#rescan').textContent=rescanLabel(view.selected);renderOrigin(view);$('#child-count').textContent=view.child_count;renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderCompareOptions();
   const partial=view.status!=='complete';$('#coverage').classList.remove('hidden');
@@ -149,7 +175,7 @@ async function navigate(entry,loaded=null){
   if(state.mode==='files'&&profile.active)loadProfile();
   if(state.mode==='insights')loadInsights();
   if(state.mode==='changes')loadGrowth();
-  $('#provenance').textContent=(view.status==='complete'?'Komplet':'Delvis')+' måling · '+(state.metric==='logical'?'Logiske filstørrelser':'Hardlink-tilskrevet allokering');
+  $('#provenance').textContent=(view.status==='complete'?'Komplet':'Delvis')+' måling · '+metricLabel(state.metric);
  }catch(e){if(token===state.request){error(e);if(profile.active){profile.busy=false;profile.error=String(e);renderFileProfile();}}}finally{if(token===state.request)$('.workspace').classList.remove('loading');}
 }
 function renderCrumbs(){const box=$('#breadcrumbs');box.replaceChildren();if(state.machine){const b=el('button','crumb','Hele Mac’en');b.addEventListener('click',()=>showMachine(state.machine));box.append(b);}
@@ -166,7 +192,7 @@ function renderChart(){
  }
  $('#center-label').textContent=view.selected.name_display||rootName(view.scope.root_display);
  $('#center-size').textContent=formatBytes(view.selected.bytes??view.selected.observed_bytes);
- $('#center-note').textContent=view.selected.bytes===null?'Mindst observeret':state.metric==='allocated'?'Allokeret plads':'Logisk størrelse';
+ $('#center-note').textContent=view.selected.bytes===null?'Mindst observeret':metricLabel(state.metric);
  $('#chart-center').disabled=view.selected.parent_id===null;$('#chart-center').title='Gå ét mappeniveau op';$('#center-up').textContent=view.selected.parent_id===null?'':'↑ Tilbage';
  $('#chart-context').textContent=view.selected.kind==='file'?'Valgt fil':'Pladsfordeling · 3 niveauer';
  if(!arcs.length)$('#hover-caption').textContent=weight(view.selected)===0n?'Ingen målbare bytes i dette udvalg.':'Dette udvalg har ingen målte underposter.';
@@ -178,7 +204,7 @@ function highlight(node,aggregate=false){
  $('#hover-caption').textContent=node?node.name_display+' · '+formatBytes(node.bytes??node.observed_bytes??node.lower_bound_bytes)+(aggregate?' · se listen':''):'Klik på en mappe for at åbne · midten går ét niveau op';
 }
 async function chooseNode(n){if(state.overview){const row=state.rows.find(r=>r.entry_id===n.entry_id)??n;if(row.scan_id)return openScan(row.scan_id,true);toast(row.error??(row.phase==='unmounted'?'Volumen er ikke monteret. Dets forbrug vises fra macOS.':'Ingen filscanning for dette område.'));return;}
- if(n.kind==='directory')return navigate(n.entry_id);try{const scan=state.scan;const data=await invoke('view_scan',{scanId:scan,entry:Number(n.entry_id),metric:state.metric});if(scan===state.scan){state.selected=data.selected;renderInspector();}}catch(e){error(e);}}
+ if(n.kind==='directory')return navigate(n.entry_id);const scan=state.scan,request=state.request,metric=state.metric;try{const data=await invoke('view_scan',{scanId:scan,entry:Number(n.entry_id),metric});if(scan===state.scan&&request===state.request&&metric===state.metric){state.selected=data.selected;renderInspector();}}catch(e){if(scan===state.scan&&request===state.request&&metric===state.metric)error(e);}}
 // This renderer consumes ordinary children only. Growth owns its separate panel
 // and never changes the schema of state.rows, including during graph refreshes.
 function renderRows(){
@@ -203,7 +229,9 @@ function renderRows(){
 function renderInspector(){
  const n=state.selected;if(!n)return;$('#inspect-name').textContent=n.name_display||rootName(n.path_display);$('#inspect-path').textContent=n.path_display||'';$('#inspect-path').title=n.path_display||'';
  $('#inspect-logical').textContent='Logisk '+formatBytes(n.logical_bytes);$('#inspect-allocated').textContent='Allokeret '+formatBytes(n.accounted_allocated_bytes??n.bytes);
+ if(state.metric===APFS&&!state.overview){$('#inspect-allocated').textContent='APFS DATA '+formatBytes(n.bytes??n.observed_bytes);}
  const c=categoryPresentation(n);$('#inspect-category').textContent=state.overview?'':`${c.label} · ${c.reason} ${c.coverage}`;$('#inspect-category').title=c.detail;
+ if(state.metric===APFS&&!state.overview){$('#inspect-category').textContent+=' · '+apfsContribution(n)+(n.apfs_data_clone_owner!=null?' · Global ejerpost '+n.apfs_data_clone_owner:'');if(apfsZeroNonowner(n))$('#inspect-category').textContent+=' · Nul eget bidrag skyldes global tilskrivning; filen er ikke dermed tom eller frigørbar.';}
  if(state.overview){$('#inspect-logical').textContent='APFS-kapacitet '+formatBytes(state.machine.capacity_bytes);$('#inspect-allocated').textContent='Ledigt '+formatBytes(state.machine.free_bytes);}
  $('#copy').disabled=state.overview;$('#reveal').disabled=state.overview;
 }
@@ -251,7 +279,7 @@ function renderInsights(){
  if(insights.busy){status.textContent='Beregner indsigter fra den gemte måling…';return;}
  if(insights.error){status.textContent='Indsigter kunne ikke beregnes. Ved hukommelsesgrænsen: vælg en mindre mappe i grafen og vælg Aktuel mappe / projekt ovenfor. Du kan også prøve igen.';status.title=insights.error;const retry=el('button','more','Prøv igen');retry.addEventListener('click',()=>loadInsights());panel.append(retry);return;}
  const data=insights.data;if(!data)return;
- status.textContent='Målt '+date(data.measured_at??data.started_at)+' · ikke live · '+(data.metric==='logical'?'Logisk':'Allokeret')+' · '+(data.coverage?.complete?'Komplet dækning':'Delvis dækning');
+ status.textContent='Målt '+date(data.measured_at??data.started_at)+' · ikke live · '+metricLabel(data.metric)+' · '+(data.coverage?.complete?'Komplet dækning':'Delvis dækning');
  panel.append(el('p','insights-scope','Område: '+data.scope.path_display),el('p','insights-total','Alle almindelige filer i området: '+insightBytes(data.totals)+' · '+data.totals.file_path_count+' filstier'));
  if(data.context_coverage==='context_unavailable')panel.append(el('p','insights-notice','Denne ældre måling mangler gemt kontekst. Formål kan derfor ikke underbygges.'));
  panel.append(el('p','insights-notice','Størrelser er ikke frigørbar APFS-plads. Ukendt dækning vises som et observeret minimum. Ingen forslag udføres, og formål er ikke en godkendelse til sletning.'));
@@ -271,7 +299,7 @@ function renderInsights(){
 }
 function renderCompareOptions(){
  const select=$('#before-scan');select.replaceChildren();
- const eligible=state.scans.filter(s=>sameRootBaseline(s,state.view,state.scan));
+ const eligible=state.scans.filter(s=>sameRootBaseline(s,state.view,state.scan,state.metric));
  if(!eligible.length){select.append(new Option('Ingen tidligere kandidat til sammenligning',''));state.compareBefore=null;return;}
  for(const s of eligible)select.append(new Option(date(s.started_at)+(s.status==='partial'?' · delvis':'')+' · '+s.scan_id,s.scan_id));
  state.compareBefore=eligible.some(s=>s.scan_id===state.compareBefore)?state.compareBefore:eligible[0].scan_id;select.value=state.compareBefore;
@@ -305,12 +333,12 @@ function renderGrowth(){
  if(growth.files){const back=el('button','more','← Tilbage til grupper');back.addEventListener('click',()=>{growth.reset({files:false,group:null});loadGrowth();});panel.append(back);}
  else{const all=el('button','more','Se alle ændrede filer');all.addEventListener('click',()=>{growth.reset({files:true,group:null});loadGrowth();});panel.append(all);}
  const status=el('p','insights-status');status.setAttribute('role','status');panel.append(status);
- if(!state.compareBefore){status.textContent='Vælg to gemte målinger af samme rod. Ingen tidligere kandidat er tilgængelig. En oprindelig måling af en bredere rod kan ikke sammenlignes direkte; gentag denne rod for at få en sammenlignelig måling.';return;}
+ if(!state.compareBefore){status.textContent=(state.metric===APFS?'APFS DATA kræver to komplette målinger med understøttede versioner og sammenligningsklar klonmetadata uden fallback. Brug Allokeret eller Logisk, eller genmål samme rod med APFS-klonmetadata. ':'')+'Vælg to gemte målinger af samme rod. Ingen tidligere kandidat er tilgængelig. En oprindelig måling af en bredere rod kan ikke sammenlignes direkte; gentag denne rod for at få en sammenlignelig måling.';return;}
  if(growth.busy){status.textContent='Beregner ændringsbidrag fra de gemte målinger…';return;}
  if(growth.error){status.textContent='Ændringer kunne ikke beregnes. Parret kan være inkompatibelt eller mangle gemt kontekst. Ved hukommelsesgrænsen: vælg en mindre mappe i grafen, vælg Aktuel mappe / projekt og prøv igen.';panel.append(el('p','insights-notice',growth.error));const retry=el('button','more','Prøv igen');retry.addEventListener('click',()=>loadGrowth());panel.append(retry);return;}
  const data=growth.data;if(!data)return;
  const savedDate=value=>value?new Date(value).toLocaleString('da-DK',{dateStyle:'medium',timeStyle:'long'}):'Ukendt afslutningstid';
- status.textContent='Før: '+savedDate(data.interval.before_measured_at)+' · Efter: '+savedDate(data.interval.after_measured_at)+' · '+(data.metric==='logical'?'Logisk':'Allokeret');
+ status.textContent='Før: '+savedDate(data.interval.before_measured_at)+' · Efter: '+savedDate(data.interval.after_measured_at)+' · '+metricLabel(data.metric);
  panel.append(el('p','insights-scope','Interval: '+elapsedLabel(data.interval.elapsed_ns)),el('p','insights-scope','Område: '+data.scope.after.path_display));
  panel.append(el('p',data.coverage.complete?'insights-status':'insights-notice',data.coverage.complete?'Komplet dækning af det valgte område i begge målinger.':'Delvis dækning. Ukendte sider og ændringer er ikke nul eller en sikker nedgang. Komplette undermapper kan stadig undersøges.'));
  const before=data.totals.before,after=data.totals.after;
@@ -339,9 +367,9 @@ function renderGrowth(){
 }
 function setScanning(active){state.scanning=active;$('#progress').classList.toggle('hidden',!active);if(!active)$('#branch-progress').classList.add('hidden');
  for(const button of document.querySelectorAll('.focused-rescan'))button.disabled=active;
- for(const id of ['rescan','choose-folder','choose-history','history-location','whole-mac'])$('#'+id).disabled=active;
+ for(const id of ['rescan','choose-folder','choose-history','history-location','whole-mac','capture-clones'])$('#'+id).disabled=active;
  $('#stop').disabled=false;$('#stop').textContent='Stop';renderHistory();renderVolumes();}
-async function beginScan(root){if(state.scanning)return;clearError();try{await invoke(root===null?'start_machine':'start_scan',root===null?{}:{root});setScanning(true);pollJob();}catch(e){error(e);}}
+async function beginScan(root){if(state.scanning)return;clearError();try{await invoke(root===null?'start_machine':'start_scan',root===null?{captureClones:$('#capture-clones').checked}:{root,captureClones:$('#capture-clones').checked});$('#capture-clones').checked=false;setScanning(true);pollJob();}catch(e){error(e);}}
 function renderProgress(s){
  const volumes=s.machine?.volumes??[],active=volumes.find(v=>v.phase==='scanning'||v.phase==='saving'),branches=active?.branches??s.branches??[];
  const panel=$('#branch-progress');panel.classList.toggle('hidden',!volumes.length&&!branches.length);
@@ -360,7 +388,7 @@ $('#whole-mac').addEventListener('click',()=>beginScan(null));
 $('#choose-folder').addEventListener('click',folderScan);$('#rescan').addEventListener('click',()=>state.overview?beginScan(null):state.view?focusedRescan.open(state.view.scan_id??state.scan,state.view.selected.entry_id):beginScan(null));
 $('#stop').addEventListener('click',async()=>{await invoke('stop_scan');$('#stop').textContent='Stopper…';$('#stop').disabled=true;});
 $('#chart-center').addEventListener('click',()=>{if(state.view?.selected.parent_id!==null)navigate(state.view.selected.parent_id);});
-for(const metric of ['allocated','logical'])$('#'+metric).addEventListener('click',()=>{state.metric=metric;for(const m of ['allocated','logical'])$('#'+m).setAttribute('aria-pressed',String(m===metric));if(state.view)navigate(state.view.selected.entry_id);});
+for(const metric of metrics)$('#'+metric).addEventListener('click',()=>{setMetric(metric);state.metricNotice='';if(state.view)navigate(state.view.selected.entry_id);});
 $('#files-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();profile.reset({active:false});state.mode='files';renderMode();loadRows();});$('#changes-tab').addEventListener('click',()=>{if(!state.view)return;insights.reset();growth.reset();profile.reset({active:false});state.mode='changes';renderMode();loadGrowth();});
 $('#insights-tab').addEventListener('click',()=>{if(!state.view||state.overview)return;insights.reset({category:null});growth.reset();profile.reset({active:false});state.mode='insights';renderMode();loadInsights();});
 $('#before-scan').addEventListener('change',()=>{state.compareBefore=$('#before-scan').value;growth.reset({group:null,files:false});loadGrowth();});$('#more').addEventListener('click',()=>loadRows(true));

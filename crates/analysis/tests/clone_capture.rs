@@ -538,3 +538,80 @@ fn captured_metric_pagination_scope_and_unavailable_snapshot_contract() {
     assert_eq!(legacy.query(&Query{metric:Metric::ApfsDataClone,..Query::default()}).unwrap_err().kind(),std::io::ErrorKind::Unsupported);
     assert!(legacy.query(&Query{metric:Metric::Private,..Query::default()}).unwrap_err().to_string().contains("private"));
 }
+
+/// Persistent, real native fixture exclusively for issue 8C desktop acceptance.
+/// Deliberately retained; native-map.json documents exact marker-protected cleanup.
+#[test]
+#[ignore = "Explicit issue 8C owned persistent native acceptance fixture"]
+fn write_issue_8c_native_acceptance_fixture() {
+    assert_eq!(std::env::var("MACSCAN_ISSUE_8C_FIXTURE").as_deref(),Ok("create-owned-fixture"));
+    let repo=PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf();
+    let evidence=repo.join("evidence/issue-8C");fs::create_dir_all(&evidence).unwrap();
+    let source_base=evidence.join("native-source");let history=evidence.join("native-history");
+    assert!(!source_base.exists()&&!history.exists(),"owned source and history must both be fresh; never overwrite");
+    fs::create_dir(&source_base).unwrap();
+    let marker="macscan-issue-8C-owned-native-fixture-v1\n";
+    fs::write(source_base.join(".macscan-owned-fixture"),marker).unwrap();
+    let project=source_base.join("project");fs::create_dir(&project).unwrap();
+    fs::write(project.join("Cargo.toml"),"[package]\nname = \"macscan-owned-acceptance\"\nversion = \"0.0.0\"\n").unwrap();
+    let target=project.join("target");fs::create_dir(&target).unwrap();let root=&target;
+    let mut source = fs::File::create(root.join("source")).unwrap();
+    source.write_all(&vec![0x5a; 1024 * 1024]).unwrap();
+    source.sync_all().unwrap();
+    for name in ["full", "forked", "partial"] {
+        let a = CString::new(root.join("source").as_os_str().as_bytes()).unwrap();
+        let b = CString::new(root.join(name).as_os_str().as_bytes()).unwrap();
+        if unsafe { libc::clonefile(a.as_ptr(), b.as_ptr(), 0) } != 0 {
+            let e = std::io::Error::last_os_error();
+            panic!("native clonefile: {e}");
+        }
+    }
+    fs::hard_link(root.join("source"), root.join("hardlink")).unwrap();
+    let partial = fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("partial"))
+        .unwrap();
+    partial.write_all_at(&[0x31; 4096], 0).unwrap();
+    partial.sync_all().unwrap();
+    let mut fork = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(root.join("forked/..namedfork/rsrc"))
+        .unwrap();
+    fork.write_all(&vec![0x73; 65536]).unwrap();
+    fork.sync_all().unwrap();
+    let sparse = fs::File::create(root.join("sparse")).unwrap();
+    sparse.set_len(16 * 1024 * 1024).unwrap();
+    sparse
+        .write_all_at(&[0x22; 4096], 16 * 1024 * 1024 - 4096)
+        .unwrap();
+    sparse.sync_all().unwrap();
+    let hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: 0,
+        fp_length: 16 * 1024 * 1024 - 4096,
+    };
+    assert_eq!(
+        unsafe { libc::fcntl(sparse.as_raw_fd(), libc::F_PUNCHHOLE, &hole) },
+        0
+    );
+    sparse.sync_all().unwrap();
+
+    let store=Store::open(&history,true).unwrap();
+    let off=capture(&store,&project,false);let on=capture(&store,&project,true);
+    let options=ScanOptions{capture_clones:true,..ScanOptions::full()};
+    let again=store.rescan_to_store(&off,0,&options,FULL_HISTORY_BUDGET,&STOP,|_|{}).unwrap();
+    let saved=rows(&store,&again,"entry_id,parent_id,name_display,path_display,kind,logical_bytes,allocated_bytes,accounted_allocated_bytes,own_allocated_bytes,clone_status,clone_id,clone_extended_flags,clone_data_allocated_bytes,apfs_data_clone_bytes,own_apfs_data_clone_bytes,apfs_data_clone_owner,apfs_data_clone_reason,category");
+    let files:Vec<_>=saved.as_array().unwrap().iter().filter(|r|r["path_display"].as_str().unwrap().starts_with(target.to_str().unwrap())&&r["kind"]=="file").collect();
+    assert_eq!(files.len(),6);
+    let sum=|key:&str|files.iter().map(|r|r[key].as_str().unwrap().parse::<u64>().unwrap()).sum::<u64>();
+    assert_eq!(sum("own_allocated_bytes"),5312512);assert_eq!(sum("accounted_allocated_bytes"),4263936);assert_eq!(sum("own_apfs_data_clone_bytes"),2166784);
+    for id in [&on,&again]{let m=store.manifest(id).unwrap();assert_eq!(m["apfs_data_clone"]["comparison_ready"],true);assert_eq!(m["status"],"complete");}
+    let comparison=store.compare(&on,&again,&CompareQuery{metric:Metric::ApfsDataClone,limit:100,cursor:None},&STOP).unwrap();assert!(comparison["records"].as_array().unwrap().is_empty());
+    let manifests:Vec<_>=[&off,&on,&again].iter().map(|id|store.manifest(id).unwrap()).collect();
+    let map=json!({"marker":marker,"source":source_base,"project":project,"target":target,"history":history,"uncaptured_id":off,"captured_before_id":on,"captured_after_id":again,"native_operations":["clonefile without copy fallback","hard_link","independent named resource fork","partial DATA write","F_PUNCHHOLE"],"target_file_totals":{"raw":5312512,"hardlink":4263936,"limited":2166784},"rows":saved,"manifests":manifests,"cleanup":"After restoring normal app history and quitting: verify native-source/.macscan-owned-fixture equals the marker, then remove ONLY evidence/issue-8C/native-source and evidence/issue-8C/native-history. Keep this map/log as evidence."});
+    fs::write(evidence.join("native-map.json"),serde_json::to_vec_pretty(&map).unwrap()).unwrap();
+    println!("Persistent owned native fixture: {}",evidence.join("native-map.json").display());
+}

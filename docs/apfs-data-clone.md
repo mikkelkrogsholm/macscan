@@ -19,8 +19,8 @@ macscan compare BEFORE_ID AFTER_ID --metric apfs-data-clone --store "$HOME/macsc
 before any traversal or publication. The default remains capture off. Summary,
 children, largest, inspect, sunburst, insights, file profile, comparison and
 growth all use the same saved metric. In-memory engine query/comparison reject
-it explicitly. Desktop transport accepts the metric; this run adds no UI
-selector, scan opt-in control or application activation.
+it explicitly. Desktop exposes the saved metric and explicit new-scan capture
+controls as described below. Building the app does not launch or activate it.
 
 ## Accounting and limits
 
@@ -100,6 +100,44 @@ primary-size relevance semantics; a clone-only change does not add zero-primary
 rows. SQL can explicitly select the saved supplemental columns. Agent responses
 retain the existing 8 KiB bound, cursors and exact integer representation.
 
+## Native desktop
+
+The short third metric button is **APFS DATA**; its accessible name, chart note
+and consumer status use **Begrænset DATA-klonkorrigeret allokering**. It applies
+to saved file measurements, children/search, chart, inspector, insights, file
+profiles and growth. Whole-Mac capacity remains the macOS volume/container
+view, with all file metric buttons disabled.
+
+The **APFS-klonmetadata til næste nye scanning** checkbox starts unchecked and
+applies to the next folder, volume or whole-Mac scan only. It resets after a
+successful start. The existing exact-entry rescan confirmation has its own
+unchecked **APFS-klonmetadata til denne nye måling** checkbox. It always confirms
+the already selected saved root, directory or file; no automatic capture or
+historical enrichment occurs. Both controls feed the existing single-job
+launcher; the optional native `captureClones` argument defaults to false for
+older callers, and whole-Mac execution passes it to each planned volume.
+
+Old, uncaptured, raw-only or unknown-version measurements keep primary metrics
+available and explain that a new opt-in measurement is required. Opening such
+a measurement while APFS DATA is selected preloads primary allocation and
+then changes the selected button, with a visible explanation. Source backlinks
+also preload before changing the accepted view: a known unavailable source
+uses allocated directly; a source outside the recent history is tried with
+APFS DATA and retried with allocated only for the explicit unavailable error.
+Missing sources and stale reads preserve the accepted view and metric.
+
+APFS baseline choices retain the existing exact root/policy/OS/volume/time gates
+and require both measurements to be primary-complete, supported algorithm and
+capture versions, and comparison-ready. The backend remains authoritative.
+Fallback or unavailable comparison paths direct users to Allokeret/Logisk or a
+new capture of the same root. Primary baseline behavior is unchanged.
+
+Fallback explains that primary hardlink allocation was retained. File
+nonowners show the saved global owner reference and a brief attribution reason;
+a zero own charge does not prove empty or reclaimable content. Directory own
+allocation of zero does not trigger this file explanation. No owner navigation
+or broader private/unique/reclaimable claim is introduced.
+
 ## Verification
 
 Use the pinned toolchain and environment in [the capture contract](apfs-clone-capture.md).
@@ -125,3 +163,25 @@ sharing, invalid/missing/zero/cross-device attributes, unknown filesystem,
 partial/global-invalid subtree sums, owner outside scope, exact large integers,
 version rejection and capture-off physical schema. Existing cancellation and
 budget tests exercise the same finalization/publication path.
+
+
+Desktop regression commands (synthetic command responses, no native scans):
+
+```sh
+export PLAYWRIGHT_MODULE=/opt/homebrew/lib/node_modules/@playwright/cli/node_modules/playwright/index.mjs
+/opt/homebrew/bin/node ui/apfs-data-clone.browser.mjs
+/opt/homebrew/bin/node ui/focused-rescan.browser.mjs
+/opt/homebrew/bin/node ui/coverage.browser.mjs
+/opt/homebrew/bin/node ui/growth.browser.mjs
+/opt/homebrew/bin/node ui/file-profile.browser.mjs
+```
+
+The ignored `write_issue_8c_native_acceptance_fixture` integration test is a
+separate explicit opt-in (`MACSCAN_ISSUE_8C_FIXTURE=create-owned-fixture`). It is
+scoped to this checkout's `evidence/issue-8C/native-source` and `native-history`,
+refuses either existing path, and leaves its actual source/history for native
+acceptance. It creates `project/Cargo.toml` plus `target/{source,full,forked,
+partial,hardlink,sparse}` with the actual operations above. Its map records
+IDs, entry IDs, manifests, totals, provenance and cleanup. The latest captured
+measurement is a rescan of the uncaptured root to exercise source fallback.
+The opt-in generator never runs a machine plan or scans user/provider trees.

@@ -1,3 +1,4 @@
+import {APFS,apfsComparable} from './metrics.mjs';
 // A preparation response is metadata only. Closing invalidates pending responses.
 export function createFocusedRescan(dialog,{invoke,onStarted,onError,isScanning}){
  let generation=0,target=null;
@@ -10,7 +11,7 @@ export function createFocusedRescan(dialog,{invoke,onStarted,onError,isScanning}
  start.addEventListener('click',async()=>{
   if(!target||isScanning())return;
   const chosen=target;start.disabled=true;
-  try{await invoke('start_rescan',chosen);close();onStarted();}catch(e){start.disabled=false;onError(e);}
+  try{await invoke('start_rescan',{...chosen,captureClones:body.querySelector('#rescan-capture').checked});close();onStarted();}catch(e){start.disabled=false;onError(e);}
  });
  return {close,async open(scanId,entry){
   if(isScanning())return;
@@ -21,12 +22,15 @@ export function createFocusedRescan(dialog,{invoke,onStarted,onError,isScanning}
     'Ny selvstændig måling af denne sti. Den oprindelige måling bevares. Dækning og tidspunkt gælder kun den nye måling.']){
     const p=document.createElement('p');p.textContent=text;body.append(p);
    }
-   target={scanId,entry:Number(entry)};start.disabled=false;
+   const label=document.createElement('label'),capture=document.createElement('input');capture.type='checkbox';capture.id='rescan-capture';capture.checked=false;label.append(capture,' APFS-klonmetadata til denne nye måling (fra som standard)');body.append(label);
+   target={scanId,entry:Number(entry)};
+   start.disabled=false;
   }catch(e){if(token===generation){body.textContent=String(e);start.disabled=true;}}
  }};
 }
 export function rescanLabel(selected){return selected.kind==='file'?'Genmål denne fil':String(selected.entry_id)==='0'?'Genmål hele målingen':'Genmål denne mappe';}
-export function sameRootBaseline(scan,view,current){
+export function sameRootBaseline(scan,view,current,metric='allocated'){
+ if(metric===APFS&&(!apfsComparable(scan)||!apfsComparable(view)))return false;
  if(scan.kind==='machine'||scan.scan_id===current)return false;
  const before=scan.context?.started_unix_ns,after=view.measurement_context?.started_unix_ns;
  if(typeof before!=='string'||typeof after!=='string'||!/^\d+$/.test(before)||!/^\d+$/.test(after))return false;

@@ -270,11 +270,11 @@ async fn compare_scans(
     .await
 }
 #[tauri::command]
-fn start_scan(root: String, state: State<'_, Desktop>) -> Reply {
-    launch_scan(Some(root),None,&state)
+fn start_scan(root: String, capture_clones: Option<bool>, state: State<'_, Desktop>) -> Reply {
+    launch_scan(Some(root),None,capture_clones.unwrap_or(false),&state)
 }
 #[tauri::command]
-fn start_machine(state: State<'_,Desktop>)->Reply {launch_scan(None,None,&state)}
+fn start_machine(capture_clones:Option<bool>,state: State<'_,Desktop>)->Reply {launch_scan(None,None,capture_clones.unwrap_or(false),&state)}
 #[tauri::command]
 async fn machine_session(session_id:String,state:State<'_,Desktop>)->Reply {
     let path=store_path(&state)?;
@@ -286,13 +286,13 @@ async fn prepare_rescan(scan_id:String,entry:u32,state:State<'_,Desktop>)->Reply
     blocking(move||Store::open(&path,false).map_err(err)?.prepare_rescan(&scan_id,entry).map_err(err)).await
 }
 #[tauri::command]
-async fn start_rescan(scan_id:String,entry:u32,state:State<'_,Desktop>)->Reply {
+async fn start_rescan(scan_id:String,entry:u32,capture_clones:Option<bool>,state:State<'_,Desktop>)->Reply {
     let path=store_path(&state)?;
     let source_id=scan_id.clone();
     let prepared=blocking(move||Store::open(&path,false).map_err(err)?.prepare_rescan(&source_id,entry).map_err(err)).await?;
-    launch_scan(None,Some((scan_id,entry,prepared)),&state)
+    launch_scan(None,Some((scan_id,entry,prepared)),capture_clones.unwrap_or(false),&state)
 }
-fn launch_scan(root:Option<String>,source:Option<(String,u32,Value)>,state:&Desktop)->Reply {
+fn launch_scan(root:Option<String>,source:Option<(String,u32,Value)>,capture_clones:bool,state:&Desktop)->Reply {
     let whole=root.is_none()&&source.is_none();
     let root=root.unwrap_or_else(||"/".into());
     let root = PathBuf::from(root);
@@ -319,16 +319,17 @@ fn launch_scan(root:Option<String>,source:Option<(String,u32,Value)>,state:&Desk
         let result=(||->Result<String,String>{
             if whole {
                 let plan=machine::plan().map_err(err)?;
-                return machine::run(&store,plan,&job.cancel,|value|{*job.status.lock().unwrap()=value;}).map_err(err);
+                return machine::run(&store,plan,capture_clones,&job.cancel,|value|{*job.status.lock().unwrap()=value;}).map_err(err);
             }
             let store=Store::open(&store,true).map_err(err)?;
+            let options=ScanOptions{capture_clones,..ScanOptions::full()};
             let progress=|p:&macscan_engine::Progress|{
                 *job.status.lock().unwrap()=json!({"phase":if p.finished {"saving"}else{"scanning"},"entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"root":root_display,"root_path_bytes_hex":root_hex,"branches":p.branches});
             };
             if let Some((id,entry,_))=source {
-                store.rescan_to_store(&id,entry,&ScanOptions::full(),HISTORY_BUDGET,&job.cancel,progress).map_err(err)
+                store.rescan_to_store(&id,entry,&options,HISTORY_BUDGET,&job.cancel,progress).map_err(err)
             } else {
-                store.scan_to_store(&root,&ScanOptions::full(),HISTORY_BUDGET,&job.cancel,progress).map_err(err)
+                store.scan_to_store(&root,&options,HISTORY_BUDGET,&job.cancel,progress).map_err(err)
             }
         })();
         let mut status=job.status.lock().unwrap();
@@ -456,9 +457,9 @@ mod tests {
         let prepared=store.prepare_rescan(&saved.id,0).unwrap();assert!(prepared["root_path_bytes_hex"].as_str().unwrap().ends_with("FF"));
         assert!(desktop.job.lock().unwrap().is_none()); // prepare then cancel is no job.
         *desktop.job.lock().unwrap()=Some(Arc::new(Job{cancel:AtomicBool::new(false),status:Mutex::new(json!({"phase":"saving"}))}));
-        assert!(launch_scan(None,Some((saved.id.clone(),0,prepared.clone())),&desktop).unwrap_err().contains("allerede"));
+        assert!(launch_scan(None,Some((saved.id.clone(),0,prepared.clone())),false,&desktop).unwrap_err().contains("allerede"));
         *desktop.job.lock().unwrap()=None;
-        launch_scan(None,Some((saved.id.clone(),0,prepared.clone())),&desktop).unwrap();
+        launch_scan(None,Some((saved.id.clone(),0,prepared.clone())),false,&desktop).unwrap();
         let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
         loop {let status=desktop.job.lock().unwrap().as_ref().unwrap().status.lock().unwrap().clone();
             assert!(status["root"].is_string());assert_eq!(status["root_path_bytes_hex"],prepared["root_path_bytes_hex"]);

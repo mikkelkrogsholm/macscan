@@ -144,3 +144,10 @@ default-path cost without hiding work behind the watcher. These are warm,
 three-repeat synthetic observations, not a cold-cache or whole-device claim.
 The watcher and aggregation algorithms were unchanged. Reports and executable
 hashes are retained in ignored `evidence/issue-8A2/`.
+
+
+Native desktop capture uses the same `ScanOptions.capture_clones` flag.
+Folder/volume/whole-Mac starts have an unchecked next-scan checkbox; exact-entry
+rescan confirmation has a separate unchecked checkbox. Native start commands
+accept optional `captureClones` (omitted means false). Whole-Mac passes it to
+each volume using the existing job. See [desktop metric behavior](apfs-data-clone.md#native-desktop).
