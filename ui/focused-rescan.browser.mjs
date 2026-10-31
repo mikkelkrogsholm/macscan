@@ -48,7 +48,22 @@ try{
  // Same display-second older measurement remains an eligible baseline via exact ns.
  assert.equal(await page.locator('#before-scan option[value="130-1"]').count(),0); // currently oldest
  await page.locator('#history-list .history-item').nth(1).click();await page.waitForFunction(()=>document.querySelector('#before-scan option[value="130-1"]'));
- await open();assert.match(await dialog.innerText(),/\/synthetic/);await page.keyboard.press('Escape');assert.equal((await calls()).length,0);
+ await open();assert.match(await dialog.innerText(),/\/synthetic/);
+ // Native-dialog contrast regression: every text role uses a readable dark palette.
+ const colors=await dialog.evaluate(d=>{
+  const rgb=value=>value.match(/[\d.]+/g).slice(0,3).map(Number);
+  const luminance=value=>rgb(value).map(n=>{n/=255;return n<=.04045?n/12.92:((n+.055)/1.055)**2.4}).reduce((sum,n,i)=>sum+n*[.2126,.7152,.0722][i],0);
+  const contrast=(a,b)=>{const x=luminance(a),y=luminance(b);return (Math.max(x,y)+.05)/(Math.min(x,y)+.05)};
+  const background=getComputedStyle(d).backgroundColor;
+  return {background,ratios:[d.querySelector('h2'),d.querySelector('p'),...d.querySelectorAll('button')].map(n=>{
+   const s=getComputedStyle(n),own=s.backgroundColor;return contrast(s.color,own==='rgba(0, 0, 0, 0)'?background:own);
+  })};
+ });
+ assert.equal(colors.background,'rgb(32, 38, 52)');for(const ratio of colors.ratios)assert.ok(ratio>=4.5,`dialog text contrast ${ratio}`);
+ await dialog.getByRole('button',{name:'Annuller',exact:true}).focus();await page.keyboard.press('Tab');
+ const focus=await dialog.locator(':focus-visible').evaluate(n=>{const s=getComputedStyle(n);return {width:s.outlineWidth,color:s.outlineColor};});assert.equal(focus.width,'2px');assert.equal(focus.color,'rgb(199, 189, 255)');
+ await page.screenshot({path:new URL('focused-dialog-dark.png',out).pathname});
+ await page.keyboard.press('Escape');assert.equal((await calls()).length,0);
  await page.locator('#rows .file-row').click();await page.waitForFunction(()=>document.querySelector('#rescan').textContent==='Genmål denne mappe');await open();assert.match(await dialog.innerText(),/\/synthetic\/child/);await cancel();assert.equal((await calls()).length,0);
  // Delayed accepted-view navigation keeps header source pair on the old display.
  await page.evaluate(()=>{window.holdView=true;document.querySelectorAll('#history-list .history-item')[0].click();});await page.waitForFunction(()=>typeof window.finishView==='function');await open();assert.deepEqual(await page.evaluate(()=>window.calls.filter(c=>c.name==='prepare_rescan').at(-1).args),{scanId:'130-2',entry:3});await cancel();await page.evaluate(()=>{window.holdView=false;window.finishView();delete window.finishView;});await page.waitForFunction(()=>!document.querySelector('.workspace').classList.contains('loading'));
