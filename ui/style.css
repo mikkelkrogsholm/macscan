@@ -29,3 +29,7 @@
 #coverage-body .insights-notice{padding:12px;border:1px solid #e9b36255;color:#f6d99f}
 #coverage-dialog .coverage-heading{display:flex;align-items:center;justify-content:space-between;gap:20px;position:sticky;top:-26px;background:#202634;padding:12px 0;z-index:1}
 #coverage-dialog .coverage-heading h2{margin:0}#coverage-dialog .coverage-heading form{margin:0}
+#rescan-dialog{width:min(560px,calc(100vw - 48px));border:1px solid var(--border,#d9dde4);border-radius:16px;padding:24px;color:inherit;background:var(--surface,#fff)}
+#rescan-dialog::backdrop{background:#14223766}
+#rescan-dialog p{overflow-wrap:anywhere;line-height:1.5}
+#rescan-dialog button{margin:12px 10px 0 0}

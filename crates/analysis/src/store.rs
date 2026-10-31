@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+mod focused;
 mod coverage;
 mod categories;
 mod insights;
@@ -545,7 +546,7 @@ impl Store {
             json!({"scan_id":id,"metric":metric.name(),"selected":selected,"ancestors":ancestors,"nodes":nodes,
           "child_count":count["count"],"status":manifest["status"],"started_at":manifest["started_at"],
           "scope":manifest["scope"],"entry_count":manifest["entry_count"],"error_count":manifest["error_count"],
-          "issues":issues,"capacity":manifest["context"]["volume_after"],
+          "origin":manifest["origin"],"measurement_context":manifest["context"],"issues":issues,"capacity":manifest["context"]["volume_after"],
           "render_limits":{"nodes":320,"levels":3,"children_per_branch":12}}),
         )
     }

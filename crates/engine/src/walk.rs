@@ -82,6 +82,17 @@ pub fn walk_with_progress(
     requested: &Path,
     options: &ScanOptions,
     cancel: &AtomicBool,
+    emit: impl FnMut(StreamEntry) -> io::Result<()>,
+    progress: impl FnMut(&Progress),
+) -> io::Result<WalkSummary> {
+    walk_with_progress_guarded(requested, options, cancel, false, emit, progress)
+}
+
+/// Focused remeasurement must keep the canonical saved destination. Validation
+/// lives after the existing provider/dataless gate, before any root enumeration.
+pub fn walk_with_progress_guarded(
+    requested: &Path, options: &ScanOptions, cancel: &AtomicBool,
+    require_saved_destination: bool,
     mut emit: impl FnMut(StreamEntry) -> io::Result<()>,
     mut progress: impl FnMut(&Progress),
 ) -> io::Result<WalkSummary> {
@@ -110,12 +121,17 @@ pub fn walk_with_progress(
     }
     let metadata = Metadata::from_std(&initial)?;
     let mut excluded_root = cloud_path(&requested) || metadata.dataless();
+    let saved_destination = requested.clone();
     let root = if excluded_root {
         requested
     } else {
         requested.canonicalize()?
     };
     excluded_root |= cloud_path(&root);
+    if require_saved_destination && root != saved_destination {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "Den gemte sti peger nu et andet sted; vælg en ny mappe eksplicit"));
+    }
     let root_excluded = options.exclusions.iter().any(|p| root.starts_with(p));
     let directory = if metadata.is_dir() && !excluded_root && !root_excluded {
         let d = Directory::root(&root)?;

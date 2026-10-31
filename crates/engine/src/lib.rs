@@ -23,7 +23,7 @@ pub use scan::{
 };
 pub use store::{Store, STORE_BUDGET};
 pub use volume::volumes;
-pub use walk::{walk_with_progress, StreamEntry, WalkSummary};
+pub use walk::{walk_with_progress_guarded, walk_with_progress, StreamEntry, WalkSummary};
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SCHEMA_VERSION: &str = "1.0";

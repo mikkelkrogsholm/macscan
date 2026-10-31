@@ -1,6 +1,6 @@
 //! Bounded batches -> Parquet -> disk-backed aggregation -> immutable snapshot.
 use super::*;
-use macscan_engine::{walk_with_progress, Progress, ScanOptions, StreamEntry};
+use macscan_engine::{walk_with_progress_guarded, Progress, ScanOptions, StreamEntry};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,14 @@ impl Store {
         options: &ScanOptions,
         budget: u64,
         cancel: &AtomicBool,
+        progress: impl FnMut(&Progress),
+    ) -> io::Result<String> {
+        self.scan_to_store_origin(root, options, budget, cancel, None, progress)
+    }
+
+    pub(super) fn scan_to_store_origin(
+        &self, root: &Path, options: &ScanOptions, budget: u64,
+        cancel: &AtomicBool, origin: Option<Value>,
         mut progress: impl FnMut(&Progress),
     ) -> io::Result<String> {
         cancelled(cancel)?;
@@ -131,10 +139,11 @@ impl Store {
                 }
                 scan_options.exclusion_reasons.push((self.root.clone(), macscan_engine::ExclusionReason::ScannerOutput));
                 let batch_budget = (options.max_memory_bytes / 4).clamp(64 * 1024, 4 * 1024 * 1024);
-                let mut summary = walk_with_progress(
+                let mut summary = walk_with_progress_guarded(
                     root,
                     &scan_options,
                     &stop,
+                    origin.is_some(),
                     |node| {
                         bytes = bytes.saturating_add(
                             node.path.as_os_str().as_bytes().len() * 4
@@ -164,7 +173,7 @@ impl Store {
                     "started_at":scan.started_at,"ended_at":scan.ended_at,"duration_ms":scan.duration_ms,
                     "entry_count":summary.entry_count,"error_count":scan.issue_count,"excluded_count":scan.excluded_count,
                     "coverage_diagnostics":scan.context["coverage_diagnostics"],
-                    "scan_mode":"streaming_full","workspace_limit_bytes":workspace_limit,
+                    "origin":origin,"scan_mode":"streaming_full","workspace_limit_bytes":workspace_limit,
                     "totals":{"logical_bytes":totals["logical_bytes"],"allocated_bytes":totals["allocated_bytes"],"accounted_allocated_bytes":totals["accounted_allocated_bytes"],"private_bytes":null,
                       "observed_lower_bound":{"logical_bytes":totals["observed_logical_bytes"],"allocated_bytes":totals["observed_allocated_bytes"],"accounted_allocated_bytes":totals["observed_accounted_allocated_bytes"]}},
                     "issues":scan.issues.iter().take(8).map(|i|json!({"entry_id":i.entry_id.to_string(),"code":i.code,"operation":i.operation,"detail":i.detail})).collect::<Vec<_>>()});

@@ -16,6 +16,8 @@ try{
  browser=await chromium.launch({headless:true,channel:process.env.MACSCAN_BROWSER_CHANNEL??'chrome'});const page=await browser.newPage({viewport:{width:1280,height:850}});const errors=[];page.on('pageerror',e=>errors.push(String(e)));
  await page.addInitScript(()=>{
   const scans=[{scan_id:'400-2',root:'/synthetic',policy:'p',started_at:'2026-10-22T10:00:00Z',status:'complete'},{scan_id:'400-1',root:'/synthetic',policy:'p',started_at:'2026-10-21T10:00:00Z',status:'complete'}];
+  const context={os_identity:'synthetic',volume_before:{volume_uuid:'synthetic'},volume_after:{volume_uuid:'synthetic'}};
+  for(const [i,scan]of scans.entries()){scan.root_path_bytes_hex='2F73796E746865746963';scan.context={...context,started_unix_ns:String(2-i)};}
   window.calls=[];window.mockCase='normal';
   const row={group_key:'project',path_display:'/synthetic/project',delta_bytes:'-3',changed_file_before_bytes:'10',changed_file_after_bytes:'7',observed_changed_file_before_bytes:'10',observed_changed_file_after_bytes:'7',file_path_count:'1',new_count:'0',removed_count:'0',changed_count:'1',unknown_count:'0',context_coverage:'complete',category:'dependencies'};
   window.__TAURI__={menu:{Menu:{}},core:{invoke:async(name,args={})=>{
@@ -24,7 +26,7 @@ try{
    if(name==='view_scan'){
     if(window.holdView)await new Promise(r=>window.finishView=r);
     const selected={entry_id:String(args.entry),parent_id:args.entry?'0':null,name_display:args.entry===3?'project':args.entry===4?'removed':'synthetic',path_display:'/synthetic/'+(args.entry===3?'project':args.entry===4?'removed':''),kind:args.entry===4?'file':'directory',bytes:'20',coverage_complete:true};
-    return {selected,ancestors:[{entry_id:'0',name_display:'synthetic'}],nodes:args.entry?[selected]:[selected,{...selected,entry_id:'3',parent_id:'0',name_display:'project',path_display:'/synthetic/project',bytes:'17'}],children:{records:args.entry===4?[]:[{entry_id:args.entry?'5':'3',parent_id:String(args.entry),name_display:args.entry?'ordinary-child':'project',kind:args.entry?'file':'directory',bytes:'7',coverage_complete:true}],next_cursor:null},scope:{root_display:'/synthetic'},started_at:scans.find(s=>s.scan_id===args.scanId).started_at,status:'complete',entry_count:'5',child_count:args.entry===4?'0':'1'};
+    return {selected,ancestors:[{entry_id:'0',name_display:'synthetic'}],nodes:args.entry?[selected]:[selected,{...selected,entry_id:'3',parent_id:'0',name_display:'project',path_display:'/synthetic/project',bytes:'17'}],children:{records:args.entry===4?[]:[{entry_id:args.entry?'5':'3',parent_id:String(args.entry),name_display:args.entry?'ordinary-child':'project',kind:args.entry?'file':'directory',bytes:'7',coverage_complete:true}],next_cursor:null},scope:{root_display:'/synthetic',root_path_bytes_hex:'2F73796E746865746963',policy_fingerprint:'p'},measurement_context:scans.find(s=>s.scan_id===args.scanId).context,started_at:scans.find(s=>s.scan_id===args.scanId).started_at,status:'complete',entry_count:'5',child_count:args.entry===4?'0':'1'};
    }
    if(name==='list_children')return {records:[],next_cursor:null};
    if(name==='growth'){

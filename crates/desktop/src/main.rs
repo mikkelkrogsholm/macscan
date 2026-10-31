@@ -38,7 +38,7 @@ fn history(path: &std::path::Path) -> Reply {
         let store = Store::open(path, false).map_err(err)?;
         for id in store.ids().map_err(err)?.into_iter().rev().take(100) {
             if let Ok(m) = store.manifest(&id) {
-                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"policy":m["scope"]["policy_fingerprint"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
+                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
             }
         }
     }
@@ -270,23 +270,38 @@ async fn compare_scans(
 }
 #[tauri::command]
 fn start_scan(root: String, state: State<'_, Desktop>) -> Reply {
-    launch_scan(Some(root),&state)
+    launch_scan(Some(root),None,&state)
 }
 #[tauri::command]
-fn start_machine(state: State<'_,Desktop>)->Reply {launch_scan(None,&state)}
+fn start_machine(state: State<'_,Desktop>)->Reply {launch_scan(None,None,&state)}
 #[tauri::command]
 async fn machine_session(session_id:String,state:State<'_,Desktop>)->Reply {
     let path=store_path(&state)?;
     blocking(move||machine::load(&path,&session_id).map_err(err)).await
 }
-fn launch_scan(root:Option<String>,state:&Desktop)->Reply {
-    let whole=root.is_none();
+#[tauri::command]
+async fn prepare_rescan(scan_id:String,entry:u32,state:State<'_,Desktop>)->Reply {
+    let path=store_path(&state)?;
+    blocking(move||Store::open(&path,false).map_err(err)?.prepare_rescan(&scan_id,entry).map_err(err)).await
+}
+#[tauri::command]
+async fn start_rescan(scan_id:String,entry:u32,state:State<'_,Desktop>)->Reply {
+    let path=store_path(&state)?;
+    let source_id=scan_id.clone();
+    let prepared=blocking(move||Store::open(&path,false).map_err(err)?.prepare_rescan(&source_id,entry).map_err(err)).await?;
+    launch_scan(None,Some((scan_id,entry,prepared)),&state)
+}
+fn launch_scan(root:Option<String>,source:Option<(String,u32,Value)>,state:&Desktop)->Reply {
+    let whole=root.is_none()&&source.is_none();
     let root=root.unwrap_or_else(||"/".into());
     let root = PathBuf::from(root);
     if !root.is_absolute() {
         return Err("Vælg en absolut lokal sti".into());
     }
     let store = store_path(&state)?;
+    let prepared=source.as_ref().map(|(_,_,prepared)|prepared);
+    let root_display=prepared.map(|p|p["root_display"].clone()).unwrap_or_else(||json!(root.to_string_lossy()));
+    let root_hex=prepared.map(|p|p["root_path_bytes_hex"].clone()).unwrap_or(Value::Null);
     let mut slot = state.job.lock().map_err(err)?;
     if let Some(job) = slot.as_ref() {
         let s = job.status.lock().map_err(err)?;
@@ -296,7 +311,7 @@ fn launch_scan(root:Option<String>,state:&Desktop)->Reply {
     }
     let job = Arc::new(Job {
         cancel: AtomicBool::new(false),
-        status: Mutex::new(json!({"phase":if whole{"planning"}else{"scanning"},"whole_mac":whole,"entries_seen":0,"elapsed_ms":0,"root":root})),
+        status: Mutex::new(json!({"phase":if whole{"planning"}else{"scanning"},"whole_mac":whole,"entries_seen":0,"elapsed_ms":0,"root":root_display,"root_path_bytes_hex":root_hex})),
     });
     *slot = Some(job.clone());
     std::thread::Builder::new().name("macscan-reader".into()).spawn(move||{
@@ -305,9 +320,15 @@ fn launch_scan(root:Option<String>,state:&Desktop)->Reply {
                 let plan=machine::plan().map_err(err)?;
                 return machine::run(&store,plan,&job.cancel,|value|{*job.status.lock().unwrap()=value;}).map_err(err);
             }
-            Store::open(&store,true).map_err(err)?.scan_to_store(&root,&ScanOptions::full(),HISTORY_BUDGET,&job.cancel,|p|{
-                *job.status.lock().unwrap()=json!({"phase":if p.finished {"saving"}else{"scanning"},"entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"root":root,"branches":p.branches});
-            }).map_err(err)
+            let store=Store::open(&store,true).map_err(err)?;
+            let progress=|p:&macscan_engine::Progress|{
+                *job.status.lock().unwrap()=json!({"phase":if p.finished {"saving"}else{"scanning"},"entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"root":root_display,"root_path_bytes_hex":root_hex,"branches":p.branches});
+            };
+            if let Some((id,entry,_))=source {
+                store.rescan_to_store(&id,entry,&ScanOptions::full(),HISTORY_BUDGET,&job.cancel,progress).map_err(err)
+            } else {
+                store.scan_to_store(&root,&ScanOptions::full(),HISTORY_BUDGET,&job.cancel,progress).map_err(err)
+            }
         })();
         let mut status=job.status.lock().unwrap();
         match result {Ok(id)=>{status["phase"]=json!("done");status["scan_id"]=json!(id);status["whole_mac"]=json!(whole);},Err(e)=>{
@@ -421,6 +442,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn focused_preparation_never_starts_a_job_and_active_guard_is_authoritative() {
+        use macscan_engine::scan;
+        let base=std::env::temp_dir().canonicalize().unwrap().join(format!("macscan-native-focused-{}",std::process::id()));
+        std::fs::create_dir(&base).unwrap();let source=base.join("source");std::fs::create_dir(&source).unwrap();std::fs::write(source.join("ordinary"),b"synthetic").unwrap();
+        let path=base.join("history");let store=Store::open(&path,true).unwrap();
+        let mut saved=scan(&source,&ScanOptions::default(),&AtomicBool::new(false)).unwrap();
+        use std::os::unix::ffi::OsStringExt;
+        saved.root=base.join(std::ffi::OsString::from_vec(b"missing-\xff".to_vec()));
+        store.save_with_cancel(&saved,HISTORY_BUDGET,&AtomicBool::new(false)).unwrap();
+        let desktop=Desktop{store:Mutex::new(path),explicit_store:true,job:Mutex::new(None)};
+        let prepared=store.prepare_rescan(&saved.id,0).unwrap();assert!(prepared["root_path_bytes_hex"].as_str().unwrap().ends_with("FF"));
+        assert!(desktop.job.lock().unwrap().is_none()); // prepare then cancel is no job.
+        *desktop.job.lock().unwrap()=Some(Arc::new(Job{cancel:AtomicBool::new(false),status:Mutex::new(json!({"phase":"saving"}))}));
+        assert!(launch_scan(None,Some((saved.id.clone(),0,prepared.clone())),&desktop).unwrap_err().contains("allerede"));
+        *desktop.job.lock().unwrap()=None;
+        launch_scan(None,Some((saved.id.clone(),0,prepared.clone())),&desktop).unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+        loop {let status=desktop.job.lock().unwrap().as_ref().unwrap().status.lock().unwrap().clone();
+            assert!(status["root"].is_string());assert_eq!(status["root_path_bytes_hex"],prepared["root_path_bytes_hex"]);
+            if status["phase"]=="error"{break;}assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(store.ids().unwrap(),vec![saved.id]);std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn native_growth_matches_shared_store_for_synthetic_saved_history() {
         use macscan_engine::{Entry, EntryKind, Scan, ScanStatus, STORE_BUDGET};
         let path = std::env::temp_dir().join(format!("macscan-desktop-growth-{}", std::process::id()));
@@ -532,6 +578,8 @@ fn main() {
             coverage,
             file_profile,
             compare_scans,
+            prepare_rescan,
+            start_rescan,
             start_scan,
             start_machine,
             machine_session,
