@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+pub use stream::StreamingProfile;
 mod focused;
 mod coverage;
 mod categories;

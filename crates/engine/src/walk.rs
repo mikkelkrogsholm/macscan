@@ -88,6 +88,18 @@ pub fn walk_with_progress(
     walk_with_progress_guarded(requested, options, cancel, false, emit, progress)
 }
 
+/// Opt-in developer timings over the same guarded production traversal.
+/// Forced fallback injects ENOTSUP before each directory's first bulk call,
+/// exercising the existing rewind/readdir/fstatat branch without policy changes.
+pub fn walk_with_progress_profiled_guarded(
+    requested: &Path, options: &ScanOptions, cancel: &AtomicBool,
+    require_saved_destination: bool, force_fallback: bool,
+    emit: impl FnMut(StreamEntry) -> io::Result<()>, progress: impl FnMut(&Progress),
+) -> (io::Result<WalkSummary>, crate::WalkProfile) {
+    crate::profile::measure(force_fallback, || walk_with_progress_guarded(
+        requested, options, cancel, require_saved_destination, emit, progress))
+}
+
 /// Focused remeasurement must keep the canonical saved destination. Validation
 /// lives after the existing provider/dataless gate, before any root enumeration.
 pub fn walk_with_progress_guarded(

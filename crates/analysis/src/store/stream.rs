@@ -1,9 +1,34 @@
 //! Bounded batches -> Parquet -> disk-backed aggregation -> immutable snapshot.
 use super::*;
-use macscan_engine::{walk_with_progress_guarded, Progress, ScanOptions, StreamEntry};
+use macscan_engine::{walk_with_progress_guarded, walk_with_progress_profiled_guarded, Progress, ScanOptions, StreamEntry};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
+
+/// Developer-only wall timings; never written to snapshot metadata.
+#[derive(Debug, Default)]
+pub struct StreamingProfile {
+    pub total: Duration,
+    pub walk_inclusive: Duration,
+    pub flush_during_walk: Duration,
+    pub flush_tail: Duration,
+    pub flush_count: u64,
+    pub finalize: Duration,
+    pub watcher_join: Duration,
+    pub publish: Duration,
+    /// Setup, manifest, cleanup, root/context work outside the walk, etc.
+    pub other: Duration,
+    pub walk: macscan_engine::WalkProfile,
+}
+impl StreamingProfile {
+    /// Exclusive top-level phases. Syscall times are nested inside walk_only.
+    pub fn walk_only(&self) -> Duration { self.walk_inclusive.saturating_sub(self.flush_during_walk) }
+    pub fn accounted(&self) -> Duration {
+        self.walk_only() + self.flush_during_walk + self.flush_tail + self.finalize
+            + self.watcher_join + self.publish + self.other
+    }
+}
+fn elapsed(start: Option<Instant>) -> Duration { start.map(|s|s.elapsed()).unwrap_or_default() }
 
 const RAW_SCHEMA: &str = "entry_id UBIGINT,parent_id UBIGINT,subtree_end UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,own_logical UBIGINT,own_allocated UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,mtime_unix_seconds BIGINT,enumeration_complete BOOLEAN,category VARCHAR";
 struct Finished<'a>(&'a AtomicBool);
@@ -28,8 +53,35 @@ impl Store {
     pub(super) fn scan_to_store_origin(
         &self, root: &Path, options: &ScanOptions, budget: u64,
         cancel: &AtomicBool, origin: Option<Value>,
-        mut progress: impl FnMut(&Progress),
+        progress: impl FnMut(&Progress),
     ) -> io::Result<String> {
+        self.scan_to_store_impl(root, options, budget, cancel, origin, progress, None, false)
+    }
+
+    /// Profile the complete production pipeline, including publication and watcher join.
+    /// `force_fallback` is a developer experiment, not a scan policy option.
+    pub fn scan_to_store_profiled(
+        &self, root: &Path, options: &ScanOptions, budget: u64,
+        cancel: &AtomicBool, progress: impl FnMut(&Progress), force_fallback: bool,
+    ) -> io::Result<(String, StreamingProfile)> {
+        let started = Instant::now();
+        let mut profile = StreamingProfile::default();
+        let id = self.scan_to_store_impl(root, options, budget, cancel, None, progress,
+            Some(&mut profile), force_fallback)?;
+        // Measure after the shared implementation returns, including lock/stage drops.
+        profile.total = started.elapsed();
+        profile.other = profile.total.saturating_sub(profile.walk_inclusive + profile.flush_tail
+            + profile.finalize + profile.watcher_join + profile.publish);
+        Ok((id, profile))
+    }
+
+    fn scan_to_store_impl(
+        &self, root: &Path, options: &ScanOptions, budget: u64,
+        cancel: &AtomicBool, origin: Option<Value>, mut progress: impl FnMut(&Progress),
+        profile: Option<&mut StreamingProfile>, force_fallback: bool,
+    ) -> io::Result<String> {
+        let enabled = profile.is_some();
+        let mut timings = StreamingProfile::default();
         cancelled(cancel)?;
         scanner_file_budget()?;
         let lock = fs::File::open(&self.root)?;
@@ -97,6 +149,7 @@ impl Store {
         let stop = AtomicBool::new(false);
         let done = AtomicBool::new(false);
         let exhausted = AtomicBool::new(false);
+        let mut join_start = None;
         let result = std::thread::scope(|scope| {
             let _finished = Finished(&done);
             scope.spawn(|| {
@@ -113,7 +166,7 @@ impl Store {
                     std::thread::sleep(Duration::from_millis(200));
                 }
             });
-            (|| -> io::Result<()> {
+            let result = (|| -> io::Result<()> {
                 let db = Db::spooling(
                     stage
                         .path
@@ -139,34 +192,42 @@ impl Store {
                 }
                 scan_options.exclusion_reasons.push((self.root.clone(), macscan_engine::ExclusionReason::ScannerOutput));
                 let batch_budget = (options.max_memory_bytes / 4).clamp(64 * 1024, 4 * 1024 * 1024);
-                let mut summary = walk_with_progress_guarded(
-                    root,
-                    &scan_options,
-                    &stop,
-                    origin.is_some(),
-                    |node| {
-                        bytes = bytes.saturating_add(
-                            node.path.as_os_str().as_bytes().len() * 4
-                                + node.entry.name.len()
-                                + 256,
-                        );
-                        batch.push(node);
-                        if batch.len() >= 4096 || bytes >= batch_budget {
-                            flush(&db, &stage.path, &mut batch, part)?;
-                            part += 1;
-                            bytes = 0;
-                        }
-                        Ok(())
-                    },
-                    |p| progress(p),
-                )?;
+                let walk_start = enabled.then(Instant::now);
+                let mut emit = |node: StreamEntry| {
+                    bytes = bytes.saturating_add(node.path.as_os_str().as_bytes().len() * 4
+                        + node.entry.name.len() + 256);
+                    batch.push(node);
+                    if batch.len() >= 4096 || bytes >= batch_budget {
+                        let start = enabled.then(Instant::now);
+                        flush(&db, &stage.path, &mut batch, part)?;
+                        timings.flush_during_walk += elapsed(start);
+                        timings.flush_count += 1;
+                        part += 1; bytes = 0;
+                    }
+                    Ok(())
+                };
+                let mut summary = if enabled {
+                    let (result, walk) = walk_with_progress_profiled_guarded(root, &scan_options,
+                        &stop, origin.is_some(), force_fallback, &mut emit, |p| progress(p));
+                    timings.walk = walk;
+                    result?
+                } else {
+                    walk_with_progress_guarded(root, &scan_options, &stop,
+                        origin.is_some(), &mut emit, |p| progress(p))?
+                };
+                timings.walk_inclusive = elapsed(walk_start);
                 if !batch.is_empty() {
+                    let start = enabled.then(Instant::now);
                     flush(&db, &stage.path, &mut batch, part)?;
+                    timings.flush_tail = elapsed(start);
+                    timings.flush_count += 1;
                 }
                 summary.scan.id = id.clone();
                 cancelled(&stop)?;
                 let root_valid = summary.scan.coverage_globally_valid();
+                let start = enabled.then(Instant::now);
                 let totals = finalize(&db, &stage.path, &stop, root_valid)?;
+                timings.finalize = elapsed(start);
                 let scan = &summary.scan;
                 let manifest = json!({"storage_format":FORMAT,"schema_version":"2.0","engine_version":ENGINE_VERSION,
                     "scan_id":id,"status":scan.status.name(),"scope":scan.report(0)["scope"],"context":scan.measurement_context(),
@@ -197,8 +258,11 @@ impl Store {
                 }
                 cancelled(&stop)?;
                 Ok(())
-            })()
+            })();
+            join_start = enabled.then(Instant::now);
+            result
         });
+        timings.watcher_join = elapsed(join_start);
         if exhausted.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::StorageFull,"scan workspace budget exhausted or less than 512 MiB free; previous snapshots preserved"));
         }
@@ -213,6 +277,7 @@ impl Store {
         }
         result?;
         cancelled(cancel)?;
+        let publish_start = enabled.then(Instant::now);
         let a = std::ffi::CString::new(stage.path.as_os_str().as_bytes()).unwrap();
         let b = std::ffi::CString::new(self.location(&id)?.as_os_str().as_bytes()).unwrap();
         if unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), 4) } != 0 {
@@ -222,6 +287,8 @@ impl Store {
         // Keep the ownership marker until after atomic publication. A crash
         // before rename must still leave a recognizable unpublished workspace.
         let _ = fs::remove_file(self.location(&id)?.join("stream-stage.json"));
+        timings.publish = elapsed(publish_start);
+        if let Some(profile) = profile { *profile = timings; }
         Ok(id)
     }
 }

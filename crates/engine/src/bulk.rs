@@ -15,9 +15,12 @@ impl Bulk {
     pub fn new() -> Self { Self { buffer: vec![0; 64*1024], rows: VecDeque::new(), used:false } }
     pub fn next(&mut self, fd:i32) -> io::Result<Option<(CString,Option<Metadata>)>> {
         if let Some(row)=self.rows.pop_front() {return Ok(Some(row));}
+        if !self.used && crate::profile::force_fallback() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
         let mut attrs=libc::attrlist {bitmapcount:5,reserved:0,commonattr:COMMON,volattr:0,dirattr:0,fileattr:FILE,forkattr:0};
         // SAFETY: live directory fd, initialized public attrlist, bounded writable buffer.
-        let n=unsafe {libc::getattrlistbulk(fd,(&mut attrs as *mut libc::attrlist).cast(),self.buffer.as_mut_ptr().cast(),self.buffer.len(),0)};
+        let n=crate::profile::timed(crate::profile::Call::Bulk, || unsafe {libc::getattrlistbulk(fd,(&mut attrs as *mut libc::attrlist).cast(),self.buffer.as_mut_ptr().cast(),self.buffer.len(),0)});
         if n<0 {return Err(io::Error::last_os_error());}
         self.used=true;
         let mut offset=0;

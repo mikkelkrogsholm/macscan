@@ -124,14 +124,14 @@ impl Directory {
     pub fn child_metadata(&self, name: &CString) -> io::Result<Metadata> {
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: name is a direct directory entry, fd is live, output is writable.
-        if unsafe {
+        if crate::profile::timed(crate::profile::Call::StatAt, || unsafe {
             libc::fstatat(
                 self.fd(),
                 name.as_ptr(),
                 stat.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
-        } != 0
+        }) != 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -159,7 +159,7 @@ impl Directory {
                 *libc::__error() = 0;
             }
             // SAFETY: a live DIR; returned memory remains valid until next readdir call.
-            let entry = unsafe { libc::readdir(self.0) };
+            let entry = crate::profile::timed(crate::profile::Call::ReadDir, || unsafe { libc::readdir(self.0) });
             if entry.is_null() {
                 let error = io::Error::last_os_error();
                 return if error.raw_os_error() == Some(0) {
