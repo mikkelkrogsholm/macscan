@@ -122,9 +122,13 @@ placeholders to manufacture a passing test. Do not enumerate an account home.
    distinguish background sync. If before-state is unavailable or ambiguous,
    report unknown; do not infer residency from allocated bytes or SF_DATALESS alone.
 2. Predeclare a maximum of one root metadata operation, one directory open/fstat,
-   one bounded enumeration batch (at most 10 direct entries), metadata for at most
-   those 10 entries, no child descent, and one final identity read. Include every
-   path-resolution, progress and capacity side call in the plan: disable progress
+   one enumeration call with a fixed 4096-byte bulk buffer (or at most 10
+   readdir iterator calls), at most 10 returned records processed and metadata
+   for at most those 10 records, no child descent, and one final identity read.
+   Bulk enumeration and readdir buffering may fetch more records internally:
+   this processing cap does not bound underlying enumeration or provider work.
+   Include every path-resolution, progress and capacity side call in the plan:
+   disable progress
    discovery and mount-resource queries for the first bounded experiment. Exact
    APIs/attributes must be frozen before the run. No file-content opens, reads,
    checksums, Quick Look, forced hydration, download or retries with policy ON.
@@ -135,8 +139,8 @@ placeholders to manufacture a passing test. Do not enumerate an account home.
    timeout are separate partial/unknown coverage states. Never convert any into
    an empty directory, zero bytes, complete subtree or deletion.
 4. Check Stop before each planned call; use a five-second between-call budget and
-   the fixed entry limit. An AtomicBool cannot interrupt synchronous VFS/provider
-   I/O. For a hard wall-clock containment requirement use a separately supervised
+   the fixed call/buffer budget and processed-record cap. An AtomicBool cannot
+   interrupt synchronous VFS/provider I/O. For a hard wall-clock containment requirement use a separately supervised
    helper process, and treat its forced termination as inconclusive with possible
    incomplete cleanup. Do not start another attempt while an earlier job is live.
    Never downgrade OFF or switch APIs to bypass a blocked materialization.
@@ -172,9 +176,10 @@ locally, with no dependency or Cargo.lock changes. All reported passing commands
 below ran after that correction:
 
 ```sh
-export PATH=/Users/mikkelfreltoftkrogsholm/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin:/usr/bin:/bin
-export RUSTC=/Users/mikkelfreltoftkrogsholm/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc
-export RUSTDOC=/Users/mikkelfreltoftkrogsholm/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustdoc
+provider_probe_toolchain="$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin"
+export PATH="$provider_probe_toolchain:/usr/bin:/bin"
+export RUSTC="$provider_probe_toolchain/rustc"
+export RUSTDOC="$provider_probe_toolchain/rustdoc"
 export CARGO_TARGET_DIR="$PWD/.build" CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 MACOSX_DEPLOYMENT_TARGET=14.0
 cargo test --locked --offline -p macscan-engine --example provider_metadata_probe
 cargo run --locked --offline -p macscan-engine --example provider_metadata_probe
