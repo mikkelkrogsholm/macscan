@@ -60,7 +60,7 @@ fn sample(flag: &str, command: &str) -> Option<&'static str> {
         }
         "--format" => "json",
         "--command" => "scan",
-        "--scan" | "--before" => "missing",
+        "--scan" | "--before" | "--run" => "missing",
         "--cursor" => "opaque-invalid-cursor",
         "--metric" => "logical",
         "--entry" | "--offset" | "--min-bytes" | "--min-age-days" => "0",
@@ -75,6 +75,8 @@ fn sample(flag: &str, command: &str) -> Option<&'static str> {
         "--view" => {
             if command == "profile" {
                 "files"
+            } else if command == "scans" {
+                "snapshots"
             } else {
                 "groups"
             }
@@ -330,10 +332,9 @@ fn advertised_ranges_and_mutual_exclusions_are_enforced_before_execution() {
             .unwrap(),
         2,
     );
-    error(
-        &f.cmd().args(["scans", "--run", "future"]).output().unwrap(),
-        2,
-    );
+    let help = object(&f.cmd().args(["scans", "--help"]).output().unwrap());
+    assert!(help["options"]["--run"].is_string());
+    assert!(help["options"]["--view"].is_string());
     error(&f.cmd().args(["scan", "--whole-mac"]).output().unwrap(), 2);
 }
 #[test]

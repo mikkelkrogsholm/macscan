@@ -75,14 +75,13 @@ pub fn load(store:&Path,id:&str)->io::Result<Value>{
     if value["kind"]!="whole_mac_v1"||value["session_id"]!=id{return Err(io::Error::other("invalid machine session"));}
     Ok(value)
 }
+#[cfg(test)]
 pub fn history(store:&Path)->Vec<Value>{
-    let Ok(entries)=fs::read_dir(store)else{return Vec::new();};
-    let mut result=Vec::new();
-    for e in entries.flatten(){let name=e.file_name();let name=name.to_string_lossy();let Some(id)=name.strip_suffix(".machine.json")else{continue;};
-        if let Ok(s)=load(store,id){result.push(json!({"kind":"machine","scan_id":id,"root":"Hele Mac’en","started_at":s["started_at"],"sort_at":s["ended_at"],"status":s["status"]}));}
-    }
-    result
+    Store::open(store,false).and_then(|s|s.history_catalog()).map(|catalog|catalog.machines.into_iter().map(|(id,s)|
+        json!({"kind":"machine","scan_id":id,"root":"Hele Mac’en","started_at":s["started_at"],"sort_at":s["ended_at"],"status":s["status"]})
+    ).collect()).unwrap_or_default()
 }
+
 fn publish(store:&Path,s:&Value)->io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let p=path(store,s["session_id"].as_str().unwrap())?;let temp=p.with_extension("tmp");

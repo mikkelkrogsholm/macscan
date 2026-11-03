@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
 mod retention;
+mod history;
+pub use retention::HistoryCatalog;
 mod apfs;
 #[cfg(test)]
 mod clone_tests;
@@ -31,6 +33,16 @@ const FORMAT: &str = "parquet-1";
 const CHUNK: usize = 8_192;
 const ENTRY_SCHEMA:&str="entry_id UBIGINT,parent_id UBIGINT,name_display VARCHAR,path_display VARCHAR,name_bytes BLOB,path_bytes BLOB,path_key BLOB,kind VARCHAR,logical_bytes UBIGINT,allocated_bytes UBIGINT,accounted_allocated_bytes UBIGINT,own_allocated_bytes UBIGINT,observed_logical_bytes UBIGINT,observed_allocated_bytes UBIGINT,observed_accounted_allocated_bytes UBIGINT,device_id UBIGINT,inode UBIGINT,link_count UBIGINT,observed_link_count UBIGINT,charged_to UBIGINT,mtime_unix_seconds BIGINT,coverage_complete BOOLEAN,enumeration_complete BOOLEAN,category VARCHAR,private_bytes UBIGINT";
 const ENTRY_CLONE_SCHEMA:&str="clone_status VARCHAR,clone_id UBIGINT,clone_extended_flags UBIGINT,clone_data_allocated_bytes UBIGINT,clone_device_id UBIGINT";
+
+/// A whole-Mac run must be resolved to a member snapshot before analysis.
+#[derive(Debug)]
+pub struct WrongIdType;
+impl std::fmt::Display for WrongIdType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("whole-Mac run ID is not a snapshot ID; use macscan scans --run RUN_ID to find snapshot IDs")
+    }
+}
+impl std::error::Error for WrongIdType {}
 
 pub struct Store {
     root: PathBuf,
@@ -68,7 +80,12 @@ impl Store {
         Ok(self.root.join(id))
     }
     pub fn manifest(&self, id: &str) -> io::Result<Value> {
-        let path = self.location(id)?.join("manifest.json");
+        let location = self.location(id)?;
+        if !location.exists() && self.root.join(format!("{id}.machine.json")).try_exists()? {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                WrongIdType));
+        }
+        let path = location.join("manifest.json");
         if path.metadata()?.len() > 64 * 1024 {
             return Err(invalid("oversize scan manifest"));
         }
@@ -628,40 +645,11 @@ impl Store {
         }
         compact_response(result, Some(&binding))
     }
+    /// Explicit legacy snapshot view; CLI defaults to runs instead.
     pub fn scans(&self, limit: usize, cursor: Option<&str>) -> io::Result<Value> {
-        let ids = self.ids()?;
-        let start = if let Some(c) = cursor {
-            ids.iter()
-                .position(|id| id == c)
-                .map(|n| n + 1)
-                .ok_or_else(|| invalid("unknown scans cursor"))?
-        } else {
-            0
-        };
-        let mut answer = json!({"schema_version":"2.0","command":"scans","status":"ok","records":[],"truncated":false,"next_cursor":null});
-        let mut next = start;
-        for (index, id) in ids.iter().enumerate().skip(start) {
-            let Ok(m) = self.manifest(id) else {
-                next = index + 1;
-                continue;
-            };
-            if answer["records"].as_array().unwrap().len() >= limit {
-                break;
-            }
-            let row = json!({"scan_id":id,"root":m["scope"]["root_display"],"status":m["status"],"started_at":m["started_at"],"entries":m["entry_count"],"metadata_bytes":directory_bytes(&self.location(id)?)?.to_string()});
-            answer["records"].as_array_mut().unwrap().push(row);
-            if serde_json::to_vec(&answer)?.len() + 512 > OUTPUT_BUDGET {
-                answer["records"].as_array_mut().unwrap().pop();
-                break;
-            }
-            next = index + 1;
-        }
-        answer["truncated"] = json!(next < ids.len());
-        if next < ids.len() && next > start {
-            answer["next_cursor"] = json!(ids[next - 1]);
-        }
-        compact_response(answer, None)
+        self.history_page(limit, cursor, None, true)
     }
+
 }
 
 fn run_query(
@@ -939,7 +927,7 @@ pub fn compact_response(mut value: Value, binding: Option<&str>) -> io::Result<V
         if let Some(binding) = binding {
             value["next_cursor"] = json!(format!("{binding}:{next}"));
         } else if value["command"] == "scans" {
-            value["next_cursor"] = last["scan_id"].clone();
+            value["next_cursor"] = history::next_cursor(&value, &last);
         } else if value["command"] == "volumes" {
             value["next_cursor"] = json!(format!(
                 "volumes-v1:{}",

@@ -22,7 +22,7 @@ This is a CLI migration, not a rewrite of retained measurements.
 Errors contain `error.code`, `operation`, `detail`, and `retryable`. Codes include
 `INVALID_ARGUMENT`, `INVALID_INPUT`, `NOT_FOUND`, `UNSUPPORTED`,
 `UNSUPPORTED_METRIC`, `UNSUPPORTED_WORKERS`, `ALREADY_EXISTS`, `BROKEN_PIPE`,
-`METADATA_LIMIT`, `CANCELLED`, `HISTORY_BUSY`, and `IO_ERROR`.
+`METADATA_LIMIT`, `CANCELLED`, `HISTORY_BUSY`, `WRONG_ID_TYPE`, and `IO_ERROR`.
 `HISTORY_BUSY` is retryable after the active operation finishes. Unknown I/O
 errors are not automatically retryable. A hint is included only when a concrete
 next action is supported; it does not promise that retry will repair an error.
@@ -105,7 +105,7 @@ SQL, compare and diagnostics now also communicate incomplete requested coverage
 through exit 10. Busy now has a typed exit 7 and `retryable: true`. Existing
 result fields remain available; store/native formats are unchanged.
 
-Whole-Mac CLI commands are not introduced here. Issue #19's acceptance for
+Whole-Mac CLI scanning is not introduced here. Issue #19's acceptance for
 partially saved/cancelled whole-Mac CLI results remains open and must be verified
 with issue #22. Existing desktop whole-Mac data is not migrated by this change.
 
@@ -140,8 +140,8 @@ outside the selected command; parsing and value validation remain ordinary
 Rust functions. The subprocess discovery suite checks advertised options
 against accepted/rejected invocations, alongside the existing value-validation,
 coverage, and pagination tests. Later commands must extend this same description
-and their own tests when implemented. Whole-Mac scanning and `scans --run` are
-not installed by CLI-02.
+and their own tests when implemented. Whole-Mac scanning is still reserved for
+CLI-04; run history is installed by CLI-03 below.
 
 Short help includes required operands, snapshot/entry ID roles, defaults and
 ranges, mutually exclusive filters, output channels, exit codes, and effects.
@@ -164,3 +164,54 @@ metrics are available; private bytes remain unsupported. Opt-in
 `--capture-apfs-clones` supports the limited full-DATA correction within a
 measurement root, with partial/non-DATA sharing retained. It does not establish
 unique, private, or reclaimable bytes. No atomic filesystem snapshot is claimed.
+
+
+## Run history and CLI 3.0 list migration (CLI-03)
+
+`macscan scans` now lists global **runs**, newest first by exact numerical ID
+components (timestamp, process and optional sequence), matching retention. CLI 2.0
+listed individual snapshots. Migrate snapshot-list consumers to
+`macscan scans --view snapshots`; this explicit view includes `scan_id`,
+`snapshot_id`, root, saved status/time, entries, coverage and `metadata_bytes`.
+All views use default 10/max 100 rows, the shared 8192-byte JSON/NDJSON budget,
+and opaque `next_cursor` values. Pass each cursor unchanged to the same view and
+run. Byte compaction resumes after the last delivered row, including volumes
+without a snapshot. A single oversized row fails explicitly rather than being
+silently skipped. If retention removes a cursor anchor, restart the listing.
+
+Run rows distinguish `kind: standalone` and `kind: whole_mac`, with `run_id`,
+`id_role: run`, saved status/time, member/snapshot counts and coverage. A
+standalone run has one snapshot; its `run_id` and `snapshot_id` currently have the
+same value but distinct roles. A whole-Mac run can have zero or many snapshots.
+Its run ID is never a snapshot alias. The page describes the fixed three-run
+retention policy; listing itself does not prune, reclaim stages, lock for writing
+or create a store. A genuinely missing store is a successful empty list;
+measurement queries against a missing store still fail with exit 4.
+
+Resolve members with `macscan scans --run RUN_ID`. The page retains `run_kind`
+and saved `run_status` even when it has no members; command `status: ok` and
+`outcome: ok` describe successful catalog delivery. Each row includes stable
+`member_index`, terminal `phase`, saved snapshot status and reason when known.
+Saved members expose both `snapshot_id` and compatible `scan_id` for
+`summary`, `children`, `inspect`, `insights`, `profile`, `coverage`, `compare`,
+`growth` and `query`. Unmounted, error, cancelled and not-scanned volumes retain
+their rows; absent snapshots, entry counts and coverage are NULL, not zero.
+An empty cancelled or partial run remains valid. Legacy partial/cancelled
+sessions may preserve pending or unknown phases without snapshot references;
+these remain visible with NULL measurement data and block all pruning. A
+complete empty run, corrupt session, dangling reference or inconsistent saved status fails
+with a structured error and preserves history. Older compatible snapshots and
+optional absent session fields require no migration.
+
+Passing a whole-Mac run ID to a snapshot analysis command returns exit 2,
+`WRONG_ID_TYPE`, with a hint to use `scans --run`. `--run` and
+`--view snapshots` are mutually exclusive. OS capacity appears separately under
+`os_capacity` (run) and `os_used_bytes` (member). No file totals are aggregated
+across volumes and no unique or reclaimable capacity is inferred. App history
+uses the same validated groups and keeps enriched child metadata for baselines,
+source navigation and APFS analysis even when the sidebar hides those children.
+
+The process fixtures in `crates/cli/tests/history.rs` cover mixed and shared
+runs, exact numeric ordering, both encodings and byte-limited pagination,
+terminal missing-volume states, empty/corrupt/dangling history, existing snapshot
+analysis and four-to-three retention. They use owned synthetic files only.

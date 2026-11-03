@@ -123,6 +123,9 @@ pub fn options(command: &str) -> Vec<(&'static str, &'static str)> {
         ));
     }
     match command {
+        "scans" => flags.extend([
+            ("--run", "run ID from scans; list saved snapshot IDs and terminal volume states; mutually exclusive with --view snapshots"),
+            ("--view", "runs|snapshots; CLI 3.0 defaults to runs (newest first); snapshots explicitly selects the former snapshot list")]),
         "scan" => flags.extend([
             ("--save", "boolean flag, default false; retain metadata and permit three-run metadata pruning after publication"),
             ("--output", "absolute metadata directory alias; implies --save; last store/output wins"),

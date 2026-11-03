@@ -34,20 +34,20 @@ fn store_path(state: &Desktop) -> Result<PathBuf, String> {
 }
 fn history(path: &std::path::Path) -> Reply {
     let mut scans = Vec::new();
-    let machines=machine::history(path);
-    let mut grouped=std::collections::BTreeSet::new();
-    for row in &machines {if let Some(id)=row["scan_id"].as_str(){if let Ok(s)=machine::load(path,id){if let Some(rows)=s["volumes"].as_array(){for row in rows{if let Some(id)=row["scan_id"].as_str(){grouped.insert(id.to_owned());}}}}}}
+    let mut machines = Vec::new();
     if path.exists() {
         let store = Store::open(path, false).map_err(err)?;
-        for id in store.ids().map_err(err)?.into_iter().rev().take(100) {
-            if let Ok(m) = store.manifest(&id) {
-                scans.push(json!({"grouped_volume":grouped.contains(&id),"scan_id":id,"root":m["scope"]["root_display"],"apfs_data_clone":m["apfs_data_clone"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
-            }
+        let catalog = store.history_catalog().map_err(err)?;
+        for (id, session) in &catalog.machines {
+            machines.push(json!({"kind":"machine","scan_id":id,"root":"Hele Mac’en","started_at":session["started_at"],"sort_at":session["ended_at"],"status":session["status"]}));
+        }
+        // All child metadata remains available for source navigation and baselines.
+        for (id, m) in &catalog.snapshots {
+            scans.push(json!({"grouped_volume":catalog.grouped.contains(id),"scan_id":id,"root":m["scope"]["root_display"],"apfs_data_clone":m["apfs_data_clone"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
         }
     }
     scans.extend(machines);
     scans.sort_by(|a,b|b["sort_at"].as_str().or(b["started_at"].as_str()).cmp(&a["sort_at"].as_str().or(a["started_at"].as_str())));
-    scans.truncate(100);
     Ok(json!({"store":path,"scans":scans,"metadata_budget_bytes":HISTORY_BUDGET}))
 }
 async fn blocking(f: impl FnOnce() -> Reply + Send + 'static) -> Reply {
@@ -449,6 +449,22 @@ fn information_to_copy(result: &Value) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_partial_history_preserves_unknown_volume_states() {
+        let base=std::env::temp_dir().join(format!("macscan-native-legacy-history-{}",std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let session=json!({"kind":"whole_mac_v1","session_id":"661-1","status":"partial","volumes":[
+            {"phase":"pending","scan_id":null},{"phase":"future_phase","scan_id":null}]});
+        let file=base.join("661-1.machine.json");
+        std::fs::write(&file,serde_json::to_vec(&session).unwrap()).unwrap();
+        let h=history(&base).unwrap();
+        assert_eq!(h["scans"][0]["kind"],"machine");
+        assert_eq!(h["scans"][0]["status"],"partial");
+        assert_eq!(machine::load(&base,"661-1").unwrap()["volumes"],session["volumes"]);
+        assert!(Store::open(&base,false).unwrap().prune_history(true).is_err());
+        assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(file).unwrap()).unwrap(),session);
+        std::fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     fn grouped_history_keeps_child_metadata_for_comparison() {
         let base=std::env::temp_dir().join(format!("macscan-native-grouped-{}",std::process::id()));std::fs::create_dir(&base).unwrap();

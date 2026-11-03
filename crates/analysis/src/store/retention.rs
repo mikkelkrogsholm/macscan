@@ -5,7 +5,7 @@ use std::{
     os::fd::AsRawFd,
 };
 
-fn key(id: &str) -> io::Result<Vec<u128>> {
+pub(super) fn key(id: &str) -> io::Result<Vec<u128>> {
     validate_id(id)?;
     let parts: Vec<_> = id
         .split('-')
@@ -67,6 +67,14 @@ fn owned_snapshot(path: &Path, id: &str) -> io::Result<()> {
         return Err(invalid("incomplete snapshot"));
     }
     Ok(())
+}
+/// Validated immutable history shared by CLI, app and retention.
+pub struct HistoryCatalog {
+    pub snapshots: BTreeMap<String, Value>,
+    pub machines: BTreeMap<String, Value>,
+    pub run_ids: Vec<String>,
+    pub grouped: BTreeSet<String>,
+    references: BTreeMap<String, BTreeSet<String>>,
 }
 struct Plan {
     kept: Vec<String>,
@@ -142,9 +150,14 @@ impl Store {
             .checked_add(allowance)
             .ok_or_else(|| invalid("metadata allowance overflow"))
     }
-    fn retention_plan(&self, current: Option<&str>) -> io::Result<Plan> {
-        let mut snapshots = BTreeSet::new();
-        let mut machines = BTreeMap::<String, BTreeSet<String>>::new();
+    /// Read-only: no locks, directory creation, stage reclamation or pruning.
+    pub fn history_catalog(&self) -> io::Result<HistoryCatalog> {
+        self.history_catalog_for(false)
+    }
+    fn history_catalog_for(&self, pruning: bool) -> io::Result<HistoryCatalog> {
+        let mut snapshots = BTreeMap::new();
+        let mut machines = BTreeMap::new();
+        let mut references = BTreeMap::<String, BTreeSet<String>>::new();
         for item in fs::read_dir(&self.root)? {
             let item = item?;
             let name = item.file_name().to_string_lossy().into_owned();
@@ -171,10 +184,13 @@ impl Store {
                     let phase = row["phase"]
                         .as_str()
                         .ok_or_else(|| invalid("missing volume state"))?;
+                    // Legacy partial/cancelled sessions may preserve pending or
+                    // future phases without snapshots. Reads expose unknown data;
+                    // cleanup still requires the original terminal-only contract.
                     if !matches!(
                         phase,
                         "done" | "error" | "cancelled" | "not_scanned" | "unmounted"
-                    ) {
+                    ) && (pruning || s["status"] == "complete" || !row["scan_id"].is_null()) {
                         return Err(invalid("incomplete machine references; history preserved"));
                     }
                     if let Some(id) = row["scan_id"].as_str() {
@@ -189,30 +205,44 @@ impl Store {
                             return Err(invalid("unsafe volume reference"));
                         }
                         owned_snapshot(&p, id)?;
+                        let manifest = self.manifest(id)?;
+                        if (s["status"] == "complete" && manifest["status"] != "complete")
+                            || (!row["scan_status"].is_null() && row["scan_status"] != manifest["status"])
+                        {
+                            return Err(invalid("inconsistent saved volume status; history preserved"));
+                        }
                         refs.insert(id.to_owned());
-                    } else if phase == "done" || !row["scan_id"].is_null() {
+                    } else if phase == "done" || !row["scan_id"].is_null() || s["status"] == "complete" {
                         return Err(invalid("invalid volume reference"));
                     }
                 }
                 if refs.is_empty() && s["status"] == "complete" {
                     return Err(invalid("empty machine reference state; history preserved"));
                 }
-                machines.insert(id.to_owned(), refs);
+                references.insert(id.to_owned(), refs);
+                machines.insert(id.to_owned(), s);
             } else if kind.is_dir()
                 && key(&name).is_ok()
                 && owned_snapshot(&item.path(), &name).is_ok()
             {
-                snapshots.insert(name);
+                let manifest = self.manifest(&name)?;
+                snapshots.insert(name, manifest);
             }
         }
-        let grouped: BTreeSet<_> = machines.values().flatten().cloned().collect();
-        let mut runs: Vec<_> = snapshots
-            .difference(&grouped)
+        let grouped: BTreeSet<_> = references.values().flatten().cloned().collect();
+        let mut runs: Vec<_> = snapshots.keys()
+            .filter(|id| !grouped.contains(*id))
             .cloned()
             .chain(machines.keys().cloned())
             .collect();
         runs.sort_by_cached_key(|id| key(id).unwrap());
         runs.reverse();
+        Ok(HistoryCatalog { snapshots, machines, run_ids: runs, grouped, references })
+    }
+    fn retention_plan(&self, current: Option<&str>) -> io::Result<Plan> {
+        let catalog = self.history_catalog_for(true)?;
+        let mut runs = catalog.run_ids;
+        let machines = catalog.references;
         // Clock corrections/imported future IDs must not evict the result
         // the caller has just published and is about to display.
         if let Some(current) = current {

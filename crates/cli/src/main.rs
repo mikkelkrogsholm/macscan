@@ -33,7 +33,9 @@ impl Error {
         }
     }
     fn io(operation: &'static str, e: io::Error) -> Self {
-        let (exit, code) = match e.kind() {
+        let (exit, code) = if e.get_ref().is_some_and(|cause|cause.is::<macscan_analysis::WrongIdType>()) {
+            (2, "WRONG_ID_TYPE")
+        } else { match e.kind() {
             io::ErrorKind::NotFound => (4, "NOT_FOUND"),
             io::ErrorKind::InvalidInput => (2, "INVALID_INPUT"),
             io::ErrorKind::Unsupported => (6, "UNSUPPORTED"),
@@ -43,7 +45,7 @@ impl Error {
             io::ErrorKind::Interrupted => (130, "CANCELLED"),
             io::ErrorKind::WouldBlock if matches!(operation, "run_lock" | "history-prune") => (7, "HISTORY_BUSY"),
             _ => (3, "IO_ERROR"),
-        };
+        }};
         Self {
             exit,
             code,
@@ -57,6 +59,8 @@ struct Options {
     query: Query,
     scan: ScanOptions,
     scan_id: Option<String>,
+    run_id: Option<String>,
+    snapshots: bool,
     reason: Option<String>,
     store: PathBuf,
     save: bool,
@@ -98,6 +102,8 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         },
         scan: ScanOptions::full(),
         scan_id: None,
+        run_id: None,
+        snapshots: false,
         reason: None,
         store: PathBuf::from(home).join("Library/Application Support/Macscan"),
         save: false,
@@ -172,6 +178,10 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             {
                 options.scan_id = Some(utf8(value)?.into())
             }
+            "--run" => options.run_id = Some(utf8(value)?.into()),
+            "--view" if command == "scans" => options.snapshots = match utf8(value)? {
+                "snapshots" => true, "runs" => false, _ => return Err(Error::usage("view must be runs or snapshots")),
+            },
             "--reason" => options.reason=Some(utf8(value)?.into()),
             "--metric" =>
             {
@@ -552,11 +562,15 @@ fn run(args: &[OsString], publication: &mut Publication) -> Result<u8> {
             result
         }
         "scans" => {
-            let store =
-                Store::open(&options.store, false).map_err(|e| Error::io("open_store", e))?;
-            store
-                .scans(options.query.limit, options.query.cursor.as_deref())
-                .map_err(|e| Error::io("scans", e))?
+            if options.run_id.is_some() && options.snapshots { return Err(Error::usage("--run and --view snapshots are mutually exclusive")); }
+            match Store::open(&options.store, false) {
+                Ok(store) => store.history_page(options.query.limit, options.query.cursor.as_deref(), options.run_id.as_deref(), options.snapshots)
+                    .map_err(|e| Error::io("scans", e))?,
+                Err(e) if e.kind()==io::ErrorKind::NotFound && options.run_id.is_none() && options.query.cursor.is_none()
+                    && std::fs::symlink_metadata(&options.store).is_err_and(|e|e.kind()==io::ErrorKind::NotFound) =>
+                    json!({"command":"scans","status":"ok","view":if options.snapshots {"snapshots"}else{"runs"},"records":[],"truncated":false,"next_cursor":null}),
+                Err(e) => return Err(Error::io("open_store",e)),
+            }
         }
         _ => return Err(Error::usage("unknown command; use schema")),
     };
@@ -618,13 +632,15 @@ fn bounded_detail(text: &str, maximum: usize) -> (&str, bool) {
 }
 fn error_response(e: &Error, publication: &Publication, ndjson: bool) -> Value {
     let (detail, truncated) = bounded_detail(&e.detail, 768);
-    let hint = match e.exit {
+    let hint = if e.code == "WRONG_ID_TYPE" {
+        Some("Use macscan scans --run RUN_ID to find snapshot IDs, then pass a snapshot ID to --scan.")
+    } else { match e.exit {
         2 => Some("Check the command and flags against macscan schema."),
         4 => Some("Check that the requested root, store, scan or entry exists."),
         5 => Some("Review the metadata/workspace budget and available disk space before trying again."),
         7 => Some("Wait for the active scan or history cleanup to finish, then retry."),
         _ => None,
-    };
+    }};
     let mut value = json!({"schema_version":"3.0","engine_version":ENGINE_VERSION,
         "status":"failed","outcome":if e.exit == 130 {"cancelled"}else{"failed"},
         "error":{"code":e.code,"operation":e.operation,"detail":detail,
