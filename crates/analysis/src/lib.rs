@@ -3,3 +3,5 @@
 mod duck;
 mod store;
 pub use store::{HistoryCatalog, WrongIdType,StreamingProfile, compact_response, encode_response, InsightsQuery, FileProfileQuery, GrowthQuery, GrowthGrouping, Store, DEFAULT_LIMIT, OUTPUT_BUDGET, FULL_HISTORY_BUDGET};
+
+pub mod machine;

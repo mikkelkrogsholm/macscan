@@ -55,7 +55,7 @@ fn error(output: &Output, code: i32) -> Value {
 }
 fn sample(flag: &str, command: &str) -> Option<&'static str> {
     Some(match flag {
-        "--save" | "--capture-apfs-clones" | "--no-extension" | "--dry-run" | "--apply" => {
+        "--whole-mac" | "--save" | "--capture-apfs-clones" | "--no-extension" | "--dry-run" | "--apply" => {
             return None
         }
         "--format" => "json",
@@ -242,7 +242,10 @@ fn each_advertised_option_passes_runtime_applicability_and_unadvertised_options_
                 cmd.arg(v);
             }
             let output = cmd.output().unwrap();
-            if flags.contains_key(flag) {
+            if name=="scan" && flag=="--whole-mac" {
+                // Production parser validation only: explicit ROOT prevents inventory.
+                error(&output,2);
+            } else if flags.contains_key(flag) {
                 if output.status.success() {
                     object(&output);
                 } else {
@@ -335,7 +338,8 @@ fn advertised_ranges_and_mutual_exclusions_are_enforced_before_execution() {
     let help = object(&f.cmd().args(["scans", "--help"]).output().unwrap());
     assert!(help["options"]["--run"].is_string());
     assert!(help["options"]["--view"].is_string());
-    error(&f.cmd().args(["scan", "--whole-mac"]).output().unwrap(), 2);
+    error(&f.cmd().args(["scan", "owned-root", "--whole-mac"]).output().unwrap(), 2);
+    error(&f.cmd().args(["scan", "--whole-mac", "owned-root"]).output().unwrap(), 2);
 }
 #[test]
 fn copied_binary_discovery_needs_no_repository_home_or_path_tools() {

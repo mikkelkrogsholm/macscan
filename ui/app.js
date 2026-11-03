@@ -155,7 +155,7 @@ function showMachine(session){
  $('#coverage').classList.remove('hidden');$('#coverage').textContent=session.coverage_note+(view.accountingOverlap?' Volumenallokering overstiger containerforbruget; grafen er normaliseret, ikke en frigørbar sum.':'');
  coverageButton(()=>coverageDialog.openMachine(session));
  renderCrumbs();renderChart();renderRows();renderInspector();renderMode();renderHistory();
- $('#center-size').textContent=formatBytes(session.used_bytes);$('#center-note').textContent='Diskforbrug fra macOS';$('#chart-context').textContent='APFS-volumener · ikke filsummer';
+ $('#center-size').textContent=formatBytes(session.used_bytes);$('#center-note').textContent=session.used_bytes==null?'Ukendt diskforbrug':'Diskforbrug fra macOS';$('#chart-context').textContent='APFS-volumener · ikke filsummer';
  $('#provenance').textContent=formatBytes(session.free_bytes)+' ledigt · eksterne drev og diskimages tælles ikke oveni';
 }
 async function navigate(entry,loaded=null){
@@ -192,13 +192,14 @@ function renderChart(){
  }
  $('#center-label').textContent=view.selected.name_display||rootName(view.scope.root_display);
  $('#center-size').textContent=formatBytes(view.selected.bytes??view.selected.observed_bytes);
- const fullNote=(state.overview?'Diskforbrug fra macOS':metricLabel(state.metric))+(view.selected.bytes===null?' · Mindst observeret':'');
- $('#center-note').textContent=view.selected.bytes===null?'Mindst observeret':state.metric===APFS&&!state.overview?'APFS DATA':metricLabel(state.metric);
+ const unknownMachine=state.overview&&view.selected.bytes==null;
+ const fullNote=(state.overview?'Diskforbrug fra macOS':metricLabel(state.metric))+(view.selected.bytes===null&&!state.overview?' · Mindst observeret':'');
+ $('#center-note').textContent=unknownMachine?'Ukendt diskforbrug':view.selected.bytes===null?'Mindst observeret':state.metric===APFS&&!state.overview?'APFS DATA':metricLabel(state.metric);
  $('#center-note').title=fullNote;$('#center-note').setAttribute('aria-label',fullNote);
  if(state.metric===APFS&&!state.overview)$('#chart-center').setAttribute('aria-label',($('#center-label').textContent+' · '+$('#center-size').textContent+' · '+fullNote)+(view.selected.parent_id===null?'':' · Gå ét mappeniveau op'));else $('#chart-center').removeAttribute('aria-label');
  $('#chart-center').disabled=view.selected.parent_id===null;$('#chart-center').title=state.metric===APFS&&!state.overview?fullNote+(view.selected.parent_id===null?'':' · Gå ét mappeniveau op'):'Gå ét mappeniveau op';$('#center-up').textContent=view.selected.parent_id===null?'':'↑ Tilbage';
  $('#chart-context').textContent=view.selected.kind==='file'?'Valgt fil':'Pladsfordeling · 3 niveauer';
- if(!arcs.length)$('#hover-caption').textContent=weight(view.selected)===0n?'Ingen målbare bytes i dette udvalg.':'Dette udvalg har ingen målte underposter.';
+ if(!arcs.length)$('#hover-caption').textContent=unknownMachine?'Diskforbrug fra macOS er ukendt; se volumenlisten.':weight(view.selected)===0n?'Ingen målbare bytes i dette udvalg.':'Dette udvalg har ingen målte underposter.';
  else $('#hover-caption').textContent='Klik på en mappe for at åbne · midten går ét niveau op';
 }
 function highlight(node,aggregate=false){
@@ -218,7 +219,7 @@ function renderRows(){
   if(!state.overview){const c=categoryPresentation(r),hint=el('span','file-subtitle',c.label+' · '+c.coverage);hint.title=c.reason+' '+c.detail;content.append(hint);}
   if(state.overview)content.append(el('span','file-subtitle',r.kind==='capacity'?'Ikke klassificeret som junk':phaseLabel(r)));
   const bytes=el('span','file-bytes',formatBytes(r.bytes??r.lower_bound_bytes));
-  if(r.bytes===null)bytes.prepend(el('small','lower-label','mindst '));b.title=(r.path_display??state.view.selected.path_display+'/'+name)+' · '+bytes.textContent;
+  if(r.bytes===null&&!state.overview)bytes.prepend(el('small','lower-label','mindst '));b.title=(r.path_display??state.view.selected.path_display+'/'+name)+' · '+bytes.textContent;
   const arrow=el('span','row-arrow',r.kind==='directory'?'›':'');b.append(swatch,content,bytes,arrow);
   b.addEventListener('click',()=>{if(id!=null)chooseNode({...r,path_display:r.path_display??state.view.selected.path_display+'/'+r.name_display});});
   b.addEventListener('contextmenu',e=>{if(id!=null)showEntryMenu(e,id);});

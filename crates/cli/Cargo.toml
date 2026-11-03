@@ -10,3 +10,9 @@ macscan-engine.workspace = true
 macscan-analysis.workspace = true
 serde_json.workspace = true
 libc.workspace = true
+
+# Noninstalled self-exec integration host. Production always binds machine::plan.
+[[test]]
+name = "whole_mac"
+path = "tests/whole_mac.rs"
+harness = false

@@ -127,13 +127,14 @@ pub fn options(command: &str) -> Vec<(&'static str, &'static str)> {
             ("--run", "run ID from scans; list saved snapshot IDs and terminal volume states; mutually exclusive with --view snapshots"),
             ("--view", "runs|snapshots; CLI 3.0 defaults to runs (newest first); snapshots explicitly selects the former snapshot list")]),
         "scan" => flags.extend([
+            ("--whole-mac", "boolean flag; startup physical APFS volumes through shared app orchestration; mutually exclusive with ROOT, --metric and --limit; compact receipt, use scans --run RUN_ID for members"),
             ("--save", "boolean flag, default false; retain metadata and permit three-run metadata pruning after publication"),
             ("--output", "absolute metadata directory alias; implies --save; last store/output wins"),
             ("--capture-apfs-clones", "boolean flag, default false; opt-in full DATA clone metadata within root; required for scan --metric apfs-data-clone"),
-            ("--max-entries", "positive usize decimal; default unlimited (usize::MAX)"),
-            ("--max-duration", "positive u64 decimal seconds; default unlimited (Duration::MAX)"),
-            ("--memory-budget", "integer bytes 262144..268435456; default 234881024"),
-            ("--metadata-budget", "u64 decimal bytes; default 4294967296 new-measurement allowance; explicit value limits old + new retained metadata; separate workspace/free-space guard; insufficient budget fails"),
+            ("--max-entries", "positive usize decimal; per volume for --whole-mac; default unlimited (usize::MAX)"),
+            ("--max-duration", "positive u64 decimal seconds; per volume for --whole-mac; default unlimited (Duration::MAX)"),
+            ("--memory-budget", "integer bytes 262144..268435456; per volume for --whole-mac; default 234881024"),
+            ("--metadata-budget", "u64 decimal bytes; default 4294967296 new-run allowance shared by all whole-Mac volumes; explicit value limits old + new retained metadata; separate workspace/free-space guard; insufficient budget fails"),
             ("--workers", "integer 1 only; default 1; other values unsupported (exit 6)"),
             ("--progress", "off|text|ndjson; default off; stderr only")]),
         "children"|"largest" => { flags.extend([("--search", "UTF-8 name search; default empty"), ("--min-bytes", "u64 decimal bytes; default 0")]); if command == "children" { flags.push(("--kind", "file|directory|symlink|special; default all")); } },
@@ -170,7 +171,7 @@ pub fn help_requested(command: &str, args: &[std::ffi::OsString]) -> bool {
             flags.iter().any(|(name, _)| *name == flag)
                 && !matches!(
                     flag,
-                    "--save" | "--capture-apfs-clones" | "--no-extension" | "--dry-run" | "--apply"
+                    "--whole-mac" | "--save" | "--capture-apfs-clones" | "--no-extension" | "--dry-run" | "--apply"
                 )
         });
         index += if takes_value { 2 } else { 1 };
@@ -187,7 +188,7 @@ pub fn help(command: &str) -> Option<Value> {
         return None;
     }
     let arguments = match command {
-        "scan" => "exactly one ROOT path (relative to current working directory or absolute); use -- before a root starting with --",
+        "scan" => "exactly one ROOT path OR --whole-mac, mutually exclusive in either order; use -- before a root starting with --",
         "compare"|"growth" => "exactly BEFORE_ID AFTER_ID: saved snapshot/volume-scan ID strings, never whole-Mac run IDs",
         _ => "no positional operands",
     };
@@ -204,5 +205,5 @@ pub fn help(command: &str) -> Option<Value> {
 }
 
 pub fn capabilities() -> Value {
-    json!({"schema_version":"3.0","outcome":"ok","engine_version":macscan_engine::ENGINE_VERSION,"identity":identity(),"platform":"macos","backend":"darwin_descriptor_relative","commands":COMMANDS,"read_only_targets":true,"file_content_reads":false,"network":false,"cleanup":false,"scanned_files_cleanup":false,"metadata_retention":{"keep_runs":3,"trigger":"successful saved publication or explicit history-prune --apply","scope":"validated Macscan metadata only; grouped runs count once"},"storage":"parquet_zstd","query_engine":macscan_analysis::Store::version(),"supported_metrics":["logical","allocated","apfs-data-clone"],"private_bytes":null,"clone_metadata":"opt_in_streaming_parquet","apfs_data_clone_algorithm":"apfs-data-clone-1","apfs_data_clone_capture_version":1,"apfs_data_clone_limitations":"full DATA only, within measured root; partial and non-DATA sharing not deduplicated; not unique/private/reclaimable space","atomic_filesystem_snapshot":false,"workers":1,"agent_response_budget_bytes":8192})
+    json!({"schema_version":"3.0","outcome":"ok","engine_version":macscan_engine::ENGINE_VERSION,"identity":identity(),"platform":"macos","backend":"darwin_descriptor_relative","commands":COMMANDS,"whole_mac":{"scan":"scan --whole-mac --save --progress ndjson","members":"scans --run RUN_ID","scope":"startup physical APFS containers, same app orchestration; external disks/images excluded"},"read_only_targets":true,"file_content_reads":false,"network":false,"cleanup":false,"scanned_files_cleanup":false,"metadata_retention":{"keep_runs":3,"trigger":"successful saved publication or explicit history-prune --apply","scope":"validated Macscan metadata only; grouped runs count once"},"storage":"parquet_zstd","query_engine":macscan_analysis::Store::version(),"supported_metrics":["logical","allocated","apfs-data-clone"],"private_bytes":null,"clone_metadata":"opt_in_streaming_parquet","apfs_data_clone_algorithm":"apfs-data-clone-1","apfs_data_clone_capture_version":1,"apfs_data_clone_limitations":"full DATA only, within measured root; partial and non-DATA sharing not deduplicated; not unique/private/reclaimable space","atomic_filesystem_snapshot":false,"workers":1,"agent_response_budget_bytes":8192})
 }

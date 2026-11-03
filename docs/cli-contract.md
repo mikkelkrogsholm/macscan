@@ -33,7 +33,8 @@ space. No automatic retries or permission changes occur.
 
 | Command | Coverage used for outcome |
 | --- | --- |
-| `scan` | The newly measured root's `selected_coverage.complete` |
+| `scan ROOT` | The newly measured root's `selected_coverage.complete` |
+| `scan --whole-mac` | All planned members: complete measured volumes required for 0; coverage gaps/unmounted volumes give 10; execution/storage errors give 3/5 and SIGINT gives 130 |
 | `summary`, `children`, `largest`, `inspect` | The selected `--entry` subtree's `selected_coverage.complete`; default is root entry 0 |
 | `profile`, `insights` | The selected saved subtree's `coverage.complete` |
 | `growth` | Both corresponding saved subtrees' combined `coverage.complete` |
@@ -95,7 +96,7 @@ cleanup. Effects already completed before a later signal are not rolled back.
 SIGINT is cooperative and yields exit 130 when observed; no promise is made to
 interrupt a blocked filesystem syscall immediately.
 
-## Migration from CLI 2.0 and remaining acceptance
+## Migration from CLI 2.0
 
 Consumers must switch on `schema_version` and `outcome`, then handle the explicit
 exit matrix. CLI 2.0 used exit 5 for usable partial scans/profiles/insights/growth;
@@ -105,9 +106,9 @@ SQL, compare and diagnostics now also communicate incomplete requested coverage
 through exit 10. Busy now has a typed exit 7 and `retryable: true`. Existing
 result fields remain available; store/native formats are unchanged.
 
-Whole-Mac CLI scanning is not introduced here. Issue #19's acceptance for
-partially saved/cancelled whole-Mac CLI results remains open and must be verified
-with issue #22. Existing desktop whole-Mac data is not migrated by this change.
+Whole-Mac CLI scanning uses the same saved sessions and volume snapshots as the
+desktop app. Existing data is not migrated. Its subprocess acceptance is covered
+by `crates/cli/tests/whole_mac.rs`, alongside the standalone contract tests.
 
 Verification is in `crates/cli/tests/contract.rs`, the existing CLI integration
 suites, and the CLI's escaped-diagnostic budget unit test. They use synthetic
@@ -215,3 +216,83 @@ The process fixtures in `crates/cli/tests/history.rs` cover mixed and shared
 runs, exact numeric ordering, both encodings and byte-limited pagination,
 terminal missing-volume states, empty/corrupt/dangling history, existing snapshot
 analysis and four-to-three retention. They use owned synthetic files only.
+
+## Whole-Mac orchestration (CLI-04)
+
+```sh
+macscan scan --whole-mac --save --progress ndjson
+macscan scans --run RUN_ID
+macscan summary --scan VOLUME_SCAN_ID
+macscan coverage --scan VOLUME_SCAN_ID
+```
+
+`scan ROOT` remains available. ROOT and `--whole-mac` are mutually exclusive,
+regardless of order. Whole-Mac also rejects `--metric` and `--limit`: its final
+response is a run receipt, not a selected-file query. Select metrics and paginate
+with the saved volume analysis commands. All option validation happens before
+inventory, store creation or traversal. `--whole-mac` is a boolean flag.
+
+Both clients call `macscan_analysis::machine` for APFS planning, sequential
+streaming scans, session publication and loading. The plan includes mounted and
+unmounted APFS volumes on the startup physical disk's containers, preserving the
+app's existing ordering. External disks and disk images are excluded. System
+firmlinks are excluded from `/`; Data is measured at its canonical root. No
+provider policy, scanner or background service is added.
+
+`--max-entries`, `--max-duration` and `--memory-budget` apply separately to each
+volume. `--capture-apfs-clones` remains default-off and is passed to every
+volume. One held store lock covers all children and final session publication.
+The default 4 GiB new-run allowance is computed once and shared across the
+children. Explicit `--metadata-budget` continues to cap combined old and new
+metadata; existing workspace and free-space guards remain active. Session
+receipts preserve the existing small terminal-diagnostic publication semantics
+even after a child exhausts its measurement budget.
+
+`--save` (or `--output DIR`) is explicit. Without it, a private temporary store
+is removed at command end and the receipt says `retained:false`,
+`temporary:true`; its run and child IDs cannot subsequently be queried.
+Successful saved groups count once toward three-run retention. No pruning
+happens between children. Execution failure or cancellation preserves earlier
+history and completed published children. Unmounted volumes and partial root
+coverage are observations, distinct from execution failures. Ordinary volume
+I/O failures yield generic execution exit 3; detailed volume errors remain in
+`scans --run`. Storage/workspace failure uses typed exit 5, never string matching.
+
+Successful and usable partial receipts go to stdout. Failed/cancelled receipts
+use the existing stderr error envelope with empty stdout. Every receipt remains
+at most 8192 bytes in JSON and NDJSON, with explicit `run_id`, `kind`, `retained`,
+`status`/`measurement_status`, `outcome`, coverage/member counts and a member-query
+reference. On errors, `status:"failed"` describes the command;
+`measurement_status` preserves the saved session's partial/cancelled/complete
+state. Full membership and saved/unmeasured identities are paginated through
+`scans --run`; no volume array appears in the final receipt. OS capacity stays
+separate from file measurements and is never represented as reclaimable bytes.
+Missing or overflowing OS capacity is `null`; capacity totals use checked exact
+arithmetic. The app preserves unknown capacity in its overview and labels it
+`Ukendt`, without deriving residual allocation or overlap from unknown inputs.
+
+If final session publication fails after child publication, `session_published`
+is false, while retained child counts and `recovery.first_scan_id` remain
+visible. `recovery.command` identifies the snapshot catalog. The unpublished
+run ID is a recovery identity, not a claim that `scans --run` can load a group.
+No inconsistent group is written if a published child manifest cannot be read.
+Cleanup warnings remain `retention_warning`, not failed scans. Broken stdout
+preserves the same run identity and retained state in the stderr error.
+
+Progress stays on stderr: compact parseable NDJSON with plan/phase,
+`volume_index`, member and saved-member counts, entries and elapsed milliseconds.
+Traversal events are capped at five per second, plus one plan event and one
+terminal event per visited volume. Phase alternation cannot bypass that cap.
+Terminal events identify the completed volume. There are no per-file lines or
+invented completion percentages. Desktop progress retains its existing full
+`machine` payload through its adapter.
+
+The noninstalled Cargo `whole_mac` test host invokes the exact CLI library
+entrypoint with an owned synthetic planner. Its parent launches actual
+subprocesses for full, partial, unmounted, ordinary I/O, storage, busy, SIGINT
+before any child and after child publication, temporary/capture/options,
+publication recovery, broken stdout and bounded JSON/NDJSON behavior. The
+installed binary binds only the real planner: there is no public test flag,
+environment switch or arbitrary-plan input. Automated tests never call the real
+machine planner or inspect user history. A real whole-Mac scan still requires
+separate user authorization.
