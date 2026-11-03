@@ -22,7 +22,7 @@ $('#app').innerHTML=`
 <aside class="sidebar">
  <div class="brand"><img src="icon.svg" alt="" width="34" height="34"><div>Macscan<small>PLADS TIL OVERBLIK</small></div><span class="local-dot" title="Kun lokalt"></span></div>
  <section class="locations"><h2>PLACERINGER</h2><button id="whole-mac" class="volume-card whole-mac"><span class="volume-info"><strong>Hele Mac’en</strong><small>Scan opstartsdisken · alle volumener</small></span></button><div id="volumes"></div><button id="choose-folder" class="sidebar-action"><span>＋</span> Scan en mappe…</button></section>
- <section class="history"><div class="section-heading"><h2>MÅLINGER</h2><button id="choose-history" title="Åbn en mappe med gemte målinger" aria-label="Åbn målemappe">↗</button></div><div id="history-list"></div></section>
+ <section class="history"><div class="section-heading"><h2>MÅLINGER</h2><button id="choose-history" title="Åbn en mappe med gemte målinger" aria-label="Åbn målemappe">↗</button></div><p class="muted" id="history-retention">Seneste 3 scanninger · Hele Mac’en tæller én gang</p><div id="history-list"></div></section>
  <div class="sidebar-footer"><span class="local-dot"></span> Dine data bliver på din Mac<button id="history-location">Målemappe ↗</button><button id="privacy-help">Fuld diskadgang…</button></div>
 </aside>
 <main>
@@ -94,7 +94,7 @@ function rootName(p){return p==='/'?'Macintosh HD':p==='/System/Volumes/Data'?'M
 function renderHistory(){
  const box=$('#history-list');box.replaceChildren();
  if(!state.scans.length){box.append(el('p','sidebar-empty','Ingen gemte målinger endnu.'));return;}
- for(const scan of state.scans){const b=el('button','history-item'+(state.scan===scan.scan_id?' active':''));b.disabled=state.scanning;b.title=scan.root;
+ for(const scan of state.scans.filter(s=>!s.grouped_volume)){const b=el('button','history-item'+(state.scan===scan.scan_id?' active':''));b.disabled=state.scanning;b.title=scan.root;
   const main=el('span','history-name',rootName(scan.root));main.prepend(icon('folder'));b.append(main,el('span','history-date',date(scan.started_at)+(scan.status==='partial'?' · delvis':'')));
   b.addEventListener('click',()=>openScan(scan.scan_id));box.append(b);
  }
@@ -384,7 +384,7 @@ function renderProgress(s){
  for(const row of sorted){const item=el('div','branch-row');item.append(el('span','',row.name),el('span','muted',phaseLabel(row)),el('span','',new Intl.NumberFormat('da-DK').format(row.entries)+' poster'),el('span','',row.phase==='pending'?'Ikke målt':formatBytes(row.raw_allocated_bytes)));box.append(item);}
 }
 async function pollJob(){try{const s=await invoke('job_status');$('#progress-title').textContent=s.phase==='planning'?'Læser Mac’ens volumener…':s.phase==='saving'?'Beregner størrelser og gemmer måling…':'Scanner '+(s.whole_mac?'Hele Mac’en · ':'')+rootName(s.root)+'…';$('#progress-detail').textContent=new Intl.NumberFormat('da-DK').format(s.entries_seen??0)+' poster · '+Math.round((s.elapsed_ms??0)/1000)+' sek. · ingen fast post- eller tidsgrænse';renderProgress(s);
- if(['done','error','cancelled'].includes(s.phase)){setScanning(false);await refresh();if(s.phase==='done'){await openScan(s.scan_id);toast(s.whole_mac?'Samlet oversigt gemt. Klik på en volumen for filerne.':'Målingen er gemt lokalt.');}else if(s.phase==='cancelled')toast('Scanningen er stoppet. Tidligere målinger er bevaret.');else error(s.error);return;}
+ if(['done','error','cancelled'].includes(s.phase)){setScanning(false);await refresh();if(s.phase==='done'){await openScan(s.scan_id);toast(s.retention_warning||(s.whole_mac?'Samlet oversigt gemt. Klik på en volumen for filerne.':'Målingen er gemt lokalt.'));}else if(s.phase==='cancelled')toast('Scanningen er stoppet. Tidligere målinger er bevaret.');else error(s.error);return;}
  setTimeout(pollJob,500);
  }catch(e){setScanning(false);error(e);}}
 async function folderScan(){try{const root=await invoke('choose_root');if(root)beginScan(root);}catch(e){error(e);}}
@@ -398,7 +398,7 @@ $('#insights-tab').addEventListener('click',()=>{if(!state.view||state.overview)
 $('#before-scan').addEventListener('change',()=>{state.compareBefore=$('#before-scan').value;growth.reset({group:null,files:false});loadGrowth();});$('#more').addEventListener('click',()=>loadRows(true));
 $('#search').addEventListener('input',()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>loadRows(),200);});
 for(const [id,action]of [['copy','copy'],['reveal','reveal']])$('#'+id).addEventListener('click',()=>runFileAction(action,{scanId:state.scan,entry:Number(state.selected.entry_id)}).catch(error));
-async function chooseHistory(){try{const r=await invoke('choose_history');if(!r)return;localStorage.setItem('macscan.history',r.store);state.scans=r.scans;state.store=r.store;$('#history-location').title=r.store;renderHistory();const first=r.scans[0];if(first)openScan(first.scan_id);else toast('Denne mappe indeholder ingen målinger.');}catch(e){error(e);}}
+async function chooseHistory(){try{const r=await invoke('choose_history');if(!r)return;localStorage.setItem('macscan.history',r.store);state.scans=r.scans;state.store=r.store;$('#history-location').title=r.store;renderHistory();const first=r.scans.find(s=>!s.grouped_volume);if(first)openScan(first.scan_id);else toast('Denne mappe indeholder ingen målinger.');}catch(e){error(e);}}
 $('#choose-history').addEventListener('click',chooseHistory);$('#history-location').addEventListener('click',chooseHistory);
 $('#privacy-help').addEventListener('click',async()=>{
  try{await invoke('open_privacy');}catch(e){error(e);}
@@ -407,5 +407,5 @@ $('#privacy-help').addEventListener('click',async()=>{
 document.addEventListener('keydown',e=>{if($('#coverage-dialog').open||$('#rescan-dialog').open)return;if(e.metaKey&&e.key==='o'){e.preventDefault();folderScan();}if((e.altKey&&e.key==='ArrowLeft'||e.key==='Backspace')&&!['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)&&state.view?.selected.parent_id!==null&&state.view){e.preventDefault();navigate(state.view.selected.parent_id);}});
 renderChart();
 try{const r=await refresh();if(r.explicit_store)localStorage.setItem('macscan.history',r.store);if(!r.explicit_store&&localStorage.getItem('macscan.history')){try{const h=await invoke('restore_history',{path:localStorage.getItem('macscan.history')});state.scans=h.scans;state.store=h.store;$('#history-location').title=h.store;renderHistory();}catch{localStorage.removeItem('macscan.history');}}
- const initial=state.scans[0];if(initial)await openScan(initial.scan_id);
+ const initial=state.scans.find(s=>!s.grouped_volume);if(initial)await openScan(initial.scan_id);
 }catch(e){error(e);}

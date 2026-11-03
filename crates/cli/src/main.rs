@@ -61,6 +61,9 @@ struct Options {
     ndjson: bool,
     progress: String,
     metadata_budget: u64,
+    explicit_budget: bool,
+    prune_apply: bool,
+    prune_mode: bool,
     sql: Option<String>,
     before: Option<String>,
     offset: usize,
@@ -99,6 +102,9 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         ndjson: false,
         progress: "off".into(),
         metadata_budget: FULL_HISTORY_BUDGET,
+        explicit_budget: false,
+        prune_apply: false,
+        prune_mode: false,
         sql: None,
         before: None,
         offset: 0,
@@ -124,6 +130,10 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
         let flag = utf8(arg)?;
         if flag == "--capture-apfs-clones" && command=="scan" {
             options.scan.capture_clones=true;index+=1;continue;
+        }
+        if matches!(flag,"--dry-run"|"--apply") && command=="history-prune" {
+            if options.prune_mode {return Err(Error::usage("choose either --dry-run or --apply"));}
+            options.prune_mode=true;options.prune_apply=flag=="--apply";index+=1;continue;
         }
         if flag == "--save" {
             if command != "scan" {
@@ -159,7 +169,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                         | "scans"
                         | "compare"
                         | "query"
-                        | "insights" | "growth" | "profile" | "coverage"
+                        | "insights" | "growth" | "profile" | "coverage" | "history-prune"
                 ) =>
             {
                 options.store = PathBuf::from(value)
@@ -265,7 +275,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                 options.scan.max_memory_bytes = usize::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("memory budget overflow"))?
             }
-            "--metadata-budget" if command == "scan" => options.metadata_budget = unsigned(value)?,
+            "--metadata-budget" if command == "scan" => {options.metadata_budget = unsigned(value)?;options.explicit_budget=true;},
             "--workers" if command == "scan" => {
                 if unsigned(value)? != 1 {
                     return Err(Error {
@@ -331,7 +341,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save] [--capture-apfs-clones]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
+        "commands":["history-prune [--dry-run|--apply] --store PATH","coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save] [--capture-apfs-clones]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
         "apfs_data_clone_contract":{"algorithm_version":"apfs-data-clone-1","capture_version":1,"label":"Begrænset DATA-klonkorrigeret allokering","opt_in":"scan --capture-apfs-clones","limitations":"Within measurement root; full DATA only, partial and non-DATA retained; global raw-path owners; not unique/private/reclaimable space","documentation":"docs/apfs-data-clone.md"},
         "profile_contract":{"version":"file-profile-1","view":["files","types"],"sort":["bytes","count"],"scope":"saved --entry with raw path component boundaries","age":"saved ended_unix_ns; inclusive integer threshold; unknown/future mtime excluded","type":"raw final suffix hint; ASCII lowercase; opaque type_key preserves non-UTF8 identity","documentation":"docs/file-profile.md"},
@@ -343,7 +353,7 @@ fn schema() -> Value {
         "options":{"store":"absolute metadata directory","limit":"1..100, default 10; responses always <=8192 bytes","offset":"SQL pagination; use next_offset, use ORDER BY for stable SQL pages","cursor":"predefined query pagination; use next_cursor unchanged","metric":["logical","allocated","apfs-data-clone"],"progress":["off","text","ndjson"],"format":["json","ndjson"]},
         "sql_examples":["SELECT path_display,accounted_allocated_bytes FROM entries WHERE kind='file' ORDER BY accounted_allocated_bytes DESC LIMIT 10","SELECT category,count(*) AS entries,sum(accounted_allocated_bytes) AS bytes FROM entries WHERE kind='file' GROUP BY category ORDER BY bytes DESC","SELECT path_display,logical_delta FROM changes WHERE logical_delta>0 ORDER BY logical_delta DESC LIMIT 10"],
         "result_contract":{"schema_version":"2.0","all_SQL_numbers":"exact decimal strings; booleans and null preserved","null":"unknown, never zero","allocated":"scoped hardlink-accounted OS allocation, not unique APFS or reclaimable bytes","partial":"unknown areas are not deletion evidence","output_budget_bytes":OUTPUT_BUDGET},
-        "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"automatic_deletion":false,"UI":"Tauri sunburst"}})
+        "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"automatic_deletion":true,"metadata_retention":{"keep_runs":3,"deletion_scope":"saved Macscan metadata only; scanned files are never deleted","trigger":"after successful publication; whole-Mac counts once"},"metadata_budget_scope":"default new measurement allowance; explicit --metadata-budget combined total","UI":"Tauri sunburst"}})
 }
 fn run() -> Result<u8> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -368,6 +378,10 @@ fn run() -> Result<u8> {
         }
         "volumes" => volumes(options.query.limit, options.query.cursor.as_deref())
             .map_err(|e| Error::io("volumes", e))?,
+        "history-prune" => {
+            if !options.operands.is_empty(){return Err(Error::usage("history-prune takes no operands"));}
+            Store::open(&options.store,false).and_then(|s|s.prune_history(options.prune_apply)).map_err(|e|Error::io("history-prune",e))?
+        }
         "scan" => {
             if options.operands.len() != 1 {
                 return Err(Error::usage("scan requires exactly one explicit ROOT"));
@@ -375,7 +389,9 @@ fn run() -> Result<u8> {
             let temporary=if options.save {None}else{Some(TemporaryStore::new().map_err(|e|Error::io("temporary_store",e))?)};
             let path=temporary.as_ref().map(|t|t.0.as_path()).unwrap_or(&options.store);
             let store=Store::open(path,true).map_err(|e|Error::io("open_store",e))?;
-            let id=store.scan_to_store(&PathBuf::from(&options.operands[0]),&options.scan,options.metadata_budget,&CANCEL,|p|{
+            let store=store.begin_run().map_err(|e|Error::io("run_lock",e))?;
+            let budget=if options.explicit_budget{options.metadata_budget}else{store.measurement_budget(options.metadata_budget).map_err(|e|Error::io("metadata_allowance",e))?};
+            let id=store.scan_to_store(&PathBuf::from(&options.operands[0]),&options.scan,budget,&CANCEL,|p|{
                 match options.progress.as_str() {
                     "ndjson"=>{let _=writeln!(io::stderr(),"{}",json!({"type":"progress","entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"finished":p.finished}));},
                     "text"=>{let _=writeln!(io::stderr(),"{} entries, {} ms{}",p.entries_seen,p.elapsed_ms,if p.finished {"; scan finished"}else{""});},_=>{}
@@ -387,6 +403,7 @@ fn run() -> Result<u8> {
                 result["next_cursor"]=Value::Null;
                 result["navigation_note"]=json!("Use --save for retained Parquet history, queries and comparison.");
             }
+            if options.save {if let Some(w)=store.retention_warning(&id){result["retention_warning"]=json!(w);}}
             result["command"] = json!("scan");
             result["retained"] = json!(options.save);
             result

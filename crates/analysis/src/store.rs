@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod stream;
+mod retention;
 mod apfs;
 #[cfg(test)]
 mod clone_tests;
@@ -33,6 +34,7 @@ const ENTRY_CLONE_SCHEMA:&str="clone_status VARCHAR,clone_id UBIGINT,clone_exten
 
 pub struct Store {
     root: PathBuf,
+    run_lock: Option<std::sync::Arc<fs::File>>,
 }
 impl Store {
     pub fn open(path: &Path, create: bool) -> io::Result<Self> {
@@ -52,6 +54,7 @@ impl Store {
         }
         Ok(Self {
             root: path.canonicalize()?,
+            run_lock: None,
         })
     }
     pub fn path(&self) -> &Path {
@@ -100,16 +103,10 @@ impl Store {
         budget: u64,
         cancel: &AtomicBool,
     ) -> io::Result<()> {
+        let _run = self.lock_run()?;
         let global_valid=scan.coverage_globally_valid();
         let capture_clones=scan.context["clone_capture"]["requested"]==true || scan.entries.iter().any(|e|e.clone_metadata!=macscan_engine::CloneMetadata::default());
-        // Serialize this store's publications so simultaneous saves cannot each
-        // claim the same metadata budget. File close releases the advisory lock.
-        use std::os::fd::AsRawFd;
-        let publication_lock = fs::File::open(&self.root)?;
-        if unsafe { libc::flock(publication_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        // The run guard serializes publication and cleanup for this store.
         let final_path = self.location(&scan.id)?;
         if final_path.exists() {
             return Err(io::Error::new(

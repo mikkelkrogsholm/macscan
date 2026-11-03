@@ -2,7 +2,9 @@
 
 En genmåling gemmes som en ny, selvstændig måling med egen rod, tid og dækning.
 Den opdaterer aldrig det oprindelige snapshot, et eksisterende diagram eller
-referencerne/totallen i en tidligere Hele Mac’en-session.
+referencerne/totallen i en tidligere Hele Mac’en-session. Historikken gemmer
+[de seneste tre kørsler](history-retention.md); den oprindelige måling kan derfor
+senere udgå. Provenance beskytter ikke en ubegrænset kæde af kildemålinger.
 
 I en gemt måling viser topknappen **Genmål hele målingen** ved roden,
 **Genmål denne mappe** i en undermappe og **Genmål denne fil** ved en gemt

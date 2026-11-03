@@ -34,15 +34,18 @@ fn store_path(state: &Desktop) -> Result<PathBuf, String> {
 }
 fn history(path: &std::path::Path) -> Reply {
     let mut scans = Vec::new();
+    let machines=machine::history(path);
+    let mut grouped=std::collections::BTreeSet::new();
+    for row in &machines {if let Some(id)=row["scan_id"].as_str(){if let Ok(s)=machine::load(path,id){if let Some(rows)=s["volumes"].as_array(){for row in rows{if let Some(id)=row["scan_id"].as_str(){grouped.insert(id.to_owned());}}}}}}
     if path.exists() {
         let store = Store::open(path, false).map_err(err)?;
         for id in store.ids().map_err(err)?.into_iter().rev().take(100) {
             if let Ok(m) = store.manifest(&id) {
-                scans.push(json!({"scan_id":id,"root":m["scope"]["root_display"],"apfs_data_clone":m["apfs_data_clone"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
+                scans.push(json!({"grouped_volume":grouped.contains(&id),"scan_id":id,"root":m["scope"]["root_display"],"apfs_data_clone":m["apfs_data_clone"],"policy":m["scope"]["policy_fingerprint"],"root_path_bytes_hex":m["scope"]["root_path_bytes_hex"],"context":m["context"],"origin":m["origin"],"started_at":m["started_at"],"status":m["status"],"entries":m["entry_count"]}));
             }
         }
     }
-    scans.extend(machine::history(path));
+    scans.extend(machines);
     scans.sort_by(|a,b|b["sort_at"].as_str().or(b["started_at"].as_str()).cmp(&a["sort_at"].as_str().or(a["started_at"].as_str())));
     scans.truncate(100);
     Ok(json!({"store":path,"scans":scans,"metadata_budget_bytes":HISTORY_BUDGET}))
@@ -321,16 +324,19 @@ fn launch_scan(root:Option<String>,source:Option<(String,u32,Value)>,capture_clo
                 let plan=machine::plan().map_err(err)?;
                 return machine::run(&store,plan,capture_clones,&job.cancel,|value|{*job.status.lock().unwrap()=value;}).map_err(err);
             }
-            let store=Store::open(&store,true).map_err(err)?;
+            let store=Store::open(&store,true).and_then(|s|s.begin_run()).map_err(err)?;
+            let budget=store.measurement_budget(HISTORY_BUDGET).map_err(err)?;
             let options=ScanOptions{capture_clones,..ScanOptions::full()};
             let progress=|p:&macscan_engine::Progress|{
                 *job.status.lock().unwrap()=json!({"phase":if p.finished {"saving"}else{"scanning"},"entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"root":root_display,"root_path_bytes_hex":root_hex,"branches":p.branches});
             };
-            if let Some((id,entry,_))=source {
-                store.rescan_to_store(&id,entry,&options,HISTORY_BUDGET,&job.cancel,progress).map_err(err)
+            let id=if let Some((id,entry,_))=source {
+                store.rescan_to_store(&id,entry,&options,budget,&job.cancel,progress).map_err(err)
             } else {
-                store.scan_to_store(&root,&options,HISTORY_BUDGET,&job.cancel,progress).map_err(err)
-            }
+                store.scan_to_store(&root,&options,budget,&job.cancel,progress).map_err(err)
+            }?;
+            if let Some(w)=store.retention_warning(&id){job.status.lock().unwrap()["retention_warning"]=json!(w);}
+            Ok(id)
         })();
         let mut status=job.status.lock().unwrap();
         match result {Ok(id)=>{status["phase"]=json!("done");status["scan_id"]=json!(id);status["whole_mac"]=json!(whole);},Err(e)=>{
@@ -443,6 +449,35 @@ fn information_to_copy(result: &Value) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn grouped_history_keeps_child_metadata_for_comparison() {
+        let base=std::env::temp_dir().join(format!("macscan-native-grouped-{}",std::process::id()));std::fs::create_dir(&base).unwrap();
+        let source=base.join("source");std::fs::create_dir(&source).unwrap();std::fs::write(source.join("owned"),b"synthetic").unwrap();let path=base.join("history");
+        for _ in 0..2 {machine::run(&path,json!({"kind":"whole_mac_v1","volumes":[{"root":source,"phase":"pending","scan_id":null}]}),false,&AtomicBool::new(false),|_|{}).unwrap();}
+        let h=history(&path).unwrap();let rows=h["scans"].as_array().unwrap();assert_eq!(rows.len(),4);assert_eq!(rows.iter().filter(|r|r["kind"]=="machine").count(),2);
+        let children=rows.iter().filter(|r|r["grouped_volume"]==true).collect::<Vec<_>>();assert_eq!(children.len(),2);
+        assert_eq!(children[0]["root_path_bytes_hex"],children[1]["root_path_bytes_hex"]);assert!(children.iter().all(|r|r["context"]["started_unix_ns"].is_string()));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn actual_desktop_scans_keep_three_and_cleanup_warning_keeps_result() {
+        let base=std::env::temp_dir().join(format!("macscan-native-retention-{}",std::process::id()));std::fs::create_dir(&base).unwrap();
+        let root=base.join("source");std::fs::create_dir(&root).unwrap();std::fs::write(root.join("owned"),b"synthetic").unwrap();
+        let path=base.join("history");let desktop=Desktop{store:Mutex::new(path.clone()),explicit_store:true,job:Mutex::new(None)};
+        for n in 0..5 {
+            if n==4{std::fs::write(path.join("5-1.machine.json"),b"malformed").unwrap();}
+            launch_scan(Some(root.to_string_lossy().into_owned()),None,false,&desktop).unwrap();
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+            loop {let status=desktop.job.lock().unwrap().as_ref().unwrap().status.lock().unwrap().clone();
+                assert_ne!(status["phase"],"error","{status}");if status["phase"]=="done"{
+                    let store=Store::open(&path,false).unwrap();store.report(status["scan_id"].as_str().unwrap(),&Query::default(),&AtomicBool::new(false)).unwrap();
+                    assert_eq!(store.ids().unwrap().len(),if n==4{4}else{(n+1).min(3)});
+                    assert_eq!(status["retention_warning"].is_string(),n==4);break;
+                }assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     fn focused_preparation_never_starts_a_job_and_active_guard_is_authoritative() {
         use macscan_engine::scan;

@@ -19,7 +19,7 @@ export function createFocusedRescan(dialog,{invoke,onStarted,onError,isScanning}
   try{const prepared=await invoke('prepare_rescan',{scanId,entry:Number(entry)});if(token!==generation)return;
    body.replaceChildren();
    for(const text of [prepared.root_display,'Oprindeligt målt '+prepared.source_started_at,
-    'Ny selvstændig måling af denne sti. Den oprindelige måling bevares. Dækning og tidspunkt gælder kun den nye måling.']){
+    'Ny selvstændig måling af denne sti. Historikken beholder de seneste tre scanninger. Dækning og tidspunkt gælder kun den nye måling.']){
     const p=document.createElement('p');p.textContent=text;body.append(p);
    }
    const label=document.createElement('label'),capture=document.createElement('input');capture.type='checkbox';capture.id='rescan-capture';capture.checked=false;label.append(capture,' APFS-klonmetadata til denne nye måling (fra som standard)');body.append(label);

@@ -111,15 +111,18 @@ fn system_exclusions(links:&str)->Vec<PathBuf>{
 fn system_exclusion_reasons(roots:&[PathBuf])->Vec<(PathBuf,macscan_engine::ExclusionReason)> {
     roots.iter().filter(|p|p.as_path()!=Path::new("/dev")).map(|p|(p.clone(),if ["/System/Volumes","/Volumes"].contains(&p.to_str().unwrap_or("")){macscan_engine::ExclusionReason::VolumeBoundary}else{macscan_engine::ExclusionReason::FirmlinkBoundary})).collect()
 }
-pub fn run(store:&Path,mut session:Value,capture_clones:bool,cancel:&AtomicBool,mut progress:impl FnMut(Value))->io::Result<String>{
-    let store=Store::open(store,true)?;let start=Instant::now();let session_id=id();
+pub fn run(store:&Path,session:Value,capture_clones:bool,cancel:&AtomicBool,progress:impl FnMut(Value))->io::Result<String>{
+    run_with_allowance(store,session,capture_clones,cancel,progress,FULL_HISTORY_BUDGET)
+}
+fn run_with_allowance(store:&Path,mut session:Value,capture_clones:bool,cancel:&AtomicBool,mut progress:impl FnMut(Value),allowance:u64)->io::Result<String>{
+    let store=Store::open(store,true)?.begin_run()?;let budget=store.measurement_budget(allowance)?;let start=Instant::now();let session_id=id();
     session["session_id"]=json!(session_id);session["started_at"]=json!(utc());session["status"]=json!("running");
     let count=session["volumes"].as_array().unwrap().len();let mut completed=0usize;
     for i in 0..count {
         if cancel.load(Ordering::Relaxed){break;}
         let Some(root)=session["volumes"][i]["root"].as_str().map(str::to_owned) else{continue;};
         session["volumes"][i]["phase"]=json!("scanning");
-        let result=options_for(&root,capture_clones).and_then(|options|store.scan_to_store(Path::new(&root),&options,FULL_HISTORY_BUDGET,cancel,|p|{
+        let result=options_for(&root,capture_clones).and_then(|options|store.scan_to_store(Path::new(&root),&options,budget,cancel,|p|{
             session["volumes"][i]["phase"]=json!(if p.finished{"saving"}else{"scanning"});
             session["volumes"][i]["entries"]=json!(p.entries_seen);session["volumes"][i]["branches"]=json!(p.branches);
             progress(json!({"phase":if p.finished{"saving"}else{"scanning"},"whole_mac":true,"root":root,"entries_seen":completed+p.entries_seen,"elapsed_ms":start.elapsed().as_millis(),"machine":session}));
@@ -141,6 +144,10 @@ pub fn run(store:&Path,mut session:Value,capture_clones:bool,cancel:&AtomicBool,
     session["status"]=json!(if cancelled{"cancelled"}else if session["volumes"].as_array().unwrap().iter().any(|v|v["phase"]!="done"||v["scan_status"]!="complete"){"partial"}else{"complete"});
     session["entry_count"]=json!(completed);session["ended_at"]=json!(utc());
     publish(store.path(),&session)?;
+    // Coverage gaps are observations; execution/storage failure and cancellation
+    // keep earlier history intact. Never prune between child publications.
+    let failed=cancelled||session["volumes"].as_array().unwrap().iter().any(|v|matches!(v["phase"].as_str(),Some("error"|"cancelled"|"not_scanned")));
+    if !failed {if let Some(w)=store.retention_warning(&session_id){progress(json!({"phase":"saving","whole_mac":true,"machine":session,"retention_warning":w}));}}
     Ok(session_id)
 }
 fn utc()->String { // Existing engine timestamps have the same public UTC format.
@@ -152,6 +159,43 @@ fn utc()->String { // Existing engine timestamps have the same public UTC format
 
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn actual_owned_groups_retain_three_without_intermediate_pruning(){
+        let base=std::env::temp_dir().join(format!("macscan-retention-machine-{}",id()));fs::create_dir(&base).unwrap();
+        let a=base.join("a");let b=base.join("b");for p in [&a,&b]{fs::create_dir(p).unwrap();fs::write(p.join("owned"),b"synthetic").unwrap();}
+        let history=base.join("history");let mut sessions=Vec::<String>::new();
+        for n in 0..4 {
+            let prior=sessions.clone();let mut saw_first=false;
+            let s=json!({"kind":"whole_mac_v1","volumes":[{"root":a,"phase":"pending","scan_id":null},{"root":b,"phase":"pending","scan_id":null}]});
+            let current=run(&history,s,false,&AtomicBool::new(false),|p|{
+                if p["machine"]["volumes"][0]["phase"]=="done"&&p["machine"]["volumes"][1]["phase"]!="done" {
+                    saw_first=true;for id in &prior{assert!(load(&history,id).is_ok());}
+                    assert!(Store::open(&history,false).unwrap().prune_history(true).is_err());
+                }
+            }).unwrap();assert!(saw_first);sessions.push(current);
+            let retained=self::history(&history);assert_eq!(retained.len(),(n+1).min(3));
+            let store=Store::open(&history,false).unwrap();assert_eq!(store.ids().unwrap().len(),2*(n+1).min(3));
+            for row in retained {let session=load(&history,row["scan_id"].as_str().unwrap()).unwrap();for v in session["volumes"].as_array().unwrap(){store.manifest(v["scan_id"].as_str().unwrap()).unwrap();}}
+        }
+        assert!(load(&history,&sessions[0]).is_err());
+        // A real Parquet publication exceeding a tiny new-run allowance must
+        // not evict previous groups, even though its failed session is saved.
+        let before_failure=self::history(&history);
+        let s=json!({"kind":"whole_mac_v1","volumes":[{"root":a,"phase":"pending","scan_id":null},{"root":b,"phase":"pending","scan_id":null}]});
+        let failed=run_with_allowance(&history,s,false,&AtomicBool::new(false),|_|{},1).unwrap();
+        let failed=load(&history,&failed).unwrap();assert_eq!(failed["status"],"partial");assert_eq!(failed["volumes"][0]["phase"],"error");assert!(failed["error"].is_string());
+        for row in before_failure{load(&history,row["scan_id"].as_str().unwrap()).unwrap();}
+        // A cancelled later group publishes its completed child, but evicts none.
+        let cancel=AtomicBool::new(false);let before=self::history(&history);
+        let s=json!({"kind":"whole_mac_v1","volumes":[{"root":a,"phase":"pending","scan_id":null},{"root":b,"phase":"pending","scan_id":null}]});
+        let partial=run(&history,s,false,&cancel,|p|{if p["machine"]["volumes"][0]["phase"]=="done"{cancel.store(true,Ordering::Relaxed);}}).unwrap();
+        assert_eq!(load(&history,&partial).unwrap()["status"],"cancelled");for row in before{load(&history,row["scan_id"].as_str().unwrap()).unwrap();}
+        // A terminal empty cancellation is recognised, so a later successful
+        // run can restore the three-run bound without manual history edits.
+        let s=json!({"kind":"whole_mac_v1","volumes":[{"root":a,"phase":"pending","scan_id":null}]});
+        let empty=run(&history,s.clone(),false,&AtomicBool::new(true),|_|{}).unwrap();assert_eq!(load(&history,&empty).unwrap()["status"],"cancelled");
+        let successful=run(&history,s,false,&AtomicBool::new(false),|_|{}).unwrap();assert_eq!(self::history(&history).len(),3);assert!(load(&history,&successful).is_ok());
+        fs::remove_dir_all(base).unwrap();
+    }
     #[test]fn system_aliases_and_mounted_images_are_explicitly_pruned(){
         let exclusions=system_exclusions("/Applications\tApplications\n/Library\tLibrary\n/usr/local\tusr/local\n");
         for p in ["/Applications","/Library","/usr/local","/System/Volumes","/dev","/Volumes"]{assert!(exclusions.contains(&PathBuf::from(p)));}

@@ -1,7 +1,6 @@
 //! Bounded batches -> Parquet -> disk-backed aggregation -> immutable snapshot.
 use super::*;
 use macscan_engine::{walk_with_progress_guarded, walk_with_progress_profiled_guarded, walk_with_progress_prefetch_profiled_guarded, Progress, ScanOptions, StreamEntry};
-use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 
@@ -97,39 +96,12 @@ impl Store {
         cancel: &AtomicBool, origin: Option<Value>, mut progress: impl FnMut(&Progress),
         profile: Option<&mut StreamingProfile>, force_fallback: bool, prefetch: bool,
     ) -> io::Result<String> {
+        let _run = self.lock_run()?;
         let enabled = profile.is_some();
         let mut timings = StreamingProfile::default();
         cancelled(cancel)?;
         scanner_file_budget()?;
-        let lock = fs::File::open(&self.root)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // No other publisher holds this store's lock. Reclaim only our own
-        // unpublished streaming workspaces after a prior process exit/crash.
-        for child in fs::read_dir(&self.root)? {
-            let child = child?;
-            if !child.file_type()?.is_dir() {
-                continue;
-            }
-            let name = child.file_name().to_string_lossy().into_owned();
-            let Some(previous) = name.strip_suffix(".partial") else {
-                continue;
-            };
-            if validate_id(previous).is_err() {
-                continue;
-            }
-            let marker = child.path().join("stream-stage.json");
-            if fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file() && m.len() < 1024) {
-                if let Ok(value) = fs::read(&marker)
-                    .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(io::Error::other))
-                {
-                    if value["owner"] == "macscan-streaming-v1" && value["scan_id"] == previous {
-                        fs::remove_dir_all(child.path())?;
-                    }
-                }
-            }
-        }
+        self.reclaim_stages()?;
         let old_bytes = directory_bytes(&self.root)?;
         if old_bytes >= budget {
             return Err(io::Error::new(
