@@ -23,6 +23,8 @@ if [ -L dist ] || [ -L dist/Macscan.app ]; then
 fi
 mkdir -p dist
 /usr/bin/ditto .build/release/bundle/macos/Macscan.app dist/Macscan.app
+# Debug builds retain the local fallback; packaged binaries must use only their bundle.
+/usr/bin/install_name_tool -delete_rpath "$project_dir/crates/desktop/../../.build/duckdb" dist/Macscan.app/Contents/MacOS/macscan-desktop
 /usr/bin/codesign --force --sign - dist/Macscan.app/Contents/Frameworks/libduckdb.dylib
 /usr/bin/codesign --force --sign - dist/Macscan.app
 /usr/bin/codesign --verify --deep --strict dist/Macscan.app

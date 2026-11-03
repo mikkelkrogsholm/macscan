@@ -307,13 +307,18 @@ impl Store {
             }
         }
         Ok(
-            json!({"command":"history-prune","applied":apply,"keep":3,"kept_runs":plan.kept.len(),"removed_runs":plan.removed.len(),"removed_snapshots":plan.snapshots.len(),"removed_machine_sessions":plan.machines.len(),"kept_summary":plan.kept.iter().take(3).collect::<Vec<_>>(),"removed_summary":plan.removed.iter().take(8).collect::<Vec<_>>(),"summary_truncated":plan.removed.len()>8}),
+            json!({"command":"history-prune","applied":apply,"keep":3,"kept_runs":plan.kept.len(),"removed_runs":plan.removed.len(),"removed_snapshots":plan.snapshots.len(),"removed_machine_sessions":plan.machines.len(),"removed_snapshot_summary":plan.snapshots.iter().take(8).collect::<Vec<_>>(),"snapshot_summary_truncated":plan.snapshots.len()>8,"kept_summary":plan.kept.iter().take(3).collect::<Vec<_>>(),"removed_summary":plan.removed.iter().take(8).collect::<Vec<_>>(),"summary_truncated":plan.removed.len()>8}),
         )
+    }
+    /// Return the existing planner receipt after publication; cleanup failure remains a warning.
+    pub fn retention_result(&self, current: &str) -> (Option<Value>, Option<String>) {
+        match self.prune_history_for(true, Some(current)) {
+            Ok(report) => (Some(report), None),
+            Err(e) => (None, Some(format!("Målingen er gemt, men historikken kunne ikke ryddes: {e}"))),
+        }
     }
     /// A cleanup error must never turn a published measurement into scan failure.
     pub fn retention_warning(&self, current: &str) -> Option<String> {
-        self.prune_history_for(true, Some(current))
-            .err()
-            .map(|e| format!("Målingen er gemt, men historikken kunne ikke ryddes: {e}"))
+        self.retention_result(current).1
     }
 }

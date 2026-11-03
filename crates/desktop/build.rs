@@ -10,5 +10,11 @@ fn main() {
         "cargo:rustc-link-arg=-Wl,-rpath,{}",
         root.join(".build/duckdb").display()
     );
+    identity::emit();
     tauri_build::build();
+}
+
+mod identity {
+    include!("../../scripts/build-identity.rs");
+    pub fn emit() { main(); }
 }

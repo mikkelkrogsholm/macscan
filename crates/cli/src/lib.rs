@@ -356,6 +356,7 @@ struct Publication {
     scan_id: Option<String>,
     retained: bool,
     retention_warning: Option<String>,
+    retention: Option<Value>,
     machine: Option<Value>,
 }
 fn usable(complete: bool) -> u8 {
@@ -441,7 +442,7 @@ fn run(args: &[OsString], publication: &mut Publication, planner: impl FnOnce()-
                 return Err(Error::io("scan", io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
             }
             // Successful publication, not report delivery, triggers existing retention.
-            if options.save { publication.retention_warning = store.retention_warning(&id); }
+            if options.save { (publication.retention, publication.retention_warning) = store.retention_result(&id); }
             let mut result=store.report(&id,&options.query,&CANCEL).map_err(|e|Error::io("query",e))?;
             code = usable(result["selected_coverage"]["complete"] == true);
             if !options.save {
@@ -449,6 +450,7 @@ fn run(args: &[OsString], publication: &mut Publication, planner: impl FnOnce()-
                 result["navigation_note"]=json!("Use --save for retained Parquet history, queries and comparison.");
             }
             if let Some(w) = &publication.retention_warning { result["retention_warning"] = json!(w); }
+            if let Some(retention) = &publication.retention { result["retention"] = retention.clone(); }
             result["command"] = json!("scan");
             result["retained"] = json!(options.save);
             result
@@ -661,6 +663,7 @@ fn whole_mac(options:&Options,publication:&mut Publication,planner:impl FnOnce()
         receipt["recovery"]=json!({"saved_members":saved,"first_scan_id":rows.iter().find_map(|r|r["scan_id"].as_str()),
             "command":"scans --view snapshots","note":"Session publication failed; published children remain ordinary snapshots in this store."});
     }
+    if let Some(retention)=&report.retention{receipt["retention"]=retention.clone();}
     if let Some(warning)=&report.retention_warning{receipt["retention_warning"]=json!(bounded_detail(warning,256).0);}
     let execution_error=if !matches!(code,0|10){
         let error=if code==130{Error::io("whole_mac_scan",io::Error::new(io::ErrorKind::Interrupted,"cancelled"))}
@@ -724,6 +727,7 @@ fn error_response(e: &Error, publication: &Publication, ndjson: bool) -> Value {
     if let Some(id) = &publication.scan_id {
         value["scan_id"] = json!(id);
         value["retained"] = json!(publication.retained);
+        if let Some(retention) = &publication.retention { value["retention"] = retention.clone(); }
         if let Some(warning) = &publication.retention_warning {
             let (warning, truncated) = bounded_detail(warning, 256);
             value["retention_warning"] = json!(warning);
@@ -734,6 +738,16 @@ fn error_response(e: &Error, publication: &Publication, ndjson: bool) -> Value {
         for (key,item) in receipt.as_object().unwrap(){if key=="status"{value["measurement_status"]=item.clone();}else if key!="outcome" && key!="error"{value[key]=item.clone();}}
     }
     if ndjson { value["type"] = json!("error"); }
+    // Counts remain exact if unusually long saved IDs require shorter diagnostics.
+    for (key, flag) in [("kept_summary", "kept_summary_truncated"),
+        ("removed_snapshot_summary", "snapshot_summary_truncated"),
+        ("removed_summary", "summary_truncated")] {
+        while serde_json::to_vec(&value).map_or(0, |v| v.len() + 1) > OUTPUT_BUDGET {
+            let Some(items) = value["retention"][key].as_array_mut() else { break; };
+            if items.pop().is_none() { break; }
+            value["retention"][flag] = json!(true);
+        }
+    }
     value
 }
 pub fn entry(args: Vec<OsString>, planner: impl FnOnce()->io::Result<Value>) -> std::process::ExitCode {
@@ -761,7 +775,9 @@ mod tests {
     fn escaped_error_diagnostics_fit_the_serialized_budget() {
         let error = Error::io("stdout", io::Error::other("\u{0001}".repeat(10000)));
         let publication = Publication { scan_id: Some("12345678901234567890-12345-1".into()),
-            retained: true, retention_warning: Some("\u{0002}".repeat(10000)), machine: None };
+            retained: true, retention: Some(json!({"kept_runs":3,"removed_runs":8,"removed_snapshots":8,
+                "kept_summary":vec!["1".repeat(100);3],"removed_summary":vec!["2".repeat(100);8],
+                "removed_snapshot_summary":vec!["3".repeat(100);8]})), retention_warning: Some("\u{0002}".repeat(10000)), machine: None };
         for ndjson in [false, true] {
             let value = error_response(&error, &publication, ndjson);
             assert!(serde_json::to_vec(&value).unwrap().len() + 1 <= OUTPUT_BUDGET);

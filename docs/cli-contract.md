@@ -296,3 +296,21 @@ installed binary binds only the real planner: there is no public test flag,
 environment switch or arbitrary-plan input. Automated tests never call the real
 machine planner or inspect user history. A real whole-Mac scan still requires
 separate user authorization.
+
+## Local installation and publication receipts
+
+See [agent CLI installation and command flow](agent-cli.md) for the explicit
+prefix installer, matching clean CLI/app build identities, bundled runtime,
+update/uninstall behavior and owned-fixture acceptance. Both binaries expose
+headless `--version` before HOME/history/UI initialization. Installed CLI discovery
+requires no repository or GUI process.
+
+Saved successful root/group publication adds `retention`, the existing pruning
+planner's applied receipt. `kept_summary` lists up to three retained run IDs;
+`removed_summary` lists up to eight removed run IDs, and
+`removed_snapshot_summary` up to eight removed snapshot IDs. Counts are exact;
+`summary_truncated` and `snapshot_summary_truncated` identify omitted IDs.
+On an output error, diagnostic summaries may be shortened further to preserve
+the 8 KiB bound (including `kept_summary_truncated`); counts remain exact. The
+policy and on-disk formats are unchanged. Errors in pruning remain warnings and
+do not turn an already published measurement into a scan failure.

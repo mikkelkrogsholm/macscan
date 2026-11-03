@@ -128,6 +128,7 @@ pub struct RunReport {
     pub failure: Option<FailureKind>,
     pub publication_error: Option<io::Error>,
     pub retention_warning: Option<String>,
+    pub retention: Option<Value>,
 }
 /// One locked group, one combined budget, no retention between child publications.
 /// Limits in `options` apply to each volume. None adds the default new-run allowance.
@@ -180,9 +181,9 @@ pub fn run_configured(store:&Path,mut session:Value,options:&ScanOptions,total_b
     // Coverage gaps are observations; execution/storage failure and cancellation
     // keep earlier history intact. Never prune between child publications.
     let failed=cancelled||session["volumes"].as_array().unwrap().iter().any(|v|matches!(v["phase"].as_str(),Some("error"|"cancelled"|"not_scanned")));
-    let retention_warning=if !failed && publication_error.is_none(){store.retention_warning(&session_id)}else{None};
+    let (retention,retention_warning)=if !failed && publication_error.is_none(){store.retention_result(&session_id)}else{(None,None)};
     if let Some(w)=&retention_warning{progress(json!({"phase":"saving","whole_mac":true,"machine":session,"retention_warning":w}));}
-    Ok(RunReport{session,failure,publication_error,retention_warning})
+    Ok(RunReport{session,failure,publication_error,retention_warning,retention})
 }
 #[cfg(test)]
 fn run_with_allowance(store:&Path,session:Value,capture_clones:bool,cancel:&AtomicBool,progress:impl FnMut(Value),allowance:u64)->io::Result<String>{

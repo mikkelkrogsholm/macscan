@@ -26,6 +26,8 @@ mkdir -p dist
 /usr/bin/install -m 755 .build/release/macscan dist/macscan
 /usr/bin/install -m 755 .build/duckdb/libduckdb.dylib dist/libduckdb.dylib
 /usr/bin/strip -S dist/macscan
+# Debug builds retain the local fallback; packaged binaries must use only their bundle.
+/usr/bin/install_name_tool -delete_rpath "$project_dir/crates/cli/../../.build/duckdb" dist/macscan
 /usr/bin/codesign --force --sign - dist/libduckdb.dylib
 /usr/bin/codesign --force --sign - dist/macscan
 /usr/bin/codesign --verify --strict dist/macscan

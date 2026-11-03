@@ -605,6 +605,17 @@ mod tests {
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    // Discovery must not initialize HOME, Tauri, a window, or measurement history.
+    if args.len() == 2 && args[1] == "--version" {
+        println!("{}", json!({"identity":{
+            "cli_version":env!("CARGO_PKG_VERSION"),
+            "build_revision":env!("MACSCAN_BUILD_REVISION"),
+            "engine_version":macscan_engine::ENGINE_VERSION,
+            "data_schema_version":"2.0",
+            "native_engine_schema_version":macscan_engine::SCHEMA_VERSION
+        }}));
+        return;
+    }
     let explicit = args
         .windows(2)
         .find(|a| a[0] == "--store")
