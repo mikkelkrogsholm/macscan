@@ -411,6 +411,8 @@ impl Store {
         }
         let mut answer = envelope(&manifest, command, q.metric);
         answer["query_entry_id"] = json!(q.entry.to_string());
+        // Keep root status/coverage intact; expose selected-subtree evidence separately.
+        answer["selected_coverage"] = json!({"entry_id":q.entry.to_string(),"complete":selected["coverage_complete"] == true});
         if q.entry != 0 {
             answer["totals"] = selected.clone();
         }
@@ -603,6 +605,7 @@ impl Store {
             db.exec(&changes_view(true,true,true))?;self.restrict(&db)?;
             let mut value=envelope(&new,"compare",q.metric);
             value["before_scan_id"]=json!(before);value["coverage"]["before_status"]=old["status"].clone();value["coverage"]["after_status"]=new["status"].clone();
+            value["coverage"]["complete"] = json!(old["status"] == "complete" && new["status"] == "complete");
             run_query(&db,&sql,q.limit,offset,cancel,&mut value)?;value
         } else { self.query_sql(after, Some(before), &sql, q.limit, offset, cancel)? };
         result["command"] = json!("compare");
@@ -706,7 +709,7 @@ fn run_query(
     Ok(())
 }
 fn envelope(m: &Value, command: &str, metric: Metric) -> Value {
-    json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"query_engine":"DuckDB v2.0.0","apfs_data_clone":m["apfs_data_clone"],"scan_id":m["scan_id"],"command":command,"status":m["status"],"metric":metric.name(),
+    json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"query_engine":"DuckDB v2.0.0","apfs_data_clone":m["apfs_data_clone"],"scan_id":m["scan_id"],"command":command,"status":m["status"],"measurement_status":m["status"],"metric":metric.name(),
         "scope":{"root":m["scope"]["root_display"]},"started_at":m["started_at"],"coverage":{"complete":m["status"]=="complete","entries_seen":m["entry_count"],"error_count":m["error_count"],"excluded_count":m["excluded_count"]},
         "totals":m["totals"],"records":[],"truncated":false,"next_cursor":null,
         "warnings":["allocated_is_hardlink_accounted_not_unique_APFS_or_reclaimable","null_means_unknown; lower_bounds_are_not_complete_totals","categories_are_contextual_metadata_hints_not_deletion_approval"]})
@@ -885,6 +888,7 @@ pub fn encode_response(mut value: Value, ndjson: bool) -> io::Result<Vec<u8>> {
             .as_object_mut()
             .and_then(|m| m.remove("records"))
             .unwrap_or(json!([]));
+        let cli_contract = value.get("outcome").cloned();
         value["type"] = json!("start");
         serde_json::to_writer(&mut bytes, &value)?;
         bytes.push(b'\n');
@@ -892,10 +896,13 @@ pub fn encode_response(mut value: Value, ndjson: bool) -> io::Result<Vec<u8>> {
             serde_json::to_writer(&mut bytes, &json!({"type":"record","record":record}))?;
             bytes.push(b'\n');
         }
-        serde_json::to_writer(
-            &mut bytes,
-            &json!({"type":"end","scan_id":value["scan_id"],"status":value["status"],"truncated":value["truncated"],"next_cursor":value["next_cursor"],"next_offset":value["next_offset"]}),
-        )?;
+        let mut end = json!({"type":"end","scan_id":value["scan_id"],"status":value["status"],"truncated":value["truncated"],"next_cursor":value["next_cursor"],"next_offset":value["next_offset"]});
+        if let Some(outcome) = cli_contract {
+            end["schema_version"] = value["schema_version"].clone();
+            end["outcome"] = outcome;
+            if let Some(retained) = value.get("retained") { end["retained"] = retained.clone(); }
+        }
+        serde_json::to_writer(&mut bytes, &end)?;
         bytes.push(b'\n');
     } else {
         serde_json::to_writer(&mut bytes, &value)?;
@@ -904,10 +911,13 @@ pub fn encode_response(mut value: Value, ndjson: bool) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn compact_response(mut value: Value, binding: Option<&str>) -> io::Result<Value> {
+    // Native callers leave room for the CLI envelope. The CLI's final pass
+    // consumes that room rather than reserving it a second time.
+    let reserve = if value.get("outcome").is_some() { 0 } else { 128 };
     while encode_response(value.clone(), false)?
         .len()
         .max(encode_response(value.clone(), true)?.len())
-        + 128
+        + reserve
         > OUTPUT_BUDGET
     {
         let records = value["records"]

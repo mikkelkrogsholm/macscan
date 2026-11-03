@@ -81,9 +81,12 @@ impl Store {
         }
         let f = fs::File::open(&self.root)?;
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::other(
-                "another scan or history cleanup is active",
-            ));
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                    "another scan or history cleanup is active"));
+            }
+            return Err(error);
         }
         Ok(Some(f))
     }

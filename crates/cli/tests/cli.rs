@@ -218,7 +218,7 @@ fn ndjson_framing_also_respects_the_output_budget() {
 }
 
 #[test]
-fn partial_scan_has_code_five_and_queries_preserve_coverage() {
+fn partial_scan_has_code_ten_and_queries_preserve_coverage() {
     let f = Fixture::new();
     fs::write(f.0.join("a"), b"x").unwrap();
     let store = f.0.join("store");
@@ -230,22 +230,14 @@ fn partial_scan_has_code_five_and_queries_preserve_coverage() {
         .arg(&store)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(out.status.code(), Some(10));
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["status"], "partial");
     assert!(result["totals"]["logical_bytes"].is_null());
-    let summary = json(
-        &f.cmd()
-            .args([
-                "summary",
-                "--scan",
-                result["scan_id"].as_str().unwrap(),
-                "--store",
-            ])
-            .arg(&store)
-            .output()
-            .unwrap(),
-    );
+    let out = f.cmd().args(["summary", "--scan", result["scan_id"].as_str().unwrap(), "--store"])
+        .arg(&store).output().unwrap();
+    assert_eq!(out.status.code(), Some(10));
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(summary["coverage"]["complete"], false);
 }
 
@@ -353,7 +345,7 @@ fn relative_provider_root_is_excluded_before_directory_enumeration() {
         .args(["scan", "Library/CloudStorage/provider"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(out.status.code(), Some(10));
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["coverage"]["entries_seen"], 1);
     assert!(result["totals"]["logical_bytes"].is_null());
@@ -404,15 +396,16 @@ fn growth_routes_schema_scope_filters_cursor_and_ndjson(){
 #[test]
 fn coverage_command_reports_saved_whole_measurement_in_json_and_ndjson(){
     let f=Fixture::new();let source=f.0.join("source");fs::create_dir(&source).unwrap();let store=source.join("history");
-    let out=f.cmd().args(["scan"]).arg(&source).arg("--output").arg(&store).output().unwrap();assert_eq!(out.status.code(),Some(5));
+    let out=f.cmd().args(["scan"]).arg(&source).arg("--output").arg(&store).output().unwrap();assert_eq!(out.status.code(),Some(10));
     let saved:Value=serde_json::from_slice(&out.stdout).unwrap();let id=saved["scan_id"].as_str().unwrap();
     for format in ["json","ndjson"] {
-        let out=f.cmd().args(["coverage","--scan",id,"--reason","scanner_output","--format",format,"--store"]).arg(&store).output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(out.stdout.len()<=8192);
+        let out=f.cmd().args(["coverage","--scan",id,"--reason","scanner_output","--format",format,"--store"]).arg(&store).output().unwrap();assert_eq!(out.status.code(),Some(10),"{}",String::from_utf8_lossy(&out.stderr));assert!(out.stdout.len()<=8192);
         let start:Value=serde_json::from_slice(if format=="json"{&out.stdout}else{out.stdout.split(|b|*b==b'\n').next().unwrap()}).unwrap();assert_eq!(start["scope"],"whole_measurement");assert_eq!(start["reason_counts"]["scanner_output"],"1");assert_eq!(start["quality"],"event_counts");
     }
     let rejected=f.cmd().args(["coverage","--scan",id,"--entry","0","--store"]).arg(&store).output().unwrap();assert_eq!(rejected.status.code(),Some(2));
     let mut m:Value=serde_json::from_slice(&fs::read(store.join(id).join("manifest.json")).unwrap()).unwrap();m.as_object_mut().unwrap().remove("coverage_diagnostics");fs::write(store.join(id).join("manifest.json"),serde_json::to_vec(&m).unwrap()).unwrap();
-    let legacy=json(&f.cmd().args(["coverage","--scan",id,"--store"]).arg(&store).output().unwrap());assert_eq!(legacy["quality"],"legacy_samples_only");assert!(legacy["reason_counts"].is_null());assert_eq!(legacy["error_count"],"1");
+    let legacy_out=f.cmd().args(["coverage","--scan",id,"--store"]).arg(&store).output().unwrap();assert_eq!(legacy_out.status.code(),Some(10));
+    let legacy:Value=serde_json::from_slice(&legacy_out.stdout).unwrap();assert_eq!(legacy["quality"],"legacy_samples_only");assert!(legacy["reason_counts"].is_null());assert_eq!(legacy["error_count"],"1");
 }
 
 #[test]

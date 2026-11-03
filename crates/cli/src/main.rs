@@ -40,6 +40,7 @@ impl Error {
             io::ErrorKind::BrokenPipe => (3, "BROKEN_PIPE"),
             io::ErrorKind::StorageFull => (5, "METADATA_LIMIT"),
             io::ErrorKind::Interrupted => (130, "CANCELLED"),
+            io::ErrorKind::WouldBlock if matches!(operation, "run_lock" | "history-prune") => (7, "HISTORY_BUSY"),
             _ => (3, "IO_ERROR"),
         };
         Self {
@@ -340,7 +341,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
     Ok(options)
 }
 fn schema() -> Value {
-    json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"ok",
+    json!({"schema_version":"3.0","engine_version":ENGINE_VERSION,"status":"ok",
         "commands":["history-prune [--dry-run|--apply] --store PATH","coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save] [--capture-apfs-clones]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
         "apfs_data_clone_contract":{"algorithm_version":"apfs-data-clone-1","capture_version":1,"label":"Begrænset DATA-klonkorrigeret allokering","opt_in":"scan --capture-apfs-clones","limitations":"Within measurement root; full DATA only, partial and non-DATA retained; global raw-path owners; not unique/private/reclaimable space","documentation":"docs/apfs-data-clone.md"},
@@ -352,11 +353,19 @@ fn schema() -> Value {
         "columns":["entry_id","parent_id","name_display","path_display","name_bytes","path_bytes","path_key","kind","logical_bytes","allocated_bytes","accounted_allocated_bytes","own_allocated_bytes","observed_logical_bytes","observed_allocated_bytes","observed_accounted_allocated_bytes","device_id","inode","link_count","observed_link_count","charged_to","mtime_unix_seconds","coverage_complete","enumeration_complete","category","saved_category","category_rule_id","category_rule_version","category_reason","category_coverage","category_evidence_source","private_bytes","clone_status","clone_id","clone_extended_flags","clone_data_allocated_bytes","clone_device_id","apfs_data_clone_bytes","observed_apfs_data_clone_bytes","own_apfs_data_clone_bytes","apfs_data_clone_owner","apfs_data_clone_reason"],
         "options":{"store":"absolute metadata directory","limit":"1..100, default 10; responses always <=8192 bytes","offset":"SQL pagination; use next_offset, use ORDER BY for stable SQL pages","cursor":"predefined query pagination; use next_cursor unchanged","metric":["logical","allocated","apfs-data-clone"],"progress":["off","text","ndjson"],"format":["json","ndjson"]},
         "sql_examples":["SELECT path_display,accounted_allocated_bytes FROM entries WHERE kind='file' ORDER BY accounted_allocated_bytes DESC LIMIT 10","SELECT category,count(*) AS entries,sum(accounted_allocated_bytes) AS bytes FROM entries WHERE kind='file' GROUP BY category ORDER BY bytes DESC","SELECT path_display,logical_delta FROM changes WHERE logical_delta>0 ORDER BY logical_delta DESC LIMIT 10"],
-        "result_contract":{"schema_version":"2.0","all_SQL_numbers":"exact decimal strings; booleans and null preserved","null":"unknown, never zero","allocated":"scoped hardlink-accounted OS allocation, not unique APFS or reclaimable bytes","partial":"unknown areas are not deletion evidence","output_budget_bytes":OUTPUT_BUDGET},
+        "result_contract":{"schema_version":"3.0","outcome":"ok|partial|failed|cancelled; independent of saved status","exit_codes":{"ok":0,"partial":10,"cancelled":130,"input":2,"io":3,"not_found":4,"budget":5,"unsupported":6,"busy":7},"documentation":"docs/cli-contract.md","all_SQL_numbers":"exact decimal strings; booleans and null preserved","null":"unknown, never zero","allocated":"scoped hardlink-accounted OS allocation, not unique APFS or reclaimable bytes","partial":"unknown areas are not deletion evidence","output_budget_bytes":OUTPUT_BUDGET},
         "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"automatic_deletion":true,"metadata_retention":{"keep_runs":3,"deletion_scope":"saved Macscan metadata only; scanned files are never deleted","trigger":"after successful publication; whole-Mac counts once"},"metadata_budget_scope":"default new measurement allowance; explicit --metadata-budget combined total","UI":"Tauri sunburst"}})
 }
-fn run() -> Result<u8> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+#[derive(Default)]
+struct Publication {
+    scan_id: Option<String>,
+    retained: bool,
+    retention_warning: Option<String>,
+}
+fn usable(complete: bool) -> u8 {
+    if complete { 0 } else { 10 }
+}
+fn run(args: &[OsString], publication: &mut Publication) -> Result<u8> {
     let command = args.first().map(utf8).transpose()?.unwrap_or("--help");
     let options = parse(command, args.get(1..).unwrap_or_default())?;
     // Only this process's scan/query is interrupted; no existing user process.
@@ -364,10 +373,10 @@ fn run() -> Result<u8> {
         libc::signal(libc::SIGINT, cancel as *const () as libc::sighandler_t);
     }
     let mut code = 0;
-    let result = match command {
+    let mut result = match command {
         "--help" | "-h" | "schema" => schema(),
         "--version" => {
-            json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"duckdb_version":Store::version()})
+            json!({"schema_version":"3.0","engine_version":ENGINE_VERSION,"duckdb_version":Store::version()})
         }
         "capabilities" => {
             let mut v = capabilities();
@@ -393,17 +402,24 @@ fn run() -> Result<u8> {
             let budget=if options.explicit_budget{options.metadata_budget}else{store.measurement_budget(options.metadata_budget).map_err(|e|Error::io("metadata_allowance",e))?};
             let id=store.scan_to_store(&PathBuf::from(&options.operands[0]),&options.scan,budget,&CANCEL,|p|{
                 match options.progress.as_str() {
-                    "ndjson"=>{let _=writeln!(io::stderr(),"{}",json!({"type":"progress","entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"finished":p.finished}));},
+                    "ndjson"=>{let _=writeln!(io::stderr(),"{}",json!({"schema_version":"3.0","type":"progress","entries_seen":p.entries_seen,"elapsed_ms":p.elapsed_ms,"finished":p.finished}));},
                     "text"=>{let _=writeln!(io::stderr(),"{} entries, {} ms{}",p.entries_seen,p.elapsed_ms,if p.finished {"; scan finished"}else{""});},_=>{}
                 }
             }).map_err(|e|Error::io("scan",e))?;
+            publication.scan_id = Some(id.clone());
+            publication.retained = options.save;
+            if CANCEL.load(Ordering::Relaxed) {
+                return Err(Error::io("scan", io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
+            }
+            // Successful publication, not report delivery, triggers existing retention.
+            if options.save { publication.retention_warning = store.retention_warning(&id); }
             let mut result=store.report(&id,&options.query,&CANCEL).map_err(|e|Error::io("query",e))?;
-            code=if result["status"]=="partial"{5}else{0};
+            code = usable(result["selected_coverage"]["complete"] == true);
             if !options.save {
                 result["next_cursor"]=Value::Null;
                 result["navigation_note"]=json!("Use --save for retained Parquet history, queries and comparison.");
             }
-            if options.save {if let Some(w)=store.retention_warning(&id){result["retention_warning"]=json!(w);}}
+            if let Some(w) = &publication.retention_warning { result["retention_warning"] = json!(w); }
             result["command"] = json!("scan");
             result["retained"] = json!(options.save);
             result
@@ -416,7 +432,7 @@ fn run() -> Result<u8> {
             q.entry = options.query.entry; q.metric = options.query.metric;
             q.limit = options.query.limit; q.cursor = options.query.cursor;
             let result = store.file_profile(id,&q,&CANCEL).map_err(|e|Error::io("profile",e))?;
-            code = if result["coverage"]["complete"] == false { 5 } else { 0 };
+            code = usable(result["coverage"]["complete"] == true);
             result
         }
         "growth" => {
@@ -428,7 +444,7 @@ fn run() -> Result<u8> {
                 group: options.growth_group, change: options.growth_change,
                 limit: options.query.limit, cursor: options.query.cursor,
             }, &CANCEL).map_err(|e| Error::io("growth", e))?;
-            code = if result["coverage"]["complete"] == false { 5 } else { 0 };
+            code = usable(result["coverage"]["complete"] == true);
             result
         }
         "insights" => {
@@ -446,7 +462,7 @@ fn run() -> Result<u8> {
                 limit: options.query.limit,
                 cursor: options.query.cursor,
             }, &CANCEL).map_err(|e| Error::io("insights", e))?;
-            code = if result["coverage"]["complete"] == false { 5 } else { 0 };
+            code = usable(result["coverage"]["complete"] == true);
             result
         }
         "query" => {
@@ -463,7 +479,7 @@ fn run() -> Result<u8> {
                 .ok_or_else(|| Error::usage("--sql SELECT is required"))?;
             let store =
                 Store::open(&options.store, false).map_err(|e| Error::io("open_store", e))?;
-            store
+            let result = store
                 .query_sql(
                     id,
                     options.before.as_deref(),
@@ -472,7 +488,10 @@ fn run() -> Result<u8> {
                     options.offset,
                     &CANCEL,
                 )
-                .map_err(|e| Error::io("query", e))?
+                .map_err(|e| Error::io("query", e))?;
+            // SQL may select arbitrary columns: use the whole participating measurements.
+            code = usable(result["coverage"]["complete"] == true);
+            result
         }
         "compare" => {
             if options.operands.len() != 2 {
@@ -480,7 +499,7 @@ fn run() -> Result<u8> {
             }
             let store =
                 Store::open(&options.store, false).map_err(|e| Error::io("open_store", e))?;
-            store
+            let result = store
                 .compare(
                     utf8(&options.operands[0])?,
                     utf8(&options.operands[1])?,
@@ -491,13 +510,18 @@ fn run() -> Result<u8> {
                     },
                     &CANCEL,
                 )
-                .map_err(|e| Error::io("compare", e))?
+                .map_err(|e| Error::io("compare", e))?;
+            code = usable(result["coverage"]["complete"] == true);
+            result
         }
         "coverage" => {
             if !options.operands.is_empty() {return Err(Error::usage("unexpected operands"));}
             let id=options.scan_id.as_deref().ok_or_else(||Error::usage("--scan ID is required"))?;
             let store=Store::open(&options.store,false).map_err(|e|Error::io("open_store",e))?;
-            store.coverage(id,options.reason.as_deref(),options.query.cursor.as_deref(),options.query.limit,&CANCEL).map_err(|e|Error::io("coverage",e))?
+            let result = store.coverage(id,options.reason.as_deref(),options.query.cursor.as_deref(),options.query.limit,&CANCEL).map_err(|e|Error::io("coverage",e))?;
+            // A delivered diagnostic report does not establish complete disk coverage.
+            code = usable(result["status"] == "complete");
+            result
         }
         "summary" | "children" | "largest" | "inspect" => {
             if !options.operands.is_empty() {
@@ -516,9 +540,11 @@ fn run() -> Result<u8> {
                 "largest" => QueryKind::Largest,
                 _ => QueryKind::Inspect,
             };
-            store
+            let result = store
                 .report(id, &query, &CANCEL)
-                .map_err(|e| Error::io("query", e))?
+                .map_err(|e| Error::io("query", e))?;
+            code = usable(result["selected_coverage"]["complete"] == true);
+            result
         }
         "scans" => {
             let store =
@@ -536,8 +562,21 @@ fn run() -> Result<u8> {
     {
         return Err(Error::usage("unexpected operands"));
     }
-    let result =
-        macscan_analysis::compact_response(result, None).map_err(|e| Error::io("response", e))?;
+    if CANCEL.load(Ordering::Relaxed) {
+        return Err(Error::io("response", io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
+    }
+    // CLI envelopes evolve independently of saved/native analysis formats.
+    result["schema_version"] = json!("3.0");
+    result["outcome"] = json!(if code == 10 { "partial" } else { "ok" });
+    // Preserve the original scoped pagination if added CLI metadata needs space.
+    let binding = if command == "scan" {
+        publication.scan_id.as_ref().map(|id| format!("p1:{id}:children:0:{}::all:0", result["metric"].as_str().unwrap_or("allocated")))
+    } else if !matches!(command, "scans" | "volumes") {
+        result["next_cursor"].as_str().and_then(|cursor| cursor.rsplit_once(':').map(|(prefix, _)| prefix.to_owned()))
+    } else { None };
+    let mut result = macscan_analysis::compact_response(result, binding.as_deref())
+        .map_err(|e| Error::io("response", e))?;
+    if command == "scan" && !options.save { result["next_cursor"] = Value::Null; }
     emit(result, options.ndjson).map_err(|e| Error::io("stdout", e))?;
     Ok(code)
 }
@@ -566,15 +605,70 @@ fn emit(result: Value, ndjson: bool) -> io::Result<()> {
     out.write_all(&bytes)?;
     out.flush()
 }
+// Diagnostic text is bounded explicitly; exact result values are never rounded.
+fn bounded_detail(text: &str, maximum: usize) -> (&str, bool) {
+    let mut end = text.len().min(maximum);
+    while !text.is_char_boundary(end) { end -= 1; }
+    (&text[..end], end < text.len())
+}
+fn error_response(e: &Error, publication: &Publication, ndjson: bool) -> Value {
+    let (detail, truncated) = bounded_detail(&e.detail, 768);
+    let hint = match e.exit {
+        2 => Some("Check the command and flags against macscan schema."),
+        4 => Some("Check that the requested root, store, scan or entry exists."),
+        5 => Some("Review the metadata/workspace budget and available disk space before trying again."),
+        7 => Some("Wait for the active scan or history cleanup to finish, then retry."),
+        _ => None,
+    };
+    let mut value = json!({"schema_version":"3.0","engine_version":ENGINE_VERSION,
+        "status":"failed","outcome":if e.exit == 130 {"cancelled"}else{"failed"},
+        "error":{"code":e.code,"operation":e.operation,"detail":detail,
+            "detail_truncated":truncated,"retryable":e.exit == 7}});
+    if let Some(hint) = hint { value["error"]["hint"] = json!(hint); }
+    if let Some(id) = &publication.scan_id {
+        value["scan_id"] = json!(id);
+        value["retained"] = json!(publication.retained);
+        if let Some(warning) = &publication.retention_warning {
+            let (warning, truncated) = bounded_detail(warning, 256);
+            value["retention_warning"] = json!(warning);
+            value["retention_warning_truncated"] = json!(truncated);
+        }
+    }
+    if ndjson { value["type"] = json!("error"); }
+    value
+}
 fn main() -> std::process::ExitCode {
-    let code = match run() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // Select error framing even when argument validation itself fails.
+    let ndjson = args.split(|arg| arg == "--").next().unwrap_or_default()
+        .windows(2).filter(|pair| pair[0] == "--format")
+        .last().is_some_and(|pair| pair[1] == "ndjson");
+    let mut publication = Publication::default();
+    let code = match run(&args, &mut publication) {
         Ok(code) => code,
         Err(e) => {
-            let error = json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"status":"failed",
-                "error":{"code":e.code,"operation":e.operation,"detail":e.detail,"retryable":false}});
+            let error = error_response(&e, &publication, ndjson);
             let _ = writeln!(io::stderr(), "{error}");
             e.exit
         }
     };
     std::process::ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn escaped_error_diagnostics_fit_the_serialized_budget() {
+        let error = Error::io("stdout", io::Error::other("\u{0001}".repeat(10000)));
+        let publication = Publication { scan_id: Some("12345678901234567890-12345-1".into()),
+            retained: true, retention_warning: Some("\u{0002}".repeat(10000)) };
+        for ndjson in [false, true] {
+            let value = error_response(&error, &publication, ndjson);
+            assert!(serde_json::to_vec(&value).unwrap().len() + 1 <= OUTPUT_BUDGET);
+            assert_eq!(value["error"]["retryable"], false);
+            assert_eq!(value["error"]["detail_truncated"], true);
+            assert_eq!(value["retention_warning_truncated"], true);
+        }
+    }
 }

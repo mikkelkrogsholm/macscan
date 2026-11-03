@@ -146,7 +146,7 @@ impl Store {
                 )
             })
             .collect();
-        let answer = json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"command":"coverage","scan_id":id,"status":effective["status"],
+        let answer = json!({"schema_version":"2.0","engine_version":ENGINE_VERSION,"command":"coverage","scan_id":id,"status":effective["status"],"measurement_status":effective["status"],
             "read_time_global_invalidation":effective["read_time_global_invalidation"]==true,
             "coverage_note_da":if effective["read_time_global_invalidation"]==true{json!("Gemt volumenidentitet ændrede sig; hele målingens dækning er ukendt.")}else{Value::Null},
             "started_at":m["started_at"],"ended_at":m["ended_at"],"scope":"whole_measurement","quality":if versioned{"event_counts"}else{"legacy_samples_only"},"diagnostics_version":if versioned{json!(1)}else{Value::Null},

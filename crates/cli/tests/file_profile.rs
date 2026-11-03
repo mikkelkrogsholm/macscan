@@ -78,7 +78,10 @@ fn profile_cli_matches_shared_api_and_bounded_encodings() {
             limit: 100,
             ..Default::default()
         };
-        let shared = store.file_profile("502-1", &q, &cancel).unwrap();
+        let mut shared = store.file_profile("502-1", &q, &cancel).unwrap();
+        assert_eq!(shared["schema_version"], "2.0");
+        shared["schema_version"] = json!("3.0");
+        shared["outcome"] = json!("ok");
         let mut cursor = None;
         let mut seen = 0;
         loop {
