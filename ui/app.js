@@ -28,6 +28,7 @@ $('#app').innerHTML=`
 <main>
  <header class="toolbar"><div class="view-heading"><span class="eyebrow">DISK ANALYSE</span><h1 id="view-title">Find det, der fylder.</h1><div id="scan-stamp" class="muted">Lokal scanning. Ingen automatisk oprydning.</div></div><div class="toolbar-actions"><div class="metric-toggle" role="group" aria-label="Størrelsesbegreb"><button id="allocated" aria-pressed="true">Allokeret</button><button id="logical" aria-pressed="false">Logisk</button><button id="apfs-data-clone" aria-pressed="false" aria-label="Begrænset DATA-klonkorrigeret allokering" title="Begrænset DATA-klonkorrigeret allokering">APFS DATA</button></div><button id="rescan" class="primary">Scan hele Mac’en</button></div></header>
  <label class="capture-option"><input id="capture-clones" type="checkbox"> APFS-klonmetadata til næste nye scanning <small>Tilvalg · eksisterende målinger ændres ikke</small></label><p id="metric-note" class="muted" role="status"></p>
+ <div id="navigation-status" class="progress-panel hidden" role="status"><div class="spinner"></div><strong>Åbner gemt måling…</strong></div>
  <div id="error" class="error hidden" role="alert"></div>
  <div id="progress" class="progress-panel hidden" role="status"><div class="spinner"></div><div><strong id="progress-title">Scanner…</strong><div id="progress-detail"></div></div><button id="stop" class="plain">Stop</button></div>
  <section id="branch-progress" class="branch-progress hidden" aria-label="Løbende scanresultater"><div id="volume-progress"></div><p>Foreløbige filtal er før hardlink-korrektion. Afventende områder er ikke målt som nul. Små filer tælles med.</p><div id="branch-rows"></div></section>
@@ -126,8 +127,17 @@ async function preloadScan(id,entry,token){
  if(token!==state.request)return null;
  return {view,metric,note};
 }
+function navigationLoading(token){
+ state.loadingRequest=token;clearTimeout(state.searchTimer);++state.listRequest;clearError();
+ $('.workspace').classList.add('loading');$('.workspace').setAttribute('aria-busy','true');$('#navigation-status').classList.remove('hidden');
+}
+function navigationFinished(token){
+ if(token!==state.loadingRequest)return;
+ state.loadingRequest=null;$('.workspace').classList.remove('loading');$('.workspace').setAttribute('aria-busy','false');$('#navigation-status').classList.add('hidden');
+}
 async function openScan(id,keepMachine=false,entry='0',loaded=null){
- const token=++state.request;
+ const token=++state.request;navigationLoading(token);
+ try{
  if(state.scans.find(s=>s.scan_id===id)?.kind==='machine'){
   const session=await invoke('machine_session',{sessionId:id});if(token===state.request)showMachine(session);return;
  }
@@ -140,8 +150,10 @@ async function openScan(id,keepMachine=false,entry='0',loaded=null){
  for(const m of metrics)$('#'+m).disabled=false;
  insights.reset({scope:'all',category:null});growth.reset({scope:'all',group:null,files:false});state.compareBefore=null;$('#insights-tab').disabled=false;
  state.scan=id;state.selected=null;state.colors.clear();state.mode='files';$('#search').value='';await navigate(entry,prepared.view);renderHistory();
+ }catch(e){if(token===state.request)error(e);}finally{navigationFinished(token);}
 }
 function showMachine(session){
+ navigationFinished(state.loadingRequest);
  focusedRescan.close();
  coverageDialog.close();
  profile.reset({active:false});
@@ -161,7 +173,7 @@ function showMachine(session){
 async function navigate(entry,loaded=null){
  profile.reset();if(profile.active&&state.mode==='files'){profile.busy=true;renderFileProfile();}
  insights.reset({category:null});growth.reset({group:null,files:false});
- const token=++state.request;++state.listRequest;clearTimeout(state.searchTimer);clearError();$('.workspace').classList.add('loading');
+ const token=++state.request;navigationLoading(token);
  try{const view=loaded??await invoke('view_scan',{scanId:state.scan,entry:Number(entry),metric:state.metric});if(token!==state.request)return;
   state.view=view;state.selected=view.selected;
   $('#'+APFS).disabled=!apfsSupported(view);$('#'+APFS).title=apfsSupported(view)?metricLabel(APFS):unavailableNote;
@@ -176,7 +188,7 @@ async function navigate(entry,loaded=null){
   if(state.mode==='insights')loadInsights();
   if(state.mode==='changes')loadGrowth();
   $('#provenance').textContent=(view.status==='complete'?'Komplet':'Delvis')+' måling · '+metricLabel(state.metric);
- }catch(e){if(token===state.request){error(e);if(profile.active){profile.busy=false;profile.error=String(e);renderFileProfile();}}}finally{if(token===state.request)$('.workspace').classList.remove('loading');}
+ }catch(e){if(token===state.request){error(e);if(profile.active){profile.busy=false;profile.error=String(e);renderFileProfile();}}}finally{navigationFinished(token);}
 }
 function renderCrumbs(){const box=$('#breadcrumbs');box.replaceChildren();if(state.machine){const b=el('button','crumb','Hele Mac’en');b.addEventListener('click',()=>showMachine(state.machine));box.append(b);}
  for(const [i,a]of state.view.ancestors.entries()){if(i||state.machine)box.append(el('span','crumb-separator','›'));const b=el('button','crumb',i===0?rootName(state.view.scope.root_display):a.name_display);b.title=a.path_display;b.addEventListener('click',()=>navigate(a.entry_id));box.append(b);}}
@@ -207,7 +219,7 @@ function highlight(node,aggregate=false){
  for(const r of document.querySelectorAll('.file-row'))r.classList.toggle('hovered',!!node&&r.dataset.entry===node.entry_id);
  $('#hover-caption').textContent=node?node.name_display+' · '+formatBytes(node.bytes??node.observed_bytes??node.lower_bound_bytes)+(aggregate?' · se listen':''):'Klik på en mappe for at åbne · midten går ét niveau op';
 }
-async function chooseNode(n){if(state.overview){const row=state.rows.find(r=>r.entry_id===n.entry_id)??n;if(row.scan_id)return openScan(row.scan_id,true);toast(row.error??(row.phase==='unmounted'?'Volumen er ikke monteret. Dets forbrug vises fra macOS.':'Ingen filscanning for dette område.'));return;}
+async function chooseNode(n){if(state.loadingRequest!=null)return;if(state.overview){const row=state.rows.find(r=>r.entry_id===n.entry_id)??n;if(row.scan_id)return openScan(row.scan_id,true);toast(row.error??(row.phase==='unmounted'?'Volumen er ikke monteret. Dets forbrug vises fra macOS.':'Ingen filscanning for dette område.'));return;}
  if(n.kind==='directory')return navigate(n.entry_id);const scan=state.scan,request=state.request,metric=state.metric;try{const data=await invoke('view_scan',{scanId:scan,entry:Number(n.entry_id),metric});if(scan===state.scan&&request===state.request&&metric===state.metric){state.selected=data.selected;renderInspector();}}catch(e){if(scan===state.scan&&request===state.request&&metric===state.metric)error(e);}}
 // This renderer consumes ordinary children only. Growth owns its separate panel
 // and never changes the schema of state.rows, including during graph refreshes.
