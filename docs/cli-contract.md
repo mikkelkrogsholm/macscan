@@ -112,3 +112,55 @@ with issue #22. Existing desktop whole-Mac data is not migrated by this change.
 Verification is in `crates/cli/tests/contract.rs`, the existing CLI integration
 suites, and the CLI's escaped-diagnostic budget unit test. They use synthetic
 saved metadata and owned filesystem fixtures, not real scan history.
+
+## Discovery (CLI-02)
+
+`schema` remains the full machine view, including SQL columns and analysis
+contracts. Its `commands` array lists installed command names. Use
+`schema --command NAME` or `NAME --help` (also `NAME -h`) for the same short,
+command-local description. Global `--help`, `-h`, or no arguments selects the
+full schema. Help accepts only its help flag and optional `--format`;
+`schema --command NAME` accepts optional `--format`. JSON is the default;
+explicit `--format ndjson` preserves the CLI's start/record/end framing.
+Both encodings, including all frames, fit 8192 bytes. An unknown command is a
+CLI 3.0 `INVALID_ARGUMENT` error on stderr with exit 2 and empty stdout.
+
+Discovery identifies the CLI package version, build revision, engine version,
+retained data schema (2.0), and the legacy native engine schema separately.
+The revision is embedded during compilation, with a `-dirty` suffix for tracked
+working-tree changes; a source archive without Git reports `unknown`. Discovery
+never runs Git or accesses the network at runtime. A copied release binary and
+its bundled DuckDB library work from another directory without a `.git`
+directory, GUI, existing store, or HOME. Help and discovery neither create a
+store nor prune history. They do not open a measurement or enumerate scan roots.
+
+`crates/cli/src/discovery.rs` maintains the command names and applicable option
+descriptions. The runtime parser uses those descriptions to reject options
+outside the selected command; parsing and value validation remain ordinary
+Rust functions. The subprocess discovery suite checks advertised options
+against accepted/rejected invocations, alongside the existing value-validation,
+coverage, and pagination tests. Later commands must extend this same description
+and their own tests when implemented. Whole-Mac scanning and `scans --run` are
+not installed by CLI-02.
+
+Short help includes required operands, snapshot/entry ID roles, defaults and
+ranges, mutually exclusive filters, output channels, exit codes, and effects.
+`--` ends option parsing, so `scan -- --help` scans a relative directory named
+`--help`; a value token named `--help` is also a value, not a help request.
+A normal scan uses a private temporary store, removed when the operation ends.
+`--save` retains metadata; `--output PATH` aliases the store path and implies
+saving. Store/output paths must be absolute without dot/parent components;
+when repeated the last store/output path wins. A successful saved publication
+can prune validated Macscan metadata to the latest three runs. Grouped whole-Mac
+history counts as one run. This metadata retention is distinct from
+`scanned_files_cleanup: false`: scanned source files are never deleted.
+The default metadata allowance is 4 GiB for a new measurement; explicit
+`--metadata-budget` limits old plus new retained metadata. The separate workspace
+and free-space guards still apply; see [history-retention.md](history-retention.md).
+
+Capabilities describe the installed metadata/Parquet backend, not the legacy
+engine prototype's acceptance status. Logical and hardlink-accounted allocated
+metrics are available; private bytes remain unsupported. Opt-in
+`--capture-apfs-clones` supports the limited full-DATA correction within a
+measurement root, with partial/non-DATA sharing retained. It does not establish
+unique, private, or reclaimable bytes. No atomic filesystem snapshot is claimed.

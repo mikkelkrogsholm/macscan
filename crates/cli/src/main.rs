@@ -1,6 +1,7 @@
+mod discovery;
 use macscan_analysis::{Store, DEFAULT_LIMIT, OUTPUT_BUDGET, FULL_HISTORY_BUDGET};
 use macscan_engine::{
-    capabilities, volumes, CompareQuery, Metric, Query, QueryKind, ScanOptions,
+    volumes, CompareQuery, Metric, Query, QueryKind, ScanOptions,
     ENGINE_VERSION,
 };
 use serde_json::{json, Value};
@@ -129,22 +130,22 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             continue;
         }
         let flag = utf8(arg)?;
-        if flag == "--capture-apfs-clones" && command=="scan" {
+        if !discovery::options(command).iter().any(|(name,_)| *name == flag) {
+            return Err(Error::usage("unknown flag or flag is not supported by this command"));
+        }
+        if flag == "--capture-apfs-clones" {
             options.scan.capture_clones=true;index+=1;continue;
         }
-        if matches!(flag,"--dry-run"|"--apply") && command=="history-prune" {
+        if matches!(flag,"--dry-run"|"--apply") {
             if options.prune_mode {return Err(Error::usage("choose either --dry-run or --apply"));}
             options.prune_mode=true;options.prune_apply=flag=="--apply";index+=1;continue;
         }
         if flag == "--save" {
-            if command != "scan" {
-                return Err(Error::usage("--save is only valid for scan"));
-            }
             options.save = true;
             index += 1;
             continue;
         }
-        if flag == "--no-extension" && command == "profile" {
+        if flag == "--no-extension" {
             if options.profile.type_key.is_some() { return Err(Error::usage("choose one extension/type filter")); }
             options.profile.type_key = Some("none".into());
             index += 1;
@@ -159,68 +160,40 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                 "ndjson" => options.ndjson = true,
                 _ => return Err(Error::usage("format must be json or ndjson")),
             },
-            "--store"
-                if matches!(
-                    command,
-                    "scan"
-                        | "summary"
-                        | "children"
-                        | "largest"
-                        | "inspect"
-                        | "scans"
-                        | "compare"
-                        | "query"
-                        | "insights" | "growth" | "profile" | "coverage" | "history-prune"
-                ) =>
+            "--store" =>
             {
                 options.store = PathBuf::from(value)
             }
-            "--output" if command == "scan" => {
+            "--output" => {
                 options.save = true;
                 options.store = PathBuf::from(value);
             }
-            "--scan"
-                if matches!(
-                    command,
-                    "summary" | "children" | "largest" | "inspect" | "query" | "insights" | "profile" | "coverage"
-                ) =>
+            "--scan" =>
             {
                 options.scan_id = Some(utf8(value)?.into())
             }
-            "--reason" if command == "coverage" => options.reason=Some(utf8(value)?.into()),
-            "--metric"
-                if matches!(
-                    command,
-                    "scan" | "summary" | "children" | "largest" | "inspect" | "compare" | "insights" | "growth" | "profile"
-                ) =>
+            "--reason" => options.reason=Some(utf8(value)?.into()),
+            "--metric" =>
             {
                 options.query.metric =
                     Metric::parse(utf8(value)?).map_err(|e| Error::io("metric", e))?
             }
-            "--entry" if matches!(command, "summary" | "children" | "largest" | "inspect" | "insights" | "growth" | "profile") => {
+            "--entry" => {
                 options.query.entry = u32::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("entry ID overflow"))?
             }
-            "--limit"
-                if matches!(
-                    command,
-                    "scan" | "children" | "largest" | "scans" | "compare" | "volumes" | "query" | "insights" | "growth" | "profile" | "coverage"
-                ) =>
+            "--limit" =>
             {
                 options.query.limit =
                     usize::try_from(unsigned(value)?).map_err(|_| Error::usage("limit overflow"))?
             }
-            "--cursor"
-                if matches!(
-                    command,
-                    "children" | "largest" | "scans" | "compare" | "volumes" | "insights" | "growth" | "profile" | "coverage"
-                ) =>
+            "--cursor" =>
             {
                 options.query.cursor = Some(utf8(value)?.into())
             }
-            "--min-age-days" if command == "profile" => options.profile.min_age_days = Some(unsigned(value)?),
+            "--min-age-days" => options.profile.min_age_days = Some(unsigned(value)?),
             "--min-bytes" if command == "profile" => options.profile.min_bytes = Some(unsigned(value)?),
-            "--extension" | "--type-key" if command == "profile" => {
+            "--extension" | "--type-key" => {
                 if options.profile.type_key.is_some() { return Err(Error::usage("choose one extension/type filter")); }
                 options.profile.type_key = Some(if flag == "--extension" {
                     macscan_analysis::FileProfileQuery::extension_key(utf8(value)?).map_err(|e|Error::io("extension",e))?
@@ -229,34 +202,34 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
             "--view" if command == "profile" => options.profile.types = match utf8(value)? {
                 "files" => false, "types" => true, _ => return Err(Error::usage("view must be files or types")),
             },
-            "--sort" if command == "profile" => options.profile.sort_count = match utf8(value)? {
+            "--sort" => options.profile.sort_count = match utf8(value)? {
                 "bytes" => false, "count" => true, _ => return Err(Error::usage("sort must be bytes or count")),
             },
-            "--grouping" if command == "growth" => options.growth_grouping = match utf8(value)? {
+            "--grouping" => options.growth_grouping = match utf8(value)? {
                 "area" => macscan_analysis::GrowthGrouping::Area,
                 "category" => macscan_analysis::GrowthGrouping::Category,
                 _ => return Err(Error::usage("grouping must be area or category")),
             },
-            "--view" if command == "growth" => options.growth_files = match utf8(value)? {
+            "--view" => options.growth_files = match utf8(value)? {
                 "groups" => false, "files" => true,
                 _ => return Err(Error::usage("view must be groups or files")),
             },
-            "--group" if command == "growth" => options.growth_group = Some(utf8(value)?.into()),
-            "--change" if command == "growth" => options.growth_change = utf8(value)?.into(),
-            "--category" if command == "insights" => options.category = Some(utf8(value)?.into()),
-            "--sql" if command == "query" => options.sql = Some(utf8(value)?.into()),
-            "--before" if command == "query" => options.before = Some(utf8(value)?.into()),
-            "--offset" if command == "query" => {
+            "--group" => options.growth_group = Some(utf8(value)?.into()),
+            "--change" => options.growth_change = utf8(value)?.into(),
+            "--category" => options.category = Some(utf8(value)?.into()),
+            "--sql" => options.sql = Some(utf8(value)?.into()),
+            "--before" => options.before = Some(utf8(value)?.into()),
+            "--offset" => {
                 options.offset = usize::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("offset overflow"))?
             }
-            "--search" if matches!(command, "children" | "largest") => {
+            "--search" => {
                 options.query.search = utf8(value)?.into()
             }
-            "--min-bytes" if matches!(command, "children" | "largest") => {
+            "--min-bytes" => {
                 options.query.min_bytes = unsigned(value)?
             }
-            "--kind" if command == "children" => {
+            "--kind" => {
                 options.query.only_kind = Some(match utf8(value)? {
                     "file" => macscan_engine::EntryKind::File,
                     "directory" => macscan_engine::EntryKind::Directory,
@@ -265,29 +238,29 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
                     _ => return Err(Error::usage("unknown kind")),
                 })
             }
-            "--max-entries" if command == "scan" => {
+            "--max-entries" => {
                 options.scan.max_entries = usize::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("entry count overflow"))?
             }
-            "--max-duration" if command == "scan" => {
+            "--max-duration" => {
                 options.scan.max_duration = Duration::from_secs(unsigned(value)?)
             }
-            "--memory-budget" if command == "scan" => {
+            "--memory-budget" => {
                 options.scan.max_memory_bytes = usize::try_from(unsigned(value)?)
                     .map_err(|_| Error::usage("memory budget overflow"))?
             }
-            "--metadata-budget" if command == "scan" => {options.metadata_budget = unsigned(value)?;options.explicit_budget=true;},
-            "--workers" if command == "scan" => {
+            "--metadata-budget" => {options.metadata_budget = unsigned(value)?;options.explicit_budget=true;},
+            "--workers" => {
                 if unsigned(value)? != 1 {
                     return Err(Error {
                         exit: 6,
                         code: "UNSUPPORTED_WORKERS",
                         operation: "arguments",
-                        detail: "prototype currently supports one bounded worker".into(),
+                        detail: "currently supports one bounded worker".into(),
                     });
                 }
             }
-            "--progress" if command == "scan" => {
+            "--progress" => {
                 let mode = utf8(value)?;
                 if !matches!(mode, "off" | "text" | "ndjson") {
                     return Err(Error::usage("progress must be off, text or ndjson"));
@@ -342,7 +315,7 @@ fn parse(command: &str, args: &[OsString]) -> Result<Options> {
 }
 fn schema() -> Value {
     json!({"schema_version":"3.0","engine_version":ENGINE_VERSION,"status":"ok",
-        "commands":["history-prune [--dry-run|--apply] --store PATH","coverage --scan ID [--reason REASON] [--cursor CURSOR] [--limit N]","capabilities","volumes","scan ROOT [--save] [--capture-apfs-clones]","scans","summary --scan ID","children --scan ID --entry ID","largest --scan ID","inspect --scan ID --entry ID","insights --scan ID [--entry ID] [--category CATEGORY]","profile --scan ID [--entry ID] [--min-age-days N] [--min-bytes N] [--extension SUFFIX|--no-extension|--type-key KEY] [--view files|types] [--sort bytes|count]","query --scan ID --sql SELECT [--before ID]","compare BEFORE_ID AFTER_ID","growth BEFORE_ID AFTER_ID [--entry ID] [--grouping area|category] [--view groups|files]"],
+        "identity":discovery::identity(),"commands":discovery::COMMANDS,"command_help":"schema --command NAME or NAME --help",
         "storage":"ZSTD compressed Parquet, explicit --save; small manifest.json; no persistent DuckDB database",
         "apfs_data_clone_contract":{"algorithm_version":"apfs-data-clone-1","capture_version":1,"label":"Begrænset DATA-klonkorrigeret allokering","opt_in":"scan --capture-apfs-clones","limitations":"Within measurement root; full DATA only, partial and non-DATA retained; global raw-path owners; not unique/private/reclaimable space","documentation":"docs/apfs-data-clone.md"},
         "profile_contract":{"version":"file-profile-1","view":["files","types"],"sort":["bytes","count"],"scope":"saved --entry with raw path component boundaries","age":"saved ended_unix_ns; inclusive integer threshold; unknown/future mtime excluded","type":"raw final suffix hint; ASCII lowercase; opaque type_key preserves non-UTF8 identity","documentation":"docs/file-profile.md"},
@@ -354,7 +327,7 @@ fn schema() -> Value {
         "options":{"store":"absolute metadata directory","limit":"1..100, default 10; responses always <=8192 bytes","offset":"SQL pagination; use next_offset, use ORDER BY for stable SQL pages","cursor":"predefined query pagination; use next_cursor unchanged","metric":["logical","allocated","apfs-data-clone"],"progress":["off","text","ndjson"],"format":["json","ndjson"]},
         "sql_examples":["SELECT path_display,accounted_allocated_bytes FROM entries WHERE kind='file' ORDER BY accounted_allocated_bytes DESC LIMIT 10","SELECT category,count(*) AS entries,sum(accounted_allocated_bytes) AS bytes FROM entries WHERE kind='file' GROUP BY category ORDER BY bytes DESC","SELECT path_display,logical_delta FROM changes WHERE logical_delta>0 ORDER BY logical_delta DESC LIMIT 10"],
         "result_contract":{"schema_version":"3.0","outcome":"ok|partial|failed|cancelled; independent of saved status","exit_codes":{"ok":0,"partial":10,"cancelled":130,"input":2,"io":3,"not_found":4,"budget":5,"unsupported":6,"busy":7},"documentation":"docs/cli-contract.md","all_SQL_numbers":"exact decimal strings; booleans and null preserved","null":"unknown, never zero","allocated":"scoped hardlink-accounted OS allocation, not unique APFS or reclaimable bytes","partial":"unknown areas are not deletion evidence","output_budget_bytes":OUTPUT_BUDGET},
-        "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"automatic_deletion":true,"metadata_retention":{"keep_runs":3,"deletion_scope":"saved Macscan metadata only; scanned files are never deleted","trigger":"after successful publication; whole-Mac counts once"},"metadata_budget_scope":"default new measurement allowance; explicit --metadata-budget combined total","UI":"Tauri sunburst"}})
+        "limits":{"metadata_budget_bytes":FULL_HISTORY_BUDGET,"max_entries":null,"max_duration_seconds":null,"scan_mode":"streaming_full","scanner_workers":1,"scanned_files_cleanup":false,"metadata_retention":{"keep_runs":3,"deletion_scope":"saved Macscan metadata only; scanned files are never deleted","trigger":"after successful publication; whole-Mac counts once"},"metadata_budget_scope":"default new measurement allowance; explicit --metadata-budget combined total","UI":"Tauri sunburst"}})
 }
 #[derive(Default)]
 struct Publication {
@@ -367,24 +340,56 @@ fn usable(complete: bool) -> u8 {
 }
 fn run(args: &[OsString], publication: &mut Publication) -> Result<u8> {
     let command = args.first().map(utf8).transpose()?.unwrap_or("--help");
-    let options = parse(command, args.get(1..).unwrap_or_default())?;
+    let command = match command { "--help"|"-h" => "schema", other => other };
+    if !discovery::COMMANDS.contains(&command) { return Err(Error::usage("unknown command; use schema")); }
+    let tail = args.get(1..).unwrap_or_default();
+    if discovery::help_requested(command, tail) {
+        let mut ndjson = false;
+        let mut index = 0;
+        while index < tail.len() {
+            match utf8(&tail[index])? {
+                "--help"|"-h" => index += 1,
+                "--format" => {
+                    let format = tail.get(index+1).ok_or_else(||Error::usage("flag requires a value"))?;
+                    ndjson = match utf8(format)? {"json"=>false,"ndjson"=>true,_=>return Err(Error::usage("format must be json or ndjson"))};
+                    index += 2;
+                }
+                _ => return Err(Error::usage("command help accepts only --help/-h and --format")),
+            }
+        }
+        emit(discovery::help(command).unwrap(), ndjson).map_err(|e| Error::io("stdout",e))?;
+        return Ok(0);
+    }
+    if matches!(command,"schema"|"capabilities"|"--version") {
+        let mut selected = None;
+        let mut ndjson = false;
+        let mut index = 0;
+        while index < tail.len() {
+            let flag = utf8(&tail[index])?;
+            let value = tail.get(index+1).ok_or_else(||Error::usage("flag requires a value"))?;
+            match flag {
+                "--command" if command == "schema" => selected = Some(utf8(value)?),
+                "--format" => ndjson = match utf8(value)? {"json"=>false,"ndjson"=>true,_=>return Err(Error::usage("format must be json or ndjson"))},
+                _ => return Err(Error::usage("unknown flag or unexpected operand")),
+            }
+            index += 2;
+        }
+        let mut result = match command {
+            "schema" => match selected {Some(name)=>discovery::help(name).ok_or_else(||Error::usage("unknown command; use schema"))?,None=>schema()},
+            "capabilities" => discovery::capabilities(),
+            _ => json!({"identity":discovery::identity(),"engine_version":ENGINE_VERSION,"duckdb_version":Store::version()}),
+        };
+        result["schema_version"] = json!("3.0"); result["outcome"] = json!("ok");
+        emit(result, ndjson).map_err(|e|Error::io("stdout",e))?;
+        return Ok(0);
+    }
+    let options = parse(command, tail)?;
     // Only this process's scan/query is interrupted; no existing user process.
     unsafe {
         libc::signal(libc::SIGINT, cancel as *const () as libc::sighandler_t);
     }
     let mut code = 0;
     let mut result = match command {
-        "--help" | "-h" | "schema" => schema(),
-        "--version" => {
-            json!({"schema_version":"3.0","engine_version":ENGINE_VERSION,"duckdb_version":Store::version()})
-        }
-        "capabilities" => {
-            let mut v = capabilities();
-            v["storage"] = json!("parquet_zstd");
-            v["query_engine"] = json!(Store::version());
-            v["agent_response_budget_bytes"] = json!(OUTPUT_BUDGET);
-            v
-        }
         "volumes" => volumes(options.query.limit, options.query.cursor.as_deref())
             .map_err(|e| Error::io("volumes", e))?,
         "history-prune" => {
