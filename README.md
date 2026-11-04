@@ -34,8 +34,8 @@ Der læses ikke filindhold. Scanning er fortsat enkelttrådet; DuckDB-finaliseri
 bruger to tråde. Fuld diskadgang skal brugeren selv give i macOS, hvis nødvendigt.
 Ingen rettigheder ændres automatisk. Beskyttede/providerområder vises som delvise.
 Knappen “Fuld diskadgang…” åbner kun den relevante side i Systemindstillinger.
-Tilføj `dist/Macscan.app` dér manuelt, og genstart appen. Lokale ad-hoc-genbygninger
-kan ugyldiggøre tidligere tilladelser; fjern og tilføj da appen igen. Appen har
+Tilføj `dist/Macscan.app` dér manuelt, og genstart appen. Ad-hoc-genbygninger eller skift til Developer ID
+kan kræve fornyet tilladelse; fjern og tilføj da appen igen. Appen har
 formålsbeskrivelser for musikbibliotek og standardmapper, men giver sig ikke adgang.
 Store scanninger hæver kun egen proces’ bløde grænse for åbne filer til højst8192
 (aldrig over den eksisterende hårde grænse); systemets grænser ændres ikke.
@@ -70,7 +70,8 @@ En ny måling kan afvises, når budgettet er opbrugt; CLI kan ændre budgettet.
 Byg med `scripts/build-desktop.sh`. Frontend er lokal HTML/CSS/JavaScript/SVG
 uden npm-afhængigheder eller separat frontendbyg. Tauri er isoleret i sin egen
 crate og er ikke en runtimeafhængighed for CLI'en. Native dialog bruger rfd.
-Appen er lokalt ad-hoc-signeret, ikke Developer-ID-signeret/notariseret og ikke
+Buildscripts vælger en tilgængelig Developer ID-identitet eller melder ad-hoc-fallback;
+se [signering og tilladelser](docs/agent-cli.md). Appen er ikke notariseret eller
 installeret i Applications. Den bruger systemets WebView, ikke medpakket Chromium.
 Sunburst-reference: [DaisyDisk](https://daisydiskapp.com/); egne assets/layout.
 IPC følger [Tauri 2's kommando-API](https://v2.tauri.app/develop/calling-rust/).
@@ -78,7 +79,8 @@ IPC følger [Tauri 2's kommando-API](https://v2.tauri.app/develop/calling-rust/)
 ## Brug
 
 Kør fra denne mappe. `dist/macscan` og `dist/libduckdb.dylib` skal ligge sammen.
-Binæren er lokalt ad-hoc-signeret, ikke globalt installeret/notariseret.
+Binæren signeres efter samme politik som appen, men er ikke globalt installeret
+eller notariseret. Se [signeringsvalg](docs/agent-cli.md).
 
 ```sh
 dist/macscan schema

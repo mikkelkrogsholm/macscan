@@ -1,7 +1,7 @@
 # Local Macscan CLI for agents
 
 Build and install are separate, explicit operations. On arm64 macOS 14+, the
-project's locked/offline scripts produce ad-hoc signed local artifacts:
+project's locked/offline scripts produce signed local artifacts:
 
 ```sh
 scripts/build-local.sh
@@ -9,6 +9,32 @@ scripts/build-desktop.sh
 python3 scripts/install-cli.py install --prefix /chosen/prefix \
   --artifacts /absolute/release/dist --app /absolute/release/dist/Macscan.app
 ```
+
+Both build scripts use the same signing policy. By default they choose the sole
+available Developer ID Application identity; with none, they explicitly report an
+ad hoc local fallback. Multiple identities require a selector. Set
+`MACSCAN_SIGNING_IDENTITY` to the exact certificate name or SHA-1 hash to select an
+available Developer ID identity, or `-` to request ad hoc signing explicitly:
+
+```sh
+MACSCAN_SIGNING_IDENTITY='Developer ID Application: YOUR NAME (TEAM)' scripts/build-local.sh
+MACSCAN_SIGNING_IDENTITY=- scripts/build-desktop.sh
+```
+
+An unavailable explicit identity fails before release artifacts are replaced.
+Developer ID artifacts use hardened runtime and a secure timestamp; the app, CLI
+and each bundled DuckDB copy use the same selected identity. The bundle identifier
+is `dk.macscan.desktop`; CLI and library identifiers are `dk.macscan.cli` and
+`dk.macscan.duckdb`. There is no notarization or updater. Ad hoc builds have no
+stable certificate-backed identity and can invalidate previous macOS permissions.
+
+After switching an existing ad hoc app to Developer ID signing, the user may need
+to remove and re-add Macscan once in System Settings → Privacy & Security → Full
+Disk Access, then restart the app. Later builds signed by the same identity keep
+a stable designated requirement. Permission remains the user's choice; builds
+and installation do not change TCC. CLI execution has a separate permission
+context (for example its launching terminal); granting the app access does not
+promise that CLI access is granted.
 
 The installer requires Python 3.9+ and Apple's installed command-line tools
 (`codesign`, `otool`). The installed command needs neither Python nor a checkout,
@@ -37,7 +63,7 @@ validation; a failed stage keeps the previous payload active. A prefix directory
 lock prevents simultaneous installers. Cleanup after activation is explicitly a
 warning on failure; recorded prior payloads can be validated and cleaned by the
 next update, including partially completed cleanup. This is a local
-ad-hoc release path, without notarization or an updater. Missing runtime files
+release path, without notarization or an updater. Missing runtime files
 produce an actionable launcher error and never fall back into `.build`.
 
 ```sh

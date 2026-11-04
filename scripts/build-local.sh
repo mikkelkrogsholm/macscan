@@ -2,6 +2,8 @@
 # Local arm64 CLI artifact only. Does not install or touch scan targets.
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+. "$project_dir/scripts/signing.sh"
+macscan_resolve_signing_identity
 toolchain_bin="$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin"
 export RUSTC="$toolchain_bin/rustc"
 export RUSTDOC="$toolchain_bin/rustdoc"
@@ -24,12 +26,13 @@ if [ -L dist ] || [ -L dist/macscan ]; then
 fi
 mkdir -p dist
 /usr/bin/install -m 755 .build/release/macscan dist/macscan
-/usr/bin/install -m 755 .build/duckdb/libduckdb.dylib dist/libduckdb.dylib
+macscan_prepare_duckdb
+/usr/bin/install -m 755 "$macscan_signed_duckdb" dist/libduckdb.dylib
 /usr/bin/strip -S dist/macscan
 # Debug builds retain the local fallback; packaged binaries must use only their bundle.
 /usr/bin/install_name_tool -delete_rpath "$project_dir/crates/cli/../../.build/duckdb" dist/macscan
-/usr/bin/codesign --force --sign - dist/libduckdb.dylib
-/usr/bin/codesign --force --sign - dist/macscan
+macscan_sign dist/macscan dk.macscan.cli
+/usr/bin/codesign --verify --strict dist/libduckdb.dylib
 /usr/bin/codesign --verify --strict dist/macscan
 /usr/bin/stat -f '%z bytes %N' dist/macscan
 /usr/bin/shasum -a 256 Cargo.lock dist/macscan dist/libduckdb.dylib

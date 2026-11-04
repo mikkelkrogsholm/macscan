@@ -2,6 +2,8 @@
 # Builds a local app; never installs globally or alters scan targets.
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+. "$project_dir/scripts/signing.sh"
+macscan_resolve_signing_identity
 toolchain_bin="$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin"
 export RUSTC="$toolchain_bin/rustc"
 export RUSTDOC="$toolchain_bin/rustdoc"
@@ -25,8 +27,9 @@ mkdir -p dist
 /usr/bin/ditto .build/release/bundle/macos/Macscan.app dist/Macscan.app
 # Debug builds retain the local fallback; packaged binaries must use only their bundle.
 /usr/bin/install_name_tool -delete_rpath "$project_dir/crates/desktop/../../.build/duckdb" dist/Macscan.app/Contents/MacOS/macscan-desktop
-/usr/bin/codesign --force --sign - dist/Macscan.app/Contents/Frameworks/libduckdb.dylib
-/usr/bin/codesign --force --sign - dist/Macscan.app
+macscan_prepare_duckdb
+/usr/bin/install -m 755 "$macscan_signed_duckdb" dist/Macscan.app/Contents/Frameworks/libduckdb.dylib
+macscan_sign dist/Macscan.app dk.macscan.desktop
 /usr/bin/codesign --verify --deep --strict dist/Macscan.app
 /usr/bin/du -sh dist/Macscan.app
 /usr/bin/shasum -a 256 dist/Macscan.app/Contents/MacOS/macscan-desktop
